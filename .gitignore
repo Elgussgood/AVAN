@@ -1,0 +1,31 @@
+# Environment variables & secrets
+.env
+.env*.local
+avan-mobile/.env
+
+# Dependencies
+node_modules/
+avan-mobile/node_modules/
+
+# Expo
+.expo/
+avan-mobile/.expo/
+avan-mobile/dist/
+avan-mobile/web-build/
+avan-mobile/expo-env.d.ts
+
+# Native builds
+avan-mobile/android/
+avan-mobile/ios/
+
+# Logs & cache
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.tsbuildinfo
+
+# OS & Tools
+.DS_Store
+*.pem
+.claude/
+avan-mobile/.claude/

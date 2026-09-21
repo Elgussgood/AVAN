@@ -1,0 +1,55 @@
+{
+  "expo": {
+    "name": "AVAN",
+    "slug": "avan-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.avan.elderlynav",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "AVAN necesita acceso al micrófono para que puedas comunicarte por voz de forma fácil y segura.",
+        "NSLocationWhenInUseUsageDescription": "AVAN necesita tu ubicación para guiarte en tus traslados en auto.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "AVAN necesita tu ubicación en segundo plano para continuar dándote indicaciones de voz durante el viaje.",
+        "UIBackgroundModes": ["location", "audio"]
+      }
+    },
+    "android": {
+      "package": "com.avan.elderlynav",
+      "adaptiveIcon": {
+        "backgroundColor": "#FF5722",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png"
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "RECORD_AUDIO",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "VIBRATE",
+        "WAKE_LOCK"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "AVAN necesita tu ubicación para guiarte en tus traslados en auto."
+        }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "AVAN necesita el micrófono para escuchar tus destinos y comandos de voz."
+        }
+      ]
+    ],
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
