@@ -9,10 +9,16 @@ import {
 } from './src/services/conversationService';
 
 export default function App() {
+  // Modo Día/Noche automático según la hora (19:00 a 06:30 es noche)
+  const isNightHour = (): boolean => {
+    const hour = new Date().getHours();
+    return hour >= 19 || hour < 7;
+  };
+
   const systemColorScheme = useColorScheme();
-  const [isDarkMode, setIsDarkMode] = useState<boolean>(
-    systemColorScheme === 'dark'
-  );
+  const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
+    return isNightHour() || systemColorScheme === 'dark';
+  });
 
   // Requisito 1: La app DEBE iniciar en MinimalHomeScreen (One-Button UI pura)
   const [viewMode, setViewMode] = useState<'minimal' | 'map'>('minimal');
@@ -29,6 +35,10 @@ export default function App() {
 
   const handleToggleTheme = () => {
     setIsDarkMode((prev) => !prev);
+  };
+
+  const handleSetThemeMode = (dark: boolean) => {
+    setIsDarkMode(dark);
   };
 
   const handleToggleView = () => {
@@ -76,6 +86,7 @@ export default function App() {
         onToggleView={handleToggleView}
         isDarkMode={isDarkMode}
         onToggleTheme={handleToggleTheme}
+        onSetThemeMode={handleSetThemeMode}
         userName="GUSTAVO"
         destination={currentDestination}
         routeCoordinates={routeCoordinates}
@@ -97,6 +108,7 @@ export default function App() {
       onToggleView={handleToggleView}
       isDarkMode={isDarkMode}
       onToggleTheme={handleToggleTheme}
+      onSetThemeMode={handleSetThemeMode}
       userName="GUSTAVO"
       onStartTrip={handleStartTrip}
       context={conversationContext}

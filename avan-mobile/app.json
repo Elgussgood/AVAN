@@ -13,7 +13,10 @@
         "NSMicrophoneUsageDescription": "AVAN necesita acceso al micrófono para que puedas comunicarte por voz de forma fácil y segura.",
         "NSLocationWhenInUseUsageDescription": "AVAN necesita tu ubicación para guiarte en tus traslados en auto.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "AVAN necesita tu ubicación en segundo plano para continuar dándote indicaciones de voz durante el viaje.",
-        "UIBackgroundModes": ["location", "audio"]
+        "UIBackgroundModes": [
+          "location",
+          "audio"
+        ]
       }
     },
     "android": {
@@ -41,12 +44,7 @@
           "locationAlwaysAndWhenInUsePermission": "AVAN necesita tu ubicación para guiarte en tus traslados en auto."
         }
       ],
-      [
-        "expo-av",
-        {
-          "microphonePermission": "AVAN necesita el micrófono para escuchar tus destinos y comandos de voz."
-        }
-      ]
+      "expo-audio"
     ],
     "web": {
       "favicon": "./assets/favicon.png"

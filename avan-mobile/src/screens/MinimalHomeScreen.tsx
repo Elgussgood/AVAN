@@ -3,15 +3,13 @@ import {
   StyleSheet,
   View,
   Text,
-  SafeAreaView,
   StatusBar,
   TouchableOpacity,
   Animated,
   useColorScheme,
-  TextInput,
-  KeyboardAvoidingView,
-  Platform,
+  ActivityIndicator,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { lightTheme, darkTheme, ThemeColors } from '../theme/theme';
@@ -38,6 +36,7 @@ export interface MinimalHomeScreenProps {
   onToggleView?: () => void;
   isDarkMode?: boolean;
   onToggleTheme?: () => void;
+  onSetThemeMode?: (dark: boolean) => void;
   userName?: string;
   onStartTrip?: (destination: string, routeData?: RouteData) => void;
   context?: ConversationContext;
@@ -48,6 +47,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   onToggleView,
   isDarkMode: propIsDarkMode,
   onToggleTheme: propOnToggleTheme,
+  onSetThemeMode,
   userName = 'GUSTAVO',
   onStartTrip,
   context: propContext,
@@ -68,20 +68,63 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   const [currentContext, setCurrentContext] = useState<ConversationContext>(() => {
     return propContext || ConversationService.createInitialContext(userName);
   });
+  const contextRef = useRef<ConversationContext>(currentContext);
+
+  useEffect(() => {
+    contextRef.current = currentContext;
+  }, [currentContext]);
 
   // Mensaje visual de retroalimentación
   const [spokenMessage, setSpokenMessage] = useState<string>('');
-  const [showManualInput, setShowManualInput] = useState<boolean>(false);
-  const [manualText, setManualText] = useState<string>('');
+
+  // Estado de carga gerontológico para preparación de viaje
+  const [isLoadingTrip, setIsLoadingTrip] = useState<boolean>(false);
+  const [loadingDestination, setLoadingDestination] = useState<string>('');
 
   // Sincronizar contexto entrante
   useEffect(() => {
     if (propContext) {
       setCurrentContext(propContext);
+      contextRef.current = propContext;
     }
   }, [propContext]);
 
-  // Temporizador para auto-detención y transcripción de voz
+  // T-1.1: Saludo temporal autodesvanecible tras 4 segundos
+  const greetingOpacityAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      Animated.timing(greetingOpacityAnim, {
+        toValue: 0,
+        duration: 800,
+        useNativeDriver: true,
+      }).start();
+    }, 4000);
+
+    return () => clearTimeout(timer);
+  }, [greetingOpacityAnim]);
+
+  // T-2.6: Saludo y guía auditiva al iniciar la app (reproducido solo una vez con retardo de 800ms)
+  const hasAnnouncedWelcomeRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    if (!hasAnnouncedWelcomeRef.current) {
+      hasAnnouncedWelcomeRef.current = true;
+      const timer = setTimeout(async () => {
+        setVoiceState('speaking');
+        await VoiceService.speak(
+          `Hola ${userName}. Presiona el botón naranja para pedir indicaciones.`,
+          () => {
+            setVoiceState('idle');
+          }
+        );
+      }, 800);
+
+      return () => clearTimeout(timer);
+    }
+  }, [userName]);
+
+  // Temporizador para auto-detención y transcripción de voz (8 segundos)
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -92,68 +135,142 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     };
   }, []);
 
-  // Animación del halo pulsante
+  // T-1.3: Animación del halo pulsante y ondas concéntricas
   const pulseAnim = useRef(new Animated.Value(1)).current;
+  const pulseAnim2 = useRef(new Animated.Value(1)).current; // Segunda onda concéntrica al escuchar
   const haloOpacityAnim = useRef(new Animated.Value(0.4)).current;
 
   useEffect(() => {
     let animation: Animated.CompositeAnimation;
 
-    if (voiceState === 'listening' || voiceState === 'speaking') {
-      // Pulso activo y continuo cuando el micrófono escucha o habla
+    if (voiceState === 'listening') {
+      // Ondas concéntricas activas (efecto radar/ecualizador de audio)
       animation = Animated.loop(
         Animated.parallel([
           Animated.sequence([
             Animated.timing(pulseAnim, {
-              toValue: 1.35,
-              duration: 700,
+              toValue: 1.38,
+              duration: 750,
               useNativeDriver: true,
             }),
             Animated.timing(pulseAnim, {
               toValue: 1.0,
-              duration: 700,
+              duration: 750,
+              useNativeDriver: true,
+            }),
+          ]),
+          Animated.sequence([
+            Animated.delay(180),
+            Animated.timing(pulseAnim2, {
+              toValue: 1.55,
+              duration: 750,
+              useNativeDriver: true,
+            }),
+            Animated.timing(pulseAnim2, {
+              toValue: 1.0,
+              duration: 570,
+              useNativeDriver: true,
+            }),
+          ]),
+          Animated.sequence([
+            Animated.timing(haloOpacityAnim, {
+              toValue: 0.9,
+              duration: 750,
+              useNativeDriver: true,
+            }),
+            Animated.timing(haloOpacityAnim, {
+              toValue: 0.25,
+              duration: 750,
+              useNativeDriver: true,
+            }),
+          ]),
+        ])
+      );
+    } else if (voiceState === 'speaking') {
+      // Halo oscilante y continuo azul durante la respuesta
+      animation = Animated.loop(
+        Animated.parallel([
+          Animated.sequence([
+            Animated.timing(pulseAnim, {
+              toValue: 1.25,
+              duration: 650,
+              useNativeDriver: true,
+            }),
+            Animated.timing(pulseAnim, {
+              toValue: 1.0,
+              duration: 650,
+              useNativeDriver: true,
+            }),
+          ]),
+          Animated.sequence([
+            Animated.timing(haloOpacityAnim, {
+              toValue: 0.8,
+              duration: 650,
+              useNativeDriver: true,
+            }),
+            Animated.timing(haloOpacityAnim, {
+              toValue: 0.4,
+              duration: 650,
+              useNativeDriver: true,
+            }),
+          ]),
+        ])
+      );
+    } else if (voiceState === 'processing') {
+      // Halo rítmico ámbar durante la consulta de IA / TTS
+      animation = Animated.loop(
+        Animated.parallel([
+          Animated.sequence([
+            Animated.timing(pulseAnim, {
+              toValue: 1.22,
+              duration: 500,
+              useNativeDriver: true,
+            }),
+            Animated.timing(pulseAnim, {
+              toValue: 1.0,
+              duration: 500,
               useNativeDriver: true,
             }),
           ]),
           Animated.sequence([
             Animated.timing(haloOpacityAnim, {
               toValue: 0.85,
-              duration: 700,
+              duration: 500,
               useNativeDriver: true,
             }),
             Animated.timing(haloOpacityAnim, {
               toValue: 0.35,
-              duration: 700,
+              duration: 500,
               useNativeDriver: true,
             }),
           ]),
         ])
       );
     } else {
-      // Pulso suave y respiratorio en reposo para guiar la atención sin saturar
+      // Pulso suave y respiratorio en reposo (Naranja)
       animation = Animated.loop(
         Animated.parallel([
           Animated.sequence([
             Animated.timing(pulseAnim, {
-              toValue: 1.14,
-              duration: 1600,
+              toValue: 1.12,
+              duration: 2200,
               useNativeDriver: true,
             }),
             Animated.timing(pulseAnim, {
               toValue: 1.0,
-              duration: 1600,
+              duration: 2200,
               useNativeDriver: true,
             }),
           ]),
           Animated.sequence([
             Animated.timing(haloOpacityAnim, {
-              toValue: 0.6,
-              duration: 1600,
+              toValue: 0.55,
+              duration: 2200,
               useNativeDriver: true,
             }),
             Animated.timing(haloOpacityAnim, {
-              toValue: 0.25,
-              duration: 1600,
+              toValue: 0.2,
+              duration: 2200,
               useNativeDriver: true,
             }),
           ]),
@@ -163,7 +280,54 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
 
     animation.start();
     return () => animation.stop();
-  }, [voiceState, pulseAnim, haloOpacityAnim]);
+  }, [voiceState, pulseAnim, pulseAnim2, haloOpacityAnim]);
+
+  /**
+   * T-1.3: Sistema Cromático del Botón (Sin Texto)
+   * Naranja: Inactivo / Reposo (#FF5722)
+   * Verde: Escuchando (#22C55E)
+   * Azul: Respondiendo (#3B82F6)
+   * Ámbar: Procesando / Consultando IA (#D97706)
+   */
+  const getButtonColor = (): string => {
+    switch (voiceState) {
+      case 'listening':
+        return '#22C55E'; // Verde
+      case 'speaking':
+        return '#3B82F6'; // Azul
+      case 'processing':
+        return '#D97706'; // Ámbar accesible
+      case 'idle':
+      default:
+        return '#FF5722'; // Naranja
+    }
+  };
+
+  const getHaloColor = (): string => {
+    switch (voiceState) {
+      case 'listening':
+        return 'rgba(34, 197, 94, 0.45)'; // Verde
+      case 'speaking':
+        return 'rgba(59, 130, 246, 0.45)'; // Azul
+      case 'processing':
+        return 'rgba(217, 119, 6, 0.45)'; // Ámbar
+      case 'idle':
+      default:
+        return currentTheme.buttonGlow || 'rgba(255, 87, 34, 0.35)'; // Naranja
+    }
+  };
+
+  const getButtonIcon = (): keyof typeof Ionicons.glyphMap => {
+    switch (voiceState) {
+      case 'listening':
+        return 'mic';
+      case 'speaking':
+        return 'volume-high';
+      case 'idle':
+      default:
+        return 'mic-outline';
+    }
+  };
 
   /**
    * Procesa un comando de voz o texto a través de ConversationService
@@ -178,6 +342,27 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       // Ignorar si haptics no está disponible
     }
 
+    // T-1.2: Cambio de tema por voz
+    const lower = textToProcess.toLowerCase();
+    if (lower.includes('modo noche') || lower.includes('modo oscuro')) {
+      if (onSetThemeMode) onSetThemeMode(true);
+      else if (!isDarkMode && handleToggleTheme) handleToggleTheme();
+      const msg = 'Cambiando a modo noche.';
+      setSpokenMessage(msg);
+      setVoiceState('speaking');
+      await VoiceService.speak(msg, () => setVoiceState('idle'));
+      return;
+    }
+    if (lower.includes('modo día') || lower.includes('modo dia') || lower.includes('modo claro')) {
+      if (onSetThemeMode) onSetThemeMode(false);
+      else if (isDarkMode && handleToggleTheme) handleToggleTheme();
+      const msg = 'Cambiando a modo día.';
+      setSpokenMessage(msg);
+      setVoiceState('speaking');
+      await VoiceService.speak(msg, () => setVoiceState('idle'));
+      return;
+    }
+
     setVoiceState('processing');
 
     // Detener grabación de audio
@@ -188,37 +373,36 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     try {
       const response = await ConversationService.processUserMessage(
         textToProcess,
-        currentContext
+        contextRef.current
       );
 
       // Actualizar contexto
+      contextRef.current = response.updatedContext;
       setCurrentContext(response.updatedContext);
       if (onContextChange) {
         onContextChange(response.updatedContext);
       }
 
-      setSpokenMessage(response.spokenText);
-      setVoiceState('speaking');
-
-      // Reproducción de voz con VoiceService
-      await VoiceService.speak(
-        response.spokenText,
-        () => {
-          setVoiceState('idle');
-        },
-        () => {
-          setVoiceState('speaking');
-        }
-      );
-
-      // Si el viaje fue confirmado (Paso 2), calcular ruta real y transicionar a HomeScreen
+      // Si el viaje fue confirmado (Paso 2), activar pantalla de carga gerontológica y calcular ruta
       if (response.functionCall?.name === 'confirmar_viaje') {
         const dest =
           response.functionCall.args.destino ||
           response.updatedContext.activeRoute?.destination ||
           'Hospital General';
 
-        setSpokenMessage(`Calculando la mejor ruta hacia ${dest}...`);
+        setIsLoadingTrip(true);
+        setLoadingDestination(dest);
+
+        const preparingMsg =
+          response.spokenText ||
+          `Calculando la mejor ruta hacia ${dest}, por favor espera un momento.`;
+        setSpokenMessage(preparingMsg);
+        setVoiceState('speaking');
+
+        // Reproducir auditivamente mensaje tranquilizador
+        await VoiceService.speak(preparingMsg, () => {
+          setVoiceState('idle');
+        });
 
         try {
           const userLocation = await LocationService.getCurrentLocation();
@@ -256,18 +440,84 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
             duration: routeResult.duration,
           };
 
-          setTimeout(() => {
-            if (onStartTrip) {
-              onStartTrip(dest, routeData);
-            }
-          }, 800);
+          setIsLoadingTrip(false);
+          if (onStartTrip) {
+            onStartTrip(dest, routeData);
+          }
         } catch (error) {
           console.warn('Error al calcular ruta vehicular:', error);
+          setIsLoadingTrip(false);
           if (onStartTrip) {
             onStartTrip(dest);
           }
         }
+        return;
       }
+
+      setSpokenMessage(response.spokenText);
+      setVoiceState('speaking');
+
+      // Reproducción de voz con VoiceService
+      await VoiceService.speak(
+        response.spokenText,
+        async () => {
+          // Requerimiento 2: Flujo de auto-listening ante confirmaciones o preguntas de continuidad
+          const shouldAutoListen =
+            Boolean(response.updatedContext.pendingConfirmation) ||
+            Boolean(response.updatedContext.pendingTripCompletion) ||
+            Boolean(response.shouldAutoListen) ||
+            response.spokenText.toLowerCase().includes('otro lugar') ||
+            response.spokenText.toLowerCase().includes('a dónde desea ir') ||
+            response.spokenText.toLowerCase().includes('a donde desea ir') ||
+            response.spokenText.toLowerCase().includes('a qué lugar');
+
+          if (shouldAutoListen) {
+            try {
+              await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+            } catch {
+              // Ignorar si haptics no está disponible
+            }
+
+            const started = await AudioRecorderService.startRecording();
+            if (started) {
+              setVoiceState('listening');
+              if (response.updatedContext.pendingConfirmation) {
+                setSpokenMessage(
+                  `¿Desea iniciar el viaje a ${response.updatedContext.pendingConfirmation.destination}?`
+                );
+              } else if (response.updatedContext.pendingTripCompletion) {
+                setSpokenMessage('¿Desea viajar a algún otro lugar?');
+              } else {
+                setSpokenMessage('Diga su nuevo destino con calma...');
+              }
+
+              if (recordingTimeoutRef.current) {
+                clearTimeout(recordingTimeoutRef.current);
+              }
+              recordingTimeoutRef.current = setTimeout(async () => {
+                if (AudioRecorderService.isRecording()) {
+                  setVoiceState('processing');
+                  const transcription = await AudioRecorderService.stopAndTranscribe();
+                  const speechText = transcription?.text?.trim() || '';
+                  if (!speechText) {
+                    setVoiceState('idle');
+                    setSpokenMessage('No logré escucharte con claridad. Toca el botón para hablar.');
+                    await VoiceService.speak('No logré escucharte con claridad. Toca el botón para hablar.');
+                    return;
+                  }
+                  await handleProcessInput(speechText);
+                }
+              }, 8000);
+              return;
+            }
+          }
+
+          setVoiceState('idle');
+        },
+        () => {
+          setVoiceState('speaking');
+        }
+      );
     } catch (error) {
       console.warn('Error al procesar mensaje conversacional:', error);
       setVoiceState('idle');
@@ -298,14 +548,15 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
 
       setVoiceState('processing');
 
-      // Si hay una confirmación pendiente, confirmar con "Sí"
-      if (currentContext.pendingConfirmation) {
-        await handleProcessInput('Sí');
-      } else {
-        const transcription = await AudioRecorderService.stopAndTranscribe();
-        const speechText = transcription?.text || 'Hospital General';
-        await handleProcessInput(speechText);
+      const transcription = await AudioRecorderService.stopAndTranscribe();
+      const speechText = transcription?.text?.trim() || '';
+      if (!speechText) {
+        setVoiceState('idle');
+        setSpokenMessage('No logré escucharte con claridad. Toca el botón para hablar.');
+        await VoiceService.speak('No logré escucharte con claridad. Toca el botón para hablar.');
+        return;
       }
+      await handleProcessInput(speechText);
       return;
     }
 
@@ -318,16 +569,18 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       }
       setVoiceState('listening');
 
-      // Si hay confirmación pendiente, guiar al usuario
-      if (currentContext.pendingConfirmation) {
+      // Si hay confirmación pendiente o continuidad, guiar al usuario
+      if (contextRef.current.pendingConfirmation) {
         setSpokenMessage(
-          `¿Desea iniciar el viaje a ${currentContext.pendingConfirmation.destination}?`
+          `¿Desea iniciar el viaje a ${contextRef.current.pendingConfirmation.destination}?`
         );
+      } else if (contextRef.current.pendingTripCompletion) {
+        setSpokenMessage('¿Desea viajar a algún otro lugar?');
       } else {
         setSpokenMessage('Diga su destino con calma...');
       }
 
-      // Temporizador de auto-detención de 4.5 segundos para adultos mayores
+      // T-1.4: Temporizador de auto-detención calibrado a 8.0 segundos de silencio para adultos mayores
       if (recordingTimeoutRef.current) {
         clearTimeout(recordingTimeoutRef.current);
       }
@@ -335,12 +588,16 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         if (AudioRecorderService.isRecording()) {
           setVoiceState('processing');
           const transcription = await AudioRecorderService.stopAndTranscribe();
-          const speechText =
-            transcription?.text ||
-            (currentContext.pendingConfirmation ? 'Sí' : 'Bellas Artes');
+          const speechText = transcription?.text?.trim() || '';
+          if (!speechText) {
+            setVoiceState('idle');
+            setSpokenMessage('No logré escucharte con claridad. Toca el botón para hablar.');
+            await VoiceService.speak('No logré escucharte con claridad. Toca el botón para hablar.');
+            return;
+          }
           await handleProcessInput(speechText);
         }
-      }, 4500);
+      }, 8000);
     }
   };
 
@@ -348,8 +605,16 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
    * Texto de estado accesible WCAG AAA para la cabecera central
    */
   const getStatusText = (): string => {
+    if (voiceState === 'processing') {
+      return 'Pensando...';
+    }
+
     if (currentContext.pendingConfirmation) {
       return `¿Ir a ${currentContext.pendingConfirmation.destination}?`;
+    }
+
+    if (currentContext.pendingTripCompletion) {
+      return '¿Viajar a otro lugar?';
     }
 
     switch (voiceState) {
@@ -357,8 +622,6 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         return 'Te escucho...';
       case 'speaking':
         return 'Hablando...';
-      case 'processing':
-        return 'Procesando...';
       case 'idle':
       default:
         return 'Presiona para hablar';
@@ -369,17 +632,23 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
    * Subtexto o instrucción descriptiva
    */
   const getInstructionHint = (): string => {
+    if (voiceState === 'processing') {
+      return 'Un momento por favor, procesando su solicitud...';
+    }
+
     if (currentContext.pendingConfirmation) {
       return 'Diga "Sí" para confirmar o "Cancelar" para detener';
     }
 
+    if (currentContext.pendingTripCompletion) {
+      return 'Diga un nuevo destino o "No" para terminar';
+    }
+
     switch (voiceState) {
       case 'listening':
-        return 'Diga a dónde desea ir o elija una opción abajo';
+        return 'Diga a dónde desea ir con calma';
       case 'speaking':
         return spokenMessage || 'Escuche con atención';
-      case 'processing':
-        return 'Calculando la mejor ruta...';
       case 'idle':
       default:
         return 'Toca el botón naranja para pedir indicaciones';
@@ -387,10 +656,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   };
 
   return (
-    <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      style={[styles.container, { backgroundColor: currentTheme.background }]}
-    >
+    <View style={[styles.container, { backgroundColor: currentTheme.background }]}>
       <StatusBar
         barStyle={isDarkMode ? 'light-content' : 'dark-content'}
         backgroundColor="transparent"
@@ -398,70 +664,19 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       />
 
       <SafeAreaView style={styles.safeArea}>
-        {/* 1. Barra Superior Discreta */}
-        <View style={styles.topBar}>
-          {onToggleView ? (
-            <TouchableOpacity
-              onPress={onToggleView}
-              style={[
-                styles.viewToggleButton,
-                {
-                  backgroundColor: currentTheme.cardBackground,
-                  borderColor: currentTheme.cardBorder,
-                },
-              ]}
-              accessibilityLabel="Cambiar a vista con mapa"
-              accessibilityRole="button"
-              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-            >
-              <Ionicons
-                name="map-outline"
-                size={22}
-                color={currentTheme.textPrimary}
-                style={styles.viewToggleIcon}
-              />
-              <Text
-                style={[
-                  styles.viewToggleText,
-                  { color: currentTheme.textPrimary },
-                ]}
-              >
-                Ver Mapa
-              </Text>
-            </TouchableOpacity>
-          ) : (
-            <View style={styles.topBarSpacer} />
-          )}
-
-          {/* Selector de Modo Día / Modo Noche */}
-          <TouchableOpacity
-            onPress={handleToggleTheme}
-            style={styles.themeToggle}
-            accessibilityLabel={
-              isDarkMode ? 'Cambiar a modo día' : 'Cambiar a modo noche'
-            }
-            accessibilityRole="button"
-            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-          >
-            <Ionicons
-              name={isDarkMode ? 'moon' : 'sunny-outline'}
-              size={32}
-              color={currentTheme.headerIcon}
-            />
-          </TouchableOpacity>
-        </View>
-
-        {/* 2. Centro de la pantalla: One-Button UI pura con botón central dominante */}
+        {/* Centro de la pantalla: One-Button UI pura con botón central dominante */}
         <View style={styles.centerContainer}>
-          {/* Saludo accesible de alto contraste */}
-          <Text
-            style={[
-              styles.greetingText,
-              { color: currentTheme.textSecondary },
-            ]}
-          >
-            HOLA, {userName.toUpperCase()}
-          </Text>
+          {/* T-1.1: Saludo temporal autodesvanecible tras 4 segundos */}
+          <Animated.View style={{ opacity: greetingOpacityAnim }}>
+            <Text
+              style={[
+                styles.greetingText,
+                { color: currentTheme.textSecondary },
+              ]}
+            >
+              HOLA, {userName.toUpperCase()}
+            </Text>
+          </Animated.View>
 
           {/* Mensaje de estado accesible WCAG AAA */}
           <Text
@@ -486,14 +701,14 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
             {getInstructionHint()}
           </Text>
 
-          {/* Botón Gigante del Micrófono (144dp) con halo animado */}
+          {/* T-1.3: Botón Gigante del Micrófono (144dp) con sistema cromático y ondas concéntricas */}
           <View style={styles.micButtonWrapper}>
-            {/* Halo animado con escala y opacidad reactiva */}
+            {/* Primera onda concéntrica / halo animado */}
             <Animated.View
               style={[
                 styles.glowHalo,
                 {
-                  backgroundColor: currentTheme.buttonGlow,
+                  backgroundColor: getHaloColor(),
                   opacity: haloOpacityAnim,
                   transform: [{ scale: pulseAnim }],
                 },
@@ -501,220 +716,95 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
               pointerEvents="none"
             />
 
-            {/* Botón circular táctil de alto contraste */}
+            {/* Segunda onda concéntrica animada al escuchar */}
+            {voiceState === 'listening' && (
+              <Animated.View
+                style={[
+                  styles.glowHalo,
+                  {
+                    backgroundColor: getHaloColor(),
+                    opacity: Animated.multiply(haloOpacityAnim, 0.7),
+                    transform: [{ scale: pulseAnim2 }],
+                  },
+                ]}
+                pointerEvents="none"
+              />
+            )}
+
+            {/* Botón circular táctil sin texto de alto contraste */}
             <TouchableOpacity
               activeOpacity={0.85}
               onPress={handleVoicePress}
               style={[
                 styles.micButton,
                 {
-                  backgroundColor: currentTheme.buttonOrange,
+                  backgroundColor: getButtonColor(),
+                  shadowColor: getButtonColor(),
                 },
               ]}
               accessibilityLabel="Botón principal de micrófono"
               accessibilityHint="Presiona para hablar y solicitar tu viaje"
               accessibilityRole="button"
             >
-              <Ionicons
-                name={
-                  voiceState === 'listening'
-                    ? 'mic'
-                    : voiceState === 'speaking'
-                    ? 'volume-high'
-                    : 'mic-outline'
-                }
-                size={68}
-                color="#FFFFFF"
-              />
-            </TouchableOpacity>
-          </View>
-
-          {/* 3. Comandos rápidos accesibles (Píldoras táctiles >= 48dp de alto contraste) */}
-          <View style={styles.actionChipsContainer}>
-            {currentContext.pendingConfirmation ? (
-              // Opciones del Paso 2: Confirmación explícita
-              <View style={styles.confirmationRow}>
-                <TouchableOpacity
-                  style={[
-                    styles.actionChip,
-                    styles.confirmChip,
-                    { backgroundColor: '#16A34A' },
-                  ]}
-                  onPress={() => handleProcessInput('Sí')}
-                  accessibilityLabel="Confirmar inicio del viaje"
-                  accessibilityRole="button"
-                >
-                  <Ionicons
-                    name="checkmark-circle"
-                    size={24}
-                    color="#FFFFFF"
-                    style={{ marginRight: 8 }}
-                  />
-                  <Text style={styles.confirmChipText}>Sí, iniciar viaje</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={[
-                    styles.actionChip,
-                    styles.cancelChip,
-                    {
-                      backgroundColor: currentTheme.cardBackground,
-                      borderColor: currentTheme.cardBorder,
-                    },
-                  ]}
-                  onPress={() => handleProcessInput('Cancelar')}
-                  accessibilityLabel="Cancelar viaje"
-                  accessibilityRole="button"
-                >
-                  <Ionicons
-                    name="close-circle-outline"
-                    size={24}
-                    color={currentTheme.textPrimary}
-                    style={{ marginRight: 6 }}
-                  />
-                  <Text
-                    style={[
-                      styles.actionChipText,
-                      { color: currentTheme.textPrimary },
-                    ]}
-                  >
-                    Cancelar
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            ) : (
-              // Sugerencias de destinos frecuentes en reposo o al escuchar
-              <View style={styles.chipsWrap}>
-                <TouchableOpacity
-                  style={[
-                    styles.actionChip,
-                    {
-                      backgroundColor: currentTheme.cardBackground,
-                      borderColor: currentTheme.cardBorder,
-                    },
-                  ]}
-                  onPress={() => handleProcessInput('Llevarme a Bellas Artes')}
-                  accessibilityLabel="Pedir ruta a Bellas Artes"
-                  accessibilityRole="button"
-                >
-                  <Ionicons
-                    name="navigate-outline"
-                    size={20}
-                    color={currentTheme.buttonOrange}
-                    style={{ marginRight: 6 }}
-                  />
-                  <Text
-                    style={[
-                      styles.actionChipText,
-                      { color: currentTheme.textPrimary },
-                    ]}
-                  >
-                    Bellas Artes
-                  </Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={[
-                    styles.actionChip,
-                    {
-                      backgroundColor: currentTheme.cardBackground,
-                      borderColor: currentTheme.cardBorder,
-                    },
-                  ]}
-                  onPress={() =>
-                    handleProcessInput('Quiero ir al Hospital General')
-                  }
-                  accessibilityLabel="Pedir ruta a Hospital General"
-                  accessibilityRole="button"
-                >
-                  <Ionicons
-                    name="medkit-outline"
-                    size={20}
-                    color={currentTheme.buttonOrange}
-                    style={{ marginRight: 6 }}
-                  />
-                  <Text
-                    style={[
-                      styles.actionChipText,
-                      { color: currentTheme.textPrimary },
-                    ]}
-                  >
-                    Hospital General
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            )}
-
-            {/* Alternar entrada de texto accesible para pruebas o soporte multimodal */}
-            <TouchableOpacity
-              onPress={() => setShowManualInput((prev) => !prev)}
-              style={styles.keyboardToggle}
-              accessibilityLabel="Escribir o dictar manualmente un comando"
-              accessibilityRole="button"
-            >
-              <Ionicons
-                name={showManualInput ? 'chevron-up' : 'keypad-outline'}
-                size={20}
-                color={currentTheme.textSecondary}
-              />
-              <Text
-                style={[
-                  styles.keyboardToggleText,
-                  { color: currentTheme.textSecondary },
-                ]}
-              >
-                {showManualInput ? 'Ocultar teclado' : 'Escribir destino'}
-              </Text>
-            </TouchableOpacity>
-
-            {showManualInput && (
-              <View
-                style={[
-                  styles.manualInputWrapper,
-                  {
-                    backgroundColor: currentTheme.cardBackground,
-                    borderColor: currentTheme.cardBorder,
-                  },
-                ]}
-              >
-                <TextInput
-                  value={manualText}
-                  onChangeText={setManualText}
-                  placeholder="Ej: Ir a Bellas Artes, Sí, Cancelar..."
-                  placeholderTextColor={currentTheme.textSecondary}
-                  style={[
-                    styles.textInputField,
-                    { color: currentTheme.textPrimary },
-                  ]}
-                  onSubmitEditing={() => {
-                    handleProcessInput(manualText);
-                    setManualText('');
-                  }}
-                  returnKeyType="send"
+              {voiceState === 'processing' ? (
+                <ActivityIndicator
+                  size="large"
+                  color="#FFFFFF"
+                  style={{ transform: [{ scale: 1.6 }] }}
                 />
-                <TouchableOpacity
-                  style={[
-                    styles.sendButton,
-                    { backgroundColor: currentTheme.buttonOrange },
-                  ]}
-                  onPress={() => {
-                    handleProcessInput(manualText);
-                    setManualText('');
-                  }}
-                  accessibilityLabel="Enviar comando escrito"
-                  accessibilityRole="button"
-                >
-                  <Ionicons name="send" size={20} color="#FFFFFF" />
-                </TouchableOpacity>
-              </View>
-            )}
+              ) : (
+                <Ionicons
+                  name={getButtonIcon()}
+                  size={68}
+                  color="#FFFFFF"
+                />
+              )}
+            </TouchableOpacity>
           </View>
         </View>
 
-        {/* 4. Espaciador inferior */}
+        {/* Espaciador inferior */}
         <View style={styles.bottomSpacer} />
       </SafeAreaView>
-    </KeyboardAvoidingView>
+
+      {/* Requerimiento 3: Pantalla / Indicador de Carga Gerontológico */}
+      {isLoadingTrip && (
+        <View
+          style={[
+            styles.loadingOverlay,
+            { backgroundColor: currentTheme.background },
+          ]}
+          accessibilityRole="alert"
+          accessibilityLiveRegion="assertive"
+        >
+          <View style={styles.loadingContent}>
+            <ActivityIndicator
+              size="large"
+              color={currentTheme.buttonOrange}
+              style={styles.loadingSpinner}
+            />
+
+            <Text
+              style={[
+                styles.loadingTitle,
+                { color: currentTheme.textPrimary },
+              ]}
+            >
+              Preparando tu viaje...
+            </Text>
+
+            <Text
+              style={[
+                styles.loadingSubtitle,
+                { color: currentTheme.textSecondary },
+              ]}
+            >
+              {`Calculando la mejor ruta hacia ${loadingDestination}...\nPor favor espera un momento.`}
+            </Text>
+          </View>
+        </View>
+      )}
+    </View>
   );
 };
 
@@ -727,40 +817,6 @@ const styles = StyleSheet.create({
   },
   safeArea: {
     flex: 1,
-  },
-  topBar: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingTop: 12,
-    paddingBottom: 8,
-    minHeight: 56,
-  },
-  topBarSpacer: {
-    width: 48,
-  },
-  viewToggleButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 22,
-    borderWidth: 1.5,
-    minHeight: 48,
-  },
-  viewToggleIcon: {
-    marginRight: 8,
-  },
-  viewToggleText: {
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  themeToggle: {
-    width: 48,
-    height: 48,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
   centerContainer: {
     flex: 1,
@@ -786,7 +842,7 @@ const styles = StyleSheet.create({
     fontSize: 17,
     fontWeight: '600',
     textAlign: 'center',
-    marginBottom: 32,
+    marginBottom: 36,
     paddingHorizontal: 12,
     lineHeight: 24,
   },
@@ -795,7 +851,6 @@ const styles = StyleSheet.create({
     height: HALO_SIZE,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 28,
   },
   glowHalo: {
     position: 'absolute',
@@ -809,96 +864,40 @@ const styles = StyleSheet.create({
     borderRadius: BUTTON_SIZE / 2,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#FF5722',
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.55,
     shadowRadius: 18,
     elevation: 12,
   },
-  actionChipsContainer: {
-    width: '100%',
-    alignItems: 'center',
-    marginTop: 8,
-  },
-  confirmationRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 12,
-    marginBottom: 16,
-    width: '100%',
-  },
-  chipsWrap: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-    gap: 10,
-    marginBottom: 16,
-  },
-  actionChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 18,
-    paddingVertical: 12,
-    borderRadius: 24,
-    borderWidth: 1.5,
-    minHeight: 48,
-  },
-  confirmChip: {
-    paddingHorizontal: 22,
-    paddingVertical: 14,
-    minHeight: 52,
-  },
-  confirmChipText: {
-    color: '#FFFFFF',
-    fontSize: 18,
-    fontWeight: '800',
-  },
-  cancelChip: {
-    paddingHorizontal: 18,
-    paddingVertical: 14,
-    minHeight: 52,
-  },
-  actionChipText: {
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  keyboardToggle: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-  },
-  keyboardToggleText: {
-    fontSize: 14,
-    fontWeight: '600',
-    marginLeft: 6,
-  },
-  manualInputWrapper: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    width: '100%',
-    borderRadius: 16,
-    borderWidth: 1.5,
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    marginTop: 8,
-  },
-  textInputField: {
-    flex: 1,
-    height: 48,
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  sendButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginLeft: 8,
-  },
   bottomSpacer: {
-    height: 16,
+    height: 40,
+  },
+  loadingOverlay: {
+    ...StyleSheet.absoluteFill,
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 100,
+    paddingHorizontal: 28,
+  },
+  loadingContent: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    maxWidth: 380,
+  },
+  loadingSpinner: {
+    transform: [{ scale: 2.0 }],
+    marginBottom: 36,
+  },
+  loadingTitle: {
+    fontSize: 28,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  loadingSubtitle: {
+    fontSize: 20,
+    fontWeight: '600',
+    textAlign: 'center',
+    lineHeight: 28,
   },
 });

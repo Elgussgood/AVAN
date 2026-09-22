@@ -1,6 +1,11 @@
 import { Platform } from 'react-native';
 import * as Speech from 'expo-speech';
-import { Audio, AVPlaybackStatus } from 'expo-av';
+import {
+  createAudioPlayer,
+  setAudioModeAsync,
+  type AudioPlayer,
+  type AudioStatus,
+} from 'expo-audio';
 import { File, Paths } from 'expo-file-system';
 
 export type OpenAITTSVoice = 'nova' | 'shimmer' | 'alloy' | 'echo' | 'fable' | 'onyx';
@@ -8,6 +13,7 @@ export type OpenAITTSVoice = 'nova' | 'shimmer' | 'alloy' | 'echo' | 'fable' | '
 export interface VoiceServiceOptions {
   apiKey?: string;
   voice?: OpenAITTSVoice;
+  elevenLabsVoiceId?: string;
   apiBaseUrl?: string;
   speed?: number;
 }
@@ -16,16 +22,17 @@ export interface VoiceServiceOptions {
  * Servicio de síntesis de voz (TTS) de alta fidelidad para el proyecto AVAN.
  *
  * Diseñado con enfoque en accesibilidad para adultos mayores:
- * - Voz ultra-natural, humana y cálida vía API OpenAI TTS (modelo tts-1, voz 'nova' o 'shimmer').
- * - Velocidad calibrada a 0.88x para máxima inteligibilidad y menor esfuerzo cognitivo.
+ * - Soporte nativo para ElevenLabs (voz ultra-humana 'Rachel', modelo multilingüe v2).
+ * - Soporte para OpenAI TTS (modelo tts-1, voz 'nova' o 'shimmer').
+ * - Motor de contingencia nativo vía expo-speech configurado a prueba de balas en es-MX.
+ * - Velocidad calibrada a 0.88x - 0.9x para máxima inteligibilidad y menor esfuerzo cognitivo.
  * - Tono 0.95 para reducir estridencia y fatiga auditiva.
- * - Fallback inteligente a expo-speech priorizando voces nativas Enhanced en es-MX / es-419.
- * - Reproducción de baja latencia con expo-av.
+ * - Reproducción de audio externo moderna y resiliente con expo-audio (createAudioPlayer).
  * - Cero persistencia de audios en disco tras la reproducción (privacidad de datos biométricos).
  */
 export class VoiceService {
   private static isSpeakingState = false;
-  private static currentSound: Audio.Sound | null = null;
+  private static currentPlayer: AudioPlayer | null = null;
   private static currentTempFile: File | null = null;
   private static currentWebObjectUrl: string | null = null;
   private static currentAbortController: AbortController | null = null;
@@ -34,12 +41,13 @@ export class VoiceService {
   // Configuración por defecto
   private static customApiKey: string | null = null;
   private static selectedVoice: OpenAITTSVoice = 'nova';
+  private static elevenLabsVoiceId = 'EXAVITQu4vr4xnSDxMaL'; // Voz premade gratuita (Sarah / Bella, cálida, natural, multilingüe)
   private static apiBaseUrl = 'https://api.openai.com/v1/audio/speech';
   private static speed = 0.88;
   private static pitch = 0.95;
 
   /**
-   * Configura la clave de API global para OpenAI TTS.
+   * Configura la clave de API global (OpenAI o ElevenLabs).
    */
   static setApiKey(key: string): void {
     this.customApiKey = key;
@@ -53,7 +61,14 @@ export class VoiceService {
   }
 
   /**
-   * Configura la URL base de la API (compatible con OpenAI o proxies).
+   * Configura el ID de voz para ElevenLabs (por defecto: '21m00Tcm4TlvDq8ikWAM' - Rachel).
+   */
+  static setElevenLabsVoiceId(voiceId: string): void {
+    this.elevenLabsVoiceId = voiceId;
+  }
+
+  /**
+   * Configura la URL base de la API OpenAI (compatible con proxies).
    */
   static setApiBaseUrl(url: string): void {
     this.apiBaseUrl = url;
@@ -75,14 +90,15 @@ export class VoiceService {
 
   /**
    * Sintetiza y reproduce texto por voz.
-   * Intenta primero usar la API de OpenAI TTS para voz ultra-natural y humana.
-   * Si no hay API key disponible o falla la llamada de red, recurre al motor
-   * expo-speech con la mejor voz disponible en el dispositivo.
+   * Prioridad de síntesis:
+   * 1. ElevenLabs (si la clave empieza con 'sk_' o está configurada EXPO_PUBLIC_ELEVENLABS_API_KEY).
+   * 2. OpenAI TTS (si la clave empieza con 'sk-').
+   * 3. Fallback inteligente y garantizado a expo-speech en 'es-MX'.
    *
    * @param text Texto a reproducir.
    * @param onDone Callback opcional al finalizar la reproducción o si ocurre un error.
    * @param onStart Callback opcional al comenzar a reproducir el audio.
-   * @param apiKey Clave de API de OpenAI opcional (toma precedencia sobre configuración global).
+   * @param apiKey Clave de API opcional (toma precedencia sobre configuración global).
    */
   static async speak(
     text: string,
@@ -101,30 +117,73 @@ export class VoiceService {
     // Detener cualquier reproducción previa
     await this.stop();
 
+    const elevenLabsExplicitKey =
+      (typeof process !== 'undefined' && process.env
+        ? process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY || process.env.ELEVENLABS_API_KEY
+        : undefined);
+
     const resolvedApiKey =
       apiKey ||
       this.customApiKey ||
+      elevenLabsExplicitKey ||
       (typeof process !== 'undefined' && process.env
         ? process.env.EXPO_PUBLIC_OPENAI_API_KEY || process.env.OPENAI_API_KEY
         : undefined);
 
     this.isSpeakingState = true;
 
-    // Intentar primero con OpenAI TTS si hay API key configurada
+    let success = false;
+
+    // Detectar si la clave corresponde a ElevenLabs
+    // Claves de ElevenLabs típicamente inician con 'sk_' (guion bajo), o provienen de variable ElevenLabs
+    const isElevenLabsKey =
+      Boolean(elevenLabsExplicitKey) ||
+      (typeof resolvedApiKey === 'string' && resolvedApiKey.startsWith('sk_'));
+
+    const isOpenAIKey =
+      typeof resolvedApiKey === 'string' && resolvedApiKey.startsWith('sk-');
+
     if (resolvedApiKey) {
-      const success = await this.speakWithOpenAI(
-        naturalText,
-        resolvedApiKey,
-        onDone,
-        onStart
-      );
+      if (isElevenLabsKey) {
+        console.log('[VoiceService] Detectada API key de ElevenLabs, sintetizando voz ultra-natural...');
+        success = await this.speakWithElevenLabs(
+          naturalText,
+          resolvedApiKey,
+          onDone,
+          onStart
+        );
+      } else if (isOpenAIKey) {
+        console.log('[VoiceService] Detectada API key de OpenAI, sintetizando con OpenAI TTS...');
+        success = await this.speakWithOpenAI(
+          naturalText,
+          resolvedApiKey,
+          onDone,
+          onStart
+        );
+      } else {
+        // Clave genérica: intentar primero ElevenLabs, luego OpenAI
+        success = await this.speakWithElevenLabs(
+          naturalText,
+          resolvedApiKey,
+          onDone,
+          onStart
+        );
+        if (!success) {
+          success = await this.speakWithOpenAI(
+            naturalText,
+            resolvedApiKey,
+            onDone,
+            onStart
+          );
+        }
+      }
 
       if (success) {
         return;
       }
     }
 
-    // Fallback mejorado con expo-speech
+    // Fallback mejorado y robusto con expo-speech
     await this.speakWithSpeechFallback(naturalText, onDone, onStart);
   }
 
@@ -135,7 +194,10 @@ export class VoiceService {
     return Boolean(
       this.customApiKey ||
         (typeof process !== 'undefined' && process.env
-          ? process.env.EXPO_PUBLIC_OPENAI_API_KEY || process.env.OPENAI_API_KEY
+          ? process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY ||
+            process.env.ELEVENLABS_API_KEY ||
+            process.env.EXPO_PUBLIC_OPENAI_API_KEY ||
+            process.env.OPENAI_API_KEY
           : false)
     );
   }
@@ -176,18 +238,15 @@ export class VoiceService {
       this.currentAbortController = null;
     }
 
-    // 2. Detener y descargar sonido de expo-av
-    if (this.currentSound) {
+    // 2. Detener y remover AudioPlayer de expo-audio
+    if (this.currentPlayer) {
       try {
-        const status = await this.currentSound.getStatusAsync();
-        if (status.isLoaded) {
-          await this.currentSound.stopAsync();
-          await this.currentSound.unloadAsync();
-        }
+        this.currentPlayer.pause();
+        this.currentPlayer.remove();
       } catch (error) {
-        console.warn('[VoiceService] Error al descargar audio:', error);
+        console.warn('[VoiceService] Error al detener AudioPlayer:', error);
       }
-      this.currentSound = null;
+      this.currentPlayer = null;
     }
 
     // 3. Eliminar archivo temporal en disco (privacidad de datos biométricos)
@@ -210,14 +269,126 @@ export class VoiceService {
       this.currentWebObjectUrl = null;
     }
 
-    // 5. Detener síntesis nativa de expo-speech
+    // 5. Detener síntesis nativa de expo-speech únicamente si está activa
     try {
-      await Speech.stop();
+      const isSpeaking = await Speech.isSpeakingAsync();
+      if (isSpeaking) {
+        await Speech.stop();
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      }
     } catch (error) {
       console.warn('[VoiceService] Error al detener Speech nativo:', error);
     }
 
     this.isSpeakingState = false;
+  }
+
+  /**
+   * Síntesis de voz ultra-natural con ElevenLabs (voz Rachel, modelo multilingüe v2).
+   */
+  private static async speakWithElevenLabs(
+    text: string,
+    apiKey: string,
+    onDone?: () => void,
+    onStart?: () => void
+  ): Promise<boolean> {
+    const controller = new AbortController();
+    this.currentAbortController = controller;
+
+    let audioUri: string | null = null;
+    let tempFile: File | null = null;
+    let webObjectUrl: string | null = null;
+
+    try {
+      let currentVoiceId = this.elevenLabsVoiceId;
+      let url = `https://api.elevenlabs.io/v1/text-to-speech/${currentVoiceId}`;
+      let response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey,
+          'Content-Type': 'application/json',
+          Accept: 'audio/mpeg',
+        },
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_multilingual_v2',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+            speed: 0.9,
+          },
+        }),
+        signal: controller.signal,
+      });
+
+      // Si la petición devuelve 402 (payment_required por ser voz de librería en cuenta gratuita),
+      // reintentar de inmediato con la voz premade gratuita garantizada 'EXAVITQu4vr4xnSDxMaL'
+      if (response.status === 402 && currentVoiceId !== 'EXAVITQu4vr4xnSDxMaL') {
+        console.warn(
+          `[VoiceService] ElevenLabs 402 (voz de librería restringida en cuenta free). Reintentando con voz premade 'EXAVITQu4vr4xnSDxMaL'...`
+        );
+        currentVoiceId = 'EXAVITQu4vr4xnSDxMaL';
+        url = `https://api.elevenlabs.io/v1/text-to-speech/${currentVoiceId}`;
+        response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'xi-api-key': apiKey,
+            'Content-Type': 'application/json',
+            Accept: 'audio/mpeg',
+          },
+          body: JSON.stringify({
+            text,
+            model_id: 'eleven_multilingual_v2',
+            voice_settings: {
+              stability: 0.5,
+              similarity_boost: 0.75,
+              speed: 0.9,
+            },
+          }),
+          signal: controller.signal,
+        });
+      }
+
+      if (!response.ok) {
+        const errorDetail = await response.text();
+        console.warn(`[VoiceService] Error en ElevenLabs TTS (${response.status}):`, errorDetail);
+        return false;
+      }
+
+      // Procesar buffer binario MP3
+      if (Platform.OS === 'web') {
+        const blob = await response.blob();
+        webObjectUrl = URL.createObjectURL(blob);
+        this.currentWebObjectUrl = webObjectUrl;
+        audioUri = webObjectUrl;
+      } else {
+        const arrayBuffer = await response.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+        const fileName = `avan_tts_el_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`;
+        tempFile = new File(Paths.cache, fileName);
+        tempFile.create({ overwrite: true });
+        tempFile.write(bytes);
+        this.currentTempFile = tempFile;
+        audioUri = tempFile.uri;
+      }
+
+      if (controller.signal.aborted) {
+        this.cleanupResources(tempFile, webObjectUrl);
+        return true;
+      }
+
+      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart);
+    } catch (error: any) {
+      this.cleanupResources(tempFile, webObjectUrl);
+
+      if (controller.signal.aborted) {
+        this.isSpeakingState = false;
+        return true;
+      }
+
+      console.warn('[VoiceService] Falló síntesis ElevenLabs, intentando fallback:', error?.message || error);
+      return false;
+    }
   }
 
   /**
@@ -269,7 +440,7 @@ export class VoiceService {
       } else {
         const arrayBuffer = await response.arrayBuffer();
         const bytes = new Uint8Array(arrayBuffer);
-        const fileName = `avan_tts_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`;
+        const fileName = `avan_tts_oa_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`;
         tempFile = new File(Paths.cache, fileName);
         tempFile.create({ overwrite: true });
         tempFile.write(bytes);
@@ -282,17 +453,41 @@ export class VoiceService {
         return true;
       }
 
+      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart);
+    } catch (error: any) {
+      this.cleanupResources(tempFile, webObjectUrl);
+
+      if (controller.signal.aborted) {
+        this.isSpeakingState = false;
+        return true;
+      }
+
+      console.warn('[VoiceService] Falló síntesis OpenAI TTS, intentando fallback:', error?.message || error);
+      return false;
+    }
+  }
+
+  /**
+   * Reproduce el archivo de audio con expo-audio y maneja el ciclo de vida y Zero-Persistence.
+   */
+  private static async playAudioSource(
+    audioUri: string,
+    tempFile: File | null,
+    webObjectUrl: string | null,
+    onDone?: () => void,
+    onStart?: () => void
+  ): Promise<boolean> {
+    try {
       // Configurar modo de audio para salida clara en altavoz
       try {
-        await Audio.setAudioModeAsync({
-          allowsRecordingIOS: false,
-          playsInSilentModeIOS: true,
-          staysActiveInBackground: false,
-          shouldDuckAndroid: true,
-          playThroughEarpieceAndroid: false,
+        await setAudioModeAsync({
+          playsInSilentMode: true,
+          allowsRecording: false,
+          shouldRouteThroughEarpiece: false,
+          interruptionMode: 'duckOthers',
         });
       } catch {
-        // Ignorar si la plataforma no soporta configuración completa de audio
+        // Ignorar si la plataforma no soporta configuración de audio
       }
 
       let hasStarted = false;
@@ -303,56 +498,49 @@ export class VoiceService {
         hasFinished = true;
         this.isSpeakingState = false;
 
-        if (this.currentSound) {
+        if (this.currentPlayer) {
           try {
-            await this.currentSound.unloadAsync();
+            this.currentPlayer.pause();
+            this.currentPlayer.remove();
           } catch {}
-          this.currentSound = null;
+          this.currentPlayer = null;
         }
 
         this.cleanupResources(tempFile, webObjectUrl);
         this.currentAbortController = null;
       };
 
-      const { sound } = await Audio.Sound.createAsync(
-        { uri: audioUri },
-        { shouldPlay: true },
-        (status: AVPlaybackStatus) => {
-          if (!status.isLoaded) {
-            if (status.error) {
-              console.warn('[VoiceService] Error en reproducción de audio:', status.error);
-              handleCleanup().then(() => {
-                if (onDone) onDone();
-              });
-            }
-            return;
-          }
+      // Crear player con expo-audio
+      const player = createAudioPlayer({ uri: audioUri });
+      this.currentPlayer = player;
 
-          if (status.isPlaying && !hasStarted) {
-            hasStarted = true;
-            this.isSpeakingState = true;
-            if (onStart) onStart();
-          }
-
-          if (status.didJustFinish) {
-            handleCleanup().then(() => {
-              if (onDone) onDone();
-            });
-          }
+      player.addListener('playbackStatusUpdate', (status: AudioStatus) => {
+        if (status.error) {
+          console.warn('[VoiceService] Error en reproducción de expo-audio:', status.error);
+          handleCleanup().then(() => {
+            if (onDone) onDone();
+          });
+          return;
         }
-      );
 
-      this.currentSound = sound;
+        if (status.playing && !hasStarted) {
+          hasStarted = true;
+          this.isSpeakingState = true;
+          if (onStart) onStart();
+        }
+
+        if (status.didJustFinish) {
+          handleCleanup().then(() => {
+            if (onDone) onDone();
+          });
+        }
+      });
+
+      player.play();
       return true;
-    } catch (error: any) {
+    } catch (playError) {
+      console.warn('[VoiceService] Error al reproducir audio con expo-audio:', playError);
       this.cleanupResources(tempFile, webObjectUrl);
-
-      if (controller.signal.aborted) {
-        this.isSpeakingState = false;
-        return true;
-      }
-
-      console.warn('[VoiceService] Falló síntesis OpenAI TTS, usando fallback:', error?.message || error);
       return false;
     }
   }
@@ -385,11 +573,11 @@ export class VoiceService {
   }
 
   /**
-   * Fallback mejorado en expo-speech:
-   * 1. Consulta las voces disponibles en el dispositivo con Speech.getAvailableVoicesAsync().
-   * 2. Selecciona la voz en español de mayor calidad (priorizando quality === Speech.VoiceQuality.Enhanced
-   *    y variantes naturales en es-MX/es-419).
-   * 3. Ajusta rate en 0.88 y pitch en 0.95.
+   * Fallback 100% garantizado en expo-speech:
+   * 1. Invoca setAudioModeAsync de expo-audio para asegurar que el canal de audio esté en altavoz.
+   * 2. Emplea prioritariamente language: 'es-MX' (o 'es') con rate: 0.88 y pitch: 0.95 sin forzar
+   *    voice.identifier específico para evitar fallos silenciosos en Google TTS (Android).
+   * 3. Registra logs informativos y captura onError detalladamente.
    */
   private static async speakWithSpeechFallback(
     text: string,
@@ -397,33 +585,64 @@ export class VoiceService {
     onStart?: () => void
   ): Promise<void> {
     try {
-      const bestVoice = await this.getBestSpanishVoice();
+      // 1. Configurar modo de audio antes de llamar a Speech.speak
+      try {
+        await setAudioModeAsync({
+          allowsRecording: false,
+          playsInSilentMode: true,
+          shouldRouteThroughEarpiece: false,
+          interruptionMode: 'duckOthers',
+        });
+      } catch (audioModeErr) {
+        console.warn('[VoiceService] Error al configurar modo de audio antes de Speech:', audioModeErr);
+      }
+
+      console.log('[VoiceService] Reproduciendo por expo-speech:', text);
+
+      // 2. Determinar el idioma base en español
+      let languageToUse = 'es-MX';
+      try {
+        const voices = await Speech.getAvailableVoicesAsync();
+        if (voices && voices.length > 0) {
+          const hasEsMx = voices.some((v) =>
+            (v.language || '').toLowerCase().replace('_', '-').includes('es-mx')
+          );
+          const hasSpanish = voices.some((v) =>
+            (v.language || '').toLowerCase().startsWith('es')
+          );
+          if (!hasEsMx && hasSpanish) {
+            languageToUse = 'es';
+          }
+        }
+      } catch {
+        languageToUse = 'es-MX';
+      }
 
       const options: Speech.SpeechOptions = {
-        language: bestVoice?.language || 'es-MX',
-        rate: this.speed,
-        pitch: this.pitch,
+        language: languageToUse,
+        rate: this.speed, // 0.88: ritmo pausado para adultos mayores
+        pitch: this.pitch, // 0.95: tono ligeramente más grave para reducir fatiga auditiva
         onStart: () => {
+          console.log('[VoiceService] Speech.speak onStart');
           this.isSpeakingState = true;
           if (onStart) onStart();
         },
         onDone: () => {
+          console.log('[VoiceService] Speech.speak onDone');
           this.isSpeakingState = false;
           if (onDone) onDone();
         },
         onStopped: () => {
+          console.log('[VoiceService] Speech.speak onStopped');
           this.isSpeakingState = false;
           if (onDone) onDone();
         },
-        onError: () => {
+        onError: (error) => {
+          console.warn('[VoiceService] Speech.speak onError:', error);
           this.isSpeakingState = false;
           if (onDone) onDone();
         },
       };
-
-      if (bestVoice?.identifier) {
-        options.voice = bestVoice.identifier;
-      }
 
       this.isSpeakingState = true;
       Speech.speak(text, options);
@@ -436,9 +655,9 @@ export class VoiceService {
 
   /**
    * Consulta las voces disponibles en el dispositivo con Speech.getAvailableVoicesAsync()
-   * y selecciona la voz en español de mayor fidelidad acústica.
+   * como método auxiliar de inspección.
    */
-  private static async getBestSpanishVoice(): Promise<Speech.Voice | null> {
+  static async getBestSpanishVoice(): Promise<Speech.Voice | null> {
     if (this.cachedBestVoice) {
       return this.cachedBestVoice;
     }
@@ -449,7 +668,6 @@ export class VoiceService {
         return null;
       }
 
-      // Filtrar voces en español
       const spanishVoices = voices.filter((v) => {
         const lang = (v.language || '').toLowerCase().replace('_', '-');
         return lang.startsWith('es');
@@ -459,18 +677,15 @@ export class VoiceService {
         return null;
       }
 
-      // Sistema de puntuación para selección de voz óptima
       const scoredVoices = spanishVoices.map((voice) => {
         let score = 0;
         const lang = (voice.language || '').toLowerCase().replace('_', '-');
         const name = (voice.name || '').toLowerCase();
 
-        // 1. Calidad mejorada del sintetizador (Enhanced / Premium)
         if (voice.quality === Speech.VoiceQuality.Enhanced) {
           score += 100;
         }
 
-        // Palabras clave de naturalidad en el nombre del paquete de voz
         if (
           name.includes('natural') ||
           name.includes('neural') ||
@@ -481,15 +696,14 @@ export class VoiceService {
           score += 40;
         }
 
-        // 2. Dialecto y acento familiar para el usuario objetivo
         if (lang === 'es-mx' || lang.includes('mx') || name.includes('mexico')) {
-          score += 50; // Español de México
+          score += 50;
         } else if (lang === 'es-419' || lang.includes('419')) {
-          score += 45; // Español latinoamericano neutro
+          score += 45;
         } else if (lang === 'es-us') {
-          score += 30; // Español de EE. UU.
+          score += 30;
         } else {
-          score += 15; // Otras variantes de español (es-ES, etc.)
+          score += 15;
         }
 
         return { voice, score };
