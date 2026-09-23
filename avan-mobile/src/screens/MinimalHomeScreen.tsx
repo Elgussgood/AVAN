@@ -19,7 +19,7 @@ import {
   ConversationService,
   ConversationContext,
 } from '../services/conversationService';
-import { orsService } from '../services/orsService';
+import { orsService, StepInstruction } from '../services/orsService';
 import { LocationService } from '../services/locationService';
 
 export type VoiceState = 'idle' | 'listening' | 'processing' | 'speaking';
@@ -30,6 +30,7 @@ export interface RouteData {
   instruction: string;
   distance: number;
   duration: number;
+  steps?: StepInstruction[];
 }
 
 export interface MinimalHomeScreenProps {
@@ -113,7 +114,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       const timer = setTimeout(async () => {
         setVoiceState('speaking');
         await VoiceService.speak(
-          `Hola ${userName}. Presiona el botón naranja para pedir indicaciones.`,
+          `Hola ${userName}. Presione el botón naranja para pedir indicaciones.`,
           () => {
             setVoiceState('idle');
           }
@@ -395,7 +396,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
 
         const preparingMsg =
           response.spokenText ||
-          `Calculando la mejor ruta hacia ${dest}, por favor espera un momento.`;
+          `Calculando la mejor ruta hacia ${dest}, por favor espere un momento.`;
         setSpokenMessage(preparingMsg);
         setVoiceState('speaking');
 
@@ -438,6 +439,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
             instruction: firstInstruction,
             distance: routeResult.distance,
             duration: routeResult.duration,
+            steps: routeResult.steps,
           };
 
           setIsLoadingTrip(false);
@@ -461,15 +463,23 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       await VoiceService.speak(
         response.spokenText,
         async () => {
-          // Requerimiento 2: Flujo de auto-listening ante confirmaciones o preguntas de continuidad
+          // Requerimiento gerontológico: Coherencia estricta entre mensaje y escucha activa
+          // Si el asistente emitió una despedida o cortesía de cierre, NUNCA abrir el micrófono.
+          const isFarewell =
+            /(?:hasta luego|excelente d[ií]a|buen d[ií]a|buenas noches|a su disposici[oó]n|nos vemos|adi[oó]s|que descanse|cu[ií]dese|que le vaya bien|con mucho gusto)/i.test(
+              response.spokenText
+            );
+
           const shouldAutoListen =
-            Boolean(response.updatedContext.pendingConfirmation) ||
-            Boolean(response.updatedContext.pendingTripCompletion) ||
-            Boolean(response.shouldAutoListen) ||
-            response.spokenText.toLowerCase().includes('otro lugar') ||
-            response.spokenText.toLowerCase().includes('a dónde desea ir') ||
-            response.spokenText.toLowerCase().includes('a donde desea ir') ||
-            response.spokenText.toLowerCase().includes('a qué lugar');
+            !isFarewell &&
+            (response.shouldAutoListen !== undefined
+              ? response.shouldAutoListen
+              : Boolean(response.updatedContext.pendingConfirmation) ||
+                (Boolean(response.updatedContext.pendingTripCompletion) && response.spokenText.includes('?')) ||
+                response.spokenText.toLowerCase().includes('otro lugar') ||
+                response.spokenText.toLowerCase().includes('a dónde desea ir') ||
+                response.spokenText.toLowerCase().includes('a donde desea ir') ||
+                response.spokenText.toLowerCase().includes('a qué lugar'));
 
           if (shouldAutoListen) {
             try {
@@ -501,8 +511,8 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
                   const speechText = transcription?.text?.trim() || '';
                   if (!speechText) {
                     setVoiceState('idle');
-                    setSpokenMessage('No logré escucharte con claridad. Toca el botón para hablar.');
-                    await VoiceService.speak('No logré escucharte con claridad. Toca el botón para hablar.');
+                    setSpokenMessage('No logré escucharle con claridad. Presione el botón para hablar.');
+                    await VoiceService.speak('No logré escucharle con claridad. Presione el botón para hablar.');
                     return;
                   }
                   await handleProcessInput(speechText);
@@ -552,8 +562,8 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       const speechText = transcription?.text?.trim() || '';
       if (!speechText) {
         setVoiceState('idle');
-        setSpokenMessage('No logré escucharte con claridad. Toca el botón para hablar.');
-        await VoiceService.speak('No logré escucharte con claridad. Toca el botón para hablar.');
+        setSpokenMessage('No logré escucharle con claridad. Presione el botón para hablar.');
+        await VoiceService.speak('No logré escucharle con claridad. Presione el botón para hablar.');
         return;
       }
       await handleProcessInput(speechText);
@@ -591,8 +601,8 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           const speechText = transcription?.text?.trim() || '';
           if (!speechText) {
             setVoiceState('idle');
-            setSpokenMessage('No logré escucharte con claridad. Toca el botón para hablar.');
-            await VoiceService.speak('No logré escucharte con claridad. Toca el botón para hablar.');
+            setSpokenMessage('No logré escucharle con claridad. Presione el botón para hablar.');
+            await VoiceService.speak('No logré escucharle con claridad. Presione el botón para hablar.');
             return;
           }
           await handleProcessInput(speechText);
@@ -619,12 +629,12 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
 
     switch (voiceState) {
       case 'listening':
-        return 'Te escucho...';
+        return 'Le escucho...';
       case 'speaking':
         return 'Hablando...';
       case 'idle':
       default:
-        return 'Presiona para hablar';
+        return 'Presione para hablar';
     }
   };
 
@@ -651,7 +661,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         return spokenMessage || 'Escuche con atención';
       case 'idle':
       default:
-        return 'Toca el botón naranja para pedir indicaciones';
+        return 'Presione el botón naranja para pedir indicaciones';
     }
   };
 
@@ -743,7 +753,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
                 },
               ]}
               accessibilityLabel="Botón principal de micrófono"
-              accessibilityHint="Presiona para hablar y solicitar tu viaje"
+              accessibilityHint="Presione para hablar y solicitar su viaje"
               accessibilityRole="button"
             >
               {voiceState === 'processing' ? (
@@ -790,7 +800,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
                 { color: currentTheme.textPrimary },
               ]}
             >
-              Preparando tu viaje...
+              Preparando su viaje...
             </Text>
 
             <Text
@@ -799,7 +809,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
                 { color: currentTheme.textSecondary },
               ]}
             >
-              {`Calculando la mejor ruta hacia ${loadingDestination}...\nPor favor espera un momento.`}
+              {`Calculando la mejor ruta hacia ${loadingDestination}...\nPor favor espere un momento.`}
             </Text>
           </View>
         </View>

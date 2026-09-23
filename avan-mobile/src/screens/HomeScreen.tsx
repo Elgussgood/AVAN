@@ -24,8 +24,14 @@ import {
 import { useLocationTracking } from '../hooks/useLocationTracking';
 import { LatLng } from 'react-native-maps';
 import * as Haptics from 'expo-haptics';
-import { orsService } from '../services/orsService';
+import { orsService, StepInstruction } from '../services/orsService';
 import { LocationService } from '../services/locationService';
+import {
+  NavigationService,
+  NavigationProgress,
+  getDistanceMeters,
+  getBearing,
+} from '../services/navigationService';
 
 export interface HomeScreenProps {
   isDarkMode: boolean;
@@ -35,6 +41,7 @@ export interface HomeScreenProps {
   routeCoordinates?: LatLng[];
   destinationCoords?: LatLng | null;
   instruction?: string;
+  steps?: StepInstruction[];
   remainingDistance?: number;
   remainingDuration?: number;
   onCancelTrip?: () => void;
@@ -57,6 +64,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   routeCoordinates,
   destinationCoords,
   instruction: propInstruction,
+  steps,
   remainingDistance = 4200,
   remainingDuration = 720,
   onCancelTrip,
@@ -78,19 +86,62 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     destinationCoords || null
   );
 
+  const [activeSteps, setActiveSteps] = useState<StepInstruction[]>(() => {
+    if (steps && steps.length > 0) return steps;
+    return [
+      {
+        instruction: propInstruction || `Continúe recto hacia ${targetDestination}`,
+        distance: remainingDistance || 2400,
+        duration: remainingDuration || 480,
+        type: 6,
+        name: 'Vía Principal',
+        wayPoints: [0, Math.max(1, (routeCoordinates?.length || 2) - 1)],
+      },
+    ];
+  });
+  const [currentStepIndex, setCurrentStepIndex] = useState<number>(0);
+
+  // Modo simulación de recorrido para pruebas dinámicas
+  const [isSimulating, setIsSimulating] = useState<boolean>(false);
+  const [simulatedLocation, setSimulatedLocation] = useState<UserLocation | null>(null);
+
   const mapRef = useRef<InteractiveMapRef>(null);
   const { userLocation } = useLocationTracking();
 
   const [voiceState, setVoiceState] = useState<VoiceState>('idle');
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [instruction, setInstruction] = useState<string>(
-    propInstruction || 'En 200 metros, continúa recto por la vía principal'
+    propInstruction || 'En 200 metros, continúe recto por la vía principal'
   );
 
   const isFinishingTripRef = useRef<boolean>(false);
   const lastExitPressTimeRef = useRef<number>(0);
   const finishTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const navigationVoiceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const simulationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const simIndexRef = useRef<number>(0);
+  const hasAnnouncedApproachRef = useRef<Set<number>>(new Set());
+  const hasAnnouncedImminentRef = useRef<Set<number>>(new Set());
+  const hasArrivedRef = useRef<boolean>(false);
+  const offRouteCountRef = useRef<number>(0);
+  const isRecalculatingRef = useRef<boolean>(false);
+
+  const [navProgress, setNavProgress] = useState<NavigationProgress>(() => {
+    const initialLoc = userLocation
+      ? { latitude: userLocation.latitude, longitude: userLocation.longitude }
+      : { latitude: 19.427025, longitude: -99.167665 };
+    return NavigationService.evaluateProgress(
+      initialLoc,
+      activeRouteCoords,
+      activeDestinationCoords,
+      activeSteps,
+      0
+    );
+  });
+
+  const effectiveLocation: UserLocation | null = isSimulating
+    ? simulatedLocation
+    : userLocation;
 
   const contextRef = useRef<ConversationContext>(
     context ||
@@ -102,9 +153,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
   const currentTheme = isDarkMode ? darkTheme : lightTheme;
 
-  // Limpiar temporizadores de finalización al desmontar
+  // Limpiar temporizadores al desmontar
   useEffect(() => {
     return () => {
+      if (simulationTimerRef.current) {
+        clearInterval(simulationTimerRef.current);
+      }
       if (finishTimeoutRef.current) {
         clearTimeout(finishTimeoutRef.current);
       }
@@ -113,6 +167,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       }
     };
   }, []);
+
+  // Sincronizar steps si cambian desde props
+  useEffect(() => {
+    if (steps && steps.length > 0) {
+      setActiveSteps(steps);
+      setCurrentStepIndex(0);
+      hasAnnouncedApproachRef.current.clear();
+      hasAnnouncedImminentRef.current.clear();
+    }
+  }, [steps]);
 
   // Sincronizar destino y coordenadas si cambian por props
   useEffect(() => {
@@ -159,6 +223,219 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   }, [targetDestination]);
 
   /**
+   * Control del simulador de recorrido para pruebas dinámicas
+   */
+  const toggleSimulation = () => {
+    if (isSimulating) {
+      if (simulationTimerRef.current) {
+        clearInterval(simulationTimerRef.current);
+        simulationTimerRef.current = null;
+      }
+      setIsSimulating(false);
+      VoiceService.speak('Simulación pausada.');
+      return;
+    }
+
+    if (!activeRouteCoords || activeRouteCoords.length < 2) {
+      VoiceService.speak('No hay una ruta trazada para simular.');
+      return;
+    }
+
+    hasArrivedRef.current = false;
+    setIsSimulating(true);
+
+    if (simIndexRef.current >= activeRouteCoords.length - 1) {
+      simIndexRef.current = 0;
+      setCurrentStepIndex(0);
+      hasAnnouncedApproachRef.current.clear();
+      hasAnnouncedImminentRef.current.clear();
+    }
+
+    const firstInstruction =
+      activeSteps[currentStepIndex]?.instruction ||
+      instruction ||
+      `Continúe recto hacia ${targetDestination}`;
+    VoiceService.speak(
+      `Iniciando recorrido simulado hacia ${targetDestination}. ${firstInstruction}.`
+    );
+
+    if (simulationTimerRef.current) {
+      clearInterval(simulationTimerRef.current);
+    }
+
+    simulationTimerRef.current = setInterval(() => {
+      // Si la voz está enunciando una maniobra, pausar el avance para que la persona mayor la escuche con claridad
+      if (VoiceService.isSpeaking()) {
+        return;
+      }
+
+      simIndexRef.current += 1;
+      if (simIndexRef.current >= activeRouteCoords.length) {
+        if (simulationTimerRef.current) {
+          clearInterval(simulationTimerRef.current);
+          simulationTimerRef.current = null;
+        }
+        setIsSimulating(false);
+        return;
+      }
+
+      const prevPt = activeRouteCoords[Math.max(0, simIndexRef.current - 1)];
+      const currPt = activeRouteCoords[simIndexRef.current];
+      const bearing = getBearing(prevPt, currPt);
+
+      setSimulatedLocation({
+        latitude: currPt.latitude,
+        longitude: currPt.longitude,
+        heading: bearing,
+        speed: 9.7, // ~35 km/h
+      });
+    }, 1200);
+  };
+
+  /**
+   * TASK-19: Recálculo automático de ruta ante desvíos (>100 metros fuera de la polilínea)
+   */
+  const handleRecalculateOffRoute = async (
+    currentCoords: { latitude: number; longitude: number },
+    targetCoord: { latitude: number; longitude: number }
+  ) => {
+    try {
+      const msg = `Recalculando la mejor ruta hacia ${targetDestination}, por favor continúe con precaución.`;
+      VoiceService.speak(msg);
+
+      const routeResult = await orsService.getDirections(currentCoords, targetCoord);
+      const newCoords = routeResult.coordinates.map((c) => ({
+        latitude: c.latitude,
+        longitude: c.longitude,
+      }));
+
+      setActiveRouteCoords(newCoords);
+      setActiveSteps(routeResult.steps);
+      setCurrentStepIndex(0);
+      hasAnnouncedApproachRef.current.clear();
+      hasAnnouncedImminentRef.current.clear();
+      offRouteCountRef.current = 0;
+      isRecalculatingRef.current = false;
+    } catch (err) {
+      console.warn('Error al recalcular ruta tras desvío:', err);
+      isRecalculatingRef.current = false;
+    }
+  };
+
+  /**
+   * TASK-18 & TASK-19: Ciclo de navegación turn-by-turn en tiempo real y detección de llegada
+   */
+  useEffect(() => {
+    const loc = effectiveLocation;
+    if (!loc || !activeRouteCoords || activeRouteCoords.length === 0) return;
+
+    const currentCoords = { latitude: loc.latitude, longitude: loc.longitude };
+    const targetCoord =
+      activeDestinationCoords || activeRouteCoords[activeRouteCoords.length - 1];
+
+    // 1. Detección automática de llegada a destino (<45 metros)
+    const distToTarget = getDistanceMeters(currentCoords, targetCoord);
+    if (distToTarget <= 45 && !hasArrivedRef.current) {
+      hasArrivedRef.current = true;
+      if (simulationTimerRef.current) {
+        clearInterval(simulationTimerRef.current);
+        simulationTimerRef.current = null;
+      }
+      setIsSimulating(false);
+
+      try {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } catch {}
+
+      const arrivalMsg = `Ha llegado a su destino en ${targetDestination}.`;
+      setVoiceState('speaking');
+      setStatusMessage(arrivalMsg);
+      VoiceService.speak(arrivalMsg, () => {
+        startFinishContinuityDialog();
+      });
+      return;
+    }
+
+    // 2. Detección de pérdida de ruta (>100 metros fuera de la polilínea)
+    const minDist = NavigationService.getMinDistanceToPolyline(
+      currentCoords,
+      activeRouteCoords
+    );
+    if (minDist > 100) {
+      offRouteCountRef.current += 1;
+      if (offRouteCountRef.current >= 3 && !isRecalculatingRef.current) {
+        isRecalculatingRef.current = true;
+        handleRecalculateOffRoute(currentCoords, targetCoord);
+      }
+    } else {
+      offRouteCountRef.current = 0;
+    }
+
+    // 3. Evaluación del estado y distancias del turn-by-turn
+    const progress = NavigationService.evaluateProgress(
+      currentCoords,
+      activeRouteCoords,
+      activeDestinationCoords,
+      activeSteps,
+      currentStepIndex
+    );
+    setNavProgress(progress);
+
+    // Actualizar instrucción visible
+    if (progress.currentStep?.instruction) {
+      setInstruction(progress.currentStep.instruction);
+    }
+
+    // 4. Anuncios proactivos por voz sin intervención manual:
+    if (progress.currentStep) {
+      // B) Aviso inminente (a 55m o menos del punto de giro)
+      if (
+        progress.distanceToNextManeuver <= 55 &&
+        !hasAnnouncedImminentRef.current.has(currentStepIndex)
+      ) {
+        hasAnnouncedImminentRef.current.add(currentStepIndex);
+        hasAnnouncedApproachRef.current.add(currentStepIndex);
+        const msg = `${progress.currentStep.instruction} ahora.`;
+        VoiceService.speak(msg);
+      } else if (
+        // A) Aviso de aproximación (a 180m o menos del punto de giro)
+        progress.distanceToNextManeuver <= 180 &&
+        !hasAnnouncedApproachRef.current.has(currentStepIndex)
+      ) {
+        hasAnnouncedApproachRef.current.add(currentStepIndex);
+        const roundedMeters = Math.max(
+          50,
+          Math.round(progress.distanceToNextManeuver / 10) * 10
+        );
+        const msg = `En ${roundedMeters} metros, ${progress.currentStep.instruction}.`;
+        VoiceService.speak(msg);
+      }
+    }
+
+    // 5. Progresión de maniobra (si estamos a menos de 25m del punto de giro)
+    if (
+      progress.distanceToNextManeuver <= 25 &&
+      currentStepIndex < activeSteps.length - 1
+    ) {
+      // Si se avanza al siguiente paso y no se había anunciado la maniobra inminente, anunciarla inmediatamente
+      if (
+        progress.currentStep &&
+        !hasAnnouncedImminentRef.current.has(currentStepIndex)
+      ) {
+        hasAnnouncedImminentRef.current.add(currentStepIndex);
+        VoiceService.speak(`${progress.currentStep.instruction} ahora.`);
+      }
+      setCurrentStepIndex((prev) => prev + 1);
+    }
+  }, [
+    effectiveLocation?.latitude,
+    effectiveLocation?.longitude,
+    activeRouteCoords,
+    currentStepIndex,
+    activeSteps,
+  ]);
+
+  /**
    * Salida forzada inmediata (doble pulsación o pulsación prolongada)
    */
   const handleForcedExit = async () => {
@@ -201,43 +478,22 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   };
 
   /**
-   * Procesa un nuevo destino si el usuario desea continuar viajando
+   * Calcula y activa la nueva ruta hacia un destino confirmado en el mapa
    */
-  const handleNewDestination = async (destinationInput: string) => {
+  const startNavigationToDestination = async (newDest: string) => {
     if (finishTimeoutRef.current) {
       clearTimeout(finishTimeoutRef.current);
       finishTimeoutRef.current = null;
     }
-    if (AudioRecorderService.isRecording()) {
-      await AudioRecorderService.stopRecording();
-    }
-
-    const clean = destinationInput.trim();
-    if (!clean || clean.toLowerCase() === 'no') {
-      await handleCloseTripWithFarewell();
-      return;
+    if (navigationVoiceTimeoutRef.current) {
+      clearTimeout(navigationVoiceTimeoutRef.current);
+      navigationVoiceTimeoutRef.current = null;
     }
 
     setVoiceState('processing');
-    setStatusMessage(`Calculando ruta hacia ${clean}...`);
+    setStatusMessage(`Calculando ruta hacia ${newDest}...`);
 
     try {
-      const response = await ConversationService.processUserMessage(
-        clean,
-        contextRef.current
-      );
-      contextRef.current = response.updatedContext;
-      if (onContextChange) {
-        onContextChange(response.updatedContext);
-      }
-
-      const newDest =
-        (response.functionCall?.args && 'destino' in response.functionCall.args
-          ? (response.functionCall.args as { destino?: string }).destino
-          : undefined) ||
-        response.updatedContext.activeRoute?.destination ||
-        clean;
-
       const currentLoc = userLocation
         ? { latitude: userLocation.latitude, longitude: userLocation.longitude }
         : await LocationService.getCurrentLocation();
@@ -270,7 +526,27 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         longitude: targetCoords.longitude,
       });
       setInstruction(firstInstruction);
+      if (routeResult.steps && routeResult.steps.length > 0) {
+        setActiveSteps(routeResult.steps);
+      }
+      setCurrentStepIndex(0);
+      hasArrivedRef.current = false;
+      hasAnnouncedApproachRef.current.clear();
+      hasAnnouncedImminentRef.current.clear();
       isFinishingTripRef.current = false;
+
+      contextRef.current = {
+        ...contextRef.current,
+        pendingConfirmation: null,
+        activeRoute: {
+          destination: newDest,
+          inProgress: true,
+          startTime: Date.now(),
+        },
+      };
+      if (onContextChange) {
+        onContextChange(contextRef.current);
+      }
 
       setTimeout(() => {
         mapRef.current?.fitToCoordinates(newRouteCoordinates, {
@@ -288,7 +564,99 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         setStatusMessage('');
       });
     } catch (err) {
-      console.warn('Error al calcular nueva ruta de continuidad:', err);
+      console.warn('Error al calcular nueva ruta de navegación:', err);
+      await handleCloseTripWithFarewell();
+    }
+  };
+
+  /**
+   * Procesa un nuevo destino si el usuario desea continuar viajando (Paso 1: intención y confirmación)
+   */
+  const handleNewDestination = async (destinationInput: string) => {
+    if (finishTimeoutRef.current) {
+      clearTimeout(finishTimeoutRef.current);
+      finishTimeoutRef.current = null;
+    }
+    if (AudioRecorderService.isRecording()) {
+      await AudioRecorderService.stopRecording();
+    }
+
+    const clean = destinationInput.trim();
+    if (!clean || clean.toLowerCase() === 'no') {
+      await handleCloseTripWithFarewell();
+      return;
+    }
+
+    setVoiceState('processing');
+    setStatusMessage('Procesando destino...');
+
+    try {
+      const response = await ConversationService.processUserMessage(
+        clean,
+        contextRef.current
+      );
+      contextRef.current = response.updatedContext;
+      if (onContextChange) {
+        onContextChange(response.updatedContext);
+      }
+
+      // Si el NLU requiere confirmación (Paso 1 del protocolo en 2 pasos) o devuelve una pregunta
+      if (response.updatedContext.pendingConfirmation || response.spokenText.includes('?')) {
+        setVoiceState('speaking');
+        setStatusMessage(response.spokenText);
+
+        await VoiceService.speak(response.spokenText, async () => {
+          try {
+            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          } catch {}
+
+          const started = await AudioRecorderService.startRecording();
+          if (started) {
+            setVoiceState('listening');
+            setStatusMessage('Diga "Sí" o "No"...');
+
+            if (finishTimeoutRef.current) {
+              clearTimeout(finishTimeoutRef.current);
+            }
+            finishTimeoutRef.current = setTimeout(async () => {
+              if (AudioRecorderService.isRecording()) {
+                setVoiceState('processing');
+                setStatusMessage('Pensando...');
+                const trans = await AudioRecorderService.stopAndTranscribe();
+                await handleFinishContinuityResponse(trans?.text || '');
+              } else {
+                await handleCloseTripWithFarewell();
+              }
+            }, 8000);
+          } else {
+            await handleCloseTripWithFarewell();
+          }
+        });
+        return;
+      }
+
+      // Si ya vino confirmado
+      if (response.functionCall?.name === 'confirmar_viaje') {
+        const confirmedDest =
+          response.functionCall.args.destino ||
+          response.updatedContext.activeRoute?.destination ||
+          clean;
+        await startNavigationToDestination(confirmedDest);
+        return;
+      }
+
+      if (response.functionCall?.name === 'cancelar') {
+        await handleCloseTripWithFarewell();
+        return;
+      }
+
+      // Fallback si devuelve un destino directo sin confirmación pendiente
+      const dest =
+        response.updatedContext.activeRoute?.destination ||
+        clean;
+      await startNavigationToDestination(dest);
+    } catch (err) {
+      console.warn('Error al procesar nuevo destino:', err);
       await handleCloseTripWithFarewell();
     }
   };
@@ -304,6 +672,66 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     const cleanText = speechText.trim().toLowerCase();
 
+    // Caso A: Hay una confirmación pendiente en 2 pasos
+    if (contextRef.current.pendingConfirmation) {
+      const pendingDest = contextRef.current.pendingConfirmation.destination;
+
+      // Si responde cancelando o rechazando
+      if (
+        !cleanText ||
+        cleanText === 'no' ||
+        cleanText.includes('cancelar') ||
+        cleanText.includes('detener') ||
+        cleanText.includes('ya no') ||
+        cleanText.includes('ninguno') ||
+        cleanText.includes('nada')
+      ) {
+        contextRef.current = {
+          ...contextRef.current,
+          pendingConfirmation: null,
+        };
+        await handleCloseTripWithFarewell();
+        return;
+      }
+
+      // Procesar respuesta con ConversationService
+      setVoiceState('processing');
+      setStatusMessage('Confirmando destino...');
+
+      const response = await ConversationService.processUserMessage(
+        speechText,
+        contextRef.current
+      );
+      contextRef.current = response.updatedContext;
+      if (onContextChange) {
+        onContextChange(response.updatedContext);
+      }
+
+      if (response.functionCall?.name === 'confirmar_viaje') {
+        const dest =
+          response.functionCall.args.destino ||
+          pendingDest;
+        await startNavigationToDestination(dest);
+        return;
+      }
+
+      if (response.functionCall?.name === 'cancelar') {
+        await handleCloseTripWithFarewell();
+        return;
+      }
+
+      // Si nombró otro destino
+      if (response.updatedContext.pendingConfirmation) {
+        await handleNewDestination(speechText);
+        return;
+      }
+
+      // Si fue afirmativo genérico
+      await startNavigationToDestination(pendingDest);
+      return;
+    }
+
+    // Caso B: Pregunta inicial "¿Desea viajar a algún otro lugar?"
     // Si responde "No", "Ninguno", o guarda silencio (vacío)
     if (
       !cleanText ||
@@ -321,7 +749,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    // Si responde "Sí" genérico
+    // Si responde "Sí" genérico (sin destino todavía)
     if (
       cleanText === 'sí' ||
       cleanText === 'si' ||
@@ -336,7 +764,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
       await VoiceService.speak(askWhereMsg, async () => {
         try {
-          await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+          await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         } catch {}
 
         const started = await AudioRecorderService.startRecording();
@@ -361,7 +789,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    // Si nombra un nuevo destino directamente (ej. "Llévame a casa")
+    // Si nombra un nuevo destino directamente (ej. "Zócalo" o "Llévame al Zócalo")
     await handleNewDestination(speechText);
   };
 
@@ -459,7 +887,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       lowerText.includes('donde estoy')
     ) {
       mapRef.current?.recenter();
-      const responseText = 'Centrando el mapa en tu posición.';
+      const responseText = 'Centrando el mapa en su posición.';
       setVoiceState('speaking');
       setStatusMessage(responseText);
       await VoiceService.speak(responseText, () => {
@@ -470,14 +898,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     if (
+      lowerText.includes('simular') ||
+      lowerText.includes('simulacion') ||
+      lowerText.includes('simulación')
+    ) {
+      toggleSimulation();
+      return;
+    }
+
+    if (
       lowerText.includes('cuánto falta') ||
       lowerText.includes('cuanto falta') ||
       lowerText.includes('distancia') ||
       lowerText.includes('tiempo')
     ) {
-      const km = (remainingDistance / 1000).toFixed(1);
-      const mins = Math.max(1, Math.round(remainingDuration / 60));
-      const responseText = `Faltan aproximadamente ${km} kilómetros y ${mins} minutos para llegar.`;
+      const distStr = navProgress.formattedRemainingDistance || `${(remainingDistance / 1000).toFixed(1)} km`;
+      const timeStr = navProgress.formattedRemainingDuration || `${Math.max(1, Math.round(remainingDuration / 60))} minutos`;
+      const responseText = `Faltan aproximadamente ${distStr} y ${timeStr} para llegar a ${targetDestination}.`;
       setVoiceState('speaking');
       setStatusMessage(responseText);
       await VoiceService.speak(responseText, () => {
@@ -534,15 +971,74 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           await VoiceService.speak(response.spokenText);
           handleForcedExit();
           return;
+        } else if (response.functionCall.name === 'confirmar_viaje') {
+          const confirmedDest =
+            response.functionCall.args.destino ||
+            response.updatedContext.activeRoute?.destination ||
+            targetDestination;
+
+          setVoiceState('speaking');
+          setStatusMessage(response.spokenText);
+          await VoiceService.speak(response.spokenText);
+          await startNavigationToDestination(confirmedDest);
+          return;
         }
       }
 
       setVoiceState('speaking');
       setStatusMessage('Hablando...');
 
-      await VoiceService.speak(response.spokenText, () => {
-        setVoiceState('idle');
-        setStatusMessage('');
+      const lowerSpoken = response.spokenText.toLowerCase();
+      const isFarewell =
+        lowerSpoken.includes('excelente día') ||
+        lowerSpoken.includes('buen día') ||
+        lowerSpoken.includes('hasta luego') ||
+        lowerSpoken.includes('adiós') ||
+        lowerSpoken.includes('cancelando viaje');
+
+      const needsAutoListen =
+        (Boolean(response.updatedContext.pendingConfirmation) ||
+          response.spokenText.includes('?')) &&
+        !isFarewell;
+
+      await VoiceService.speak(response.spokenText, async () => {
+        if (needsAutoListen) {
+          try {
+            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          } catch {}
+
+          const started = await AudioRecorderService.startRecording();
+          if (started) {
+            setVoiceState('listening');
+            setStatusMessage(
+              response.updatedContext.pendingConfirmation
+                ? 'Diga "Sí" o "No"...'
+                : 'Le escucho...'
+            );
+
+            if (navigationVoiceTimeoutRef.current) {
+              clearTimeout(navigationVoiceTimeoutRef.current);
+            }
+            navigationVoiceTimeoutRef.current = setTimeout(async () => {
+              if (AudioRecorderService.isRecording()) {
+                setVoiceState('processing');
+                setStatusMessage('Pensando...');
+                const transcription =
+                  await AudioRecorderService.stopAndTranscribe();
+                await processNavigationSpeech(transcription?.text || '');
+              } else {
+                setVoiceState('idle');
+                setStatusMessage('');
+              }
+            }, 8000);
+          } else {
+            setVoiceState('idle');
+            setStatusMessage('');
+          }
+        } else {
+          setVoiceState('idle');
+          setStatusMessage('');
+        }
       });
     } catch (error) {
       console.warn('Error al procesar voz en navegación:', error);
@@ -586,7 +1082,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     if (voiceState === 'idle') {
       setVoiceState('listening');
-      setStatusMessage('Te escucho...');
+      setStatusMessage('Le escucho...');
 
       const started = await AudioRecorderService.startRecording();
       if (!started) {
@@ -624,7 +1120,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       <InteractiveMap
         ref={mapRef}
         isDarkMode={isDarkMode}
-        userLocation={userLocation}
+        userLocation={effectiveLocation}
         routeCoordinates={activeRouteCoords}
         destinationMarker={activeDestinationCoords}
         destinationTitle={targetDestination}
@@ -634,7 +1130,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       {/* 2. Capa Superior: Tarjeta de Navegación Activa y Selector de Modo */}
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.topContainer}>
-          {/* Barra superior con botón de finalizar viaje */}
+          {/* Barra superior con botón de finalizar viaje y botón de simulación */}
           <View style={styles.topBar}>
             <TouchableOpacity
               onPress={handleFinalizarPress}
@@ -648,15 +1144,42 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 },
               ]}
               accessibilityLabel="Finalizar viaje"
-              accessibilityHint="Presiona una vez para finalizar con diálogo de continuidad, o dos veces / mantén presionado para salida inmediata"
+              accessibilityHint="Presione una vez para finalizar con diálogo de continuidad, o dos veces / mantenga presionado para salida inmediata"
               accessibilityRole="button"
             >
               <Ionicons name="close" size={22} color="#EF4444" />
               <Text style={styles.cancelButtonText}>Finalizar</Text>
             </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={toggleSimulation}
+              style={[
+                styles.simButton,
+                {
+                  backgroundColor: isSimulating ? '#FF9800' : currentTheme.cardBackground,
+                  borderColor: isSimulating ? '#FF9800' : currentTheme.cardBorder,
+                },
+              ]}
+              accessibilityLabel={isSimulating ? "Pausar simulación" : "Simular recorrido"}
+              accessibilityRole="button"
+            >
+              <Ionicons
+                name={isSimulating ? "pause" : "play"}
+                size={18}
+                color={isSimulating ? '#FFFFFF' : currentTheme.buttonOrange}
+              />
+              <Text
+                style={[
+                  styles.simButtonText,
+                  { color: isSimulating ? '#FFFFFF' : currentTheme.buttonOrange },
+                ]}
+              >
+                {isSimulating ? 'Pausar' : 'Simular'}
+              </Text>
+            </TouchableOpacity>
           </View>
 
-          {/* Tarjeta Flotante con Próxima Instrucción Turn-by-Turn */}
+          {/* Tarjeta Flotante con Próxima Instrucción Turn-by-Turn y Métricas de Ruta */}
           <View
             style={[
               styles.instructionCard,
@@ -667,32 +1190,73 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               isDarkMode ? styles.darkCardGlow : styles.lightCardShadow,
             ]}
           >
-            <View style={styles.instructionIconContainer}>
-              <Ionicons
-                name="arrow-up-circle"
-                size={38}
-                color={currentTheme.routeColor}
-              />
+            <View style={styles.instructionTopRow}>
+              <View style={styles.instructionIconContainer}>
+                <Ionicons
+                  name={(navProgress.maneuverIcon as any) || "arrow-up-circle"}
+                  size={38}
+                  color={currentTheme.routeColor}
+                />
+              </View>
+
+              <View style={styles.instructionTextContainer}>
+                <View style={styles.badgeRow}>
+                  <Text
+                    style={[
+                      styles.destinationBadge,
+                      { color: currentTheme.textSecondary },
+                    ]}
+                  >
+                    {navProgress.formattedDistanceToManeuver ? `${navProgress.formattedDistanceToManeuver.toUpperCase()} • ` : ''}RUMBO A: {targetDestination.toUpperCase()}
+                  </Text>
+                  {isSimulating && (
+                    <View style={styles.simulatingPill}>
+                      <Text style={styles.simulatingPillText}>SIMULANDO</Text>
+                    </View>
+                  )}
+                </View>
+                <Text
+                  style={[
+                    styles.instructionMainText,
+                    { color: currentTheme.textPrimary },
+                  ]}
+                  numberOfLines={2}
+                >
+                  {instruction}
+                </Text>
+              </View>
             </View>
 
-            <View style={styles.instructionTextContainer}>
-              <Text
-                style={[
-                  styles.destinationBadge,
-                  { color: currentTheme.textSecondary },
-                ]}
-              >
-                RUMBO A: {targetDestination.toUpperCase()}
-              </Text>
-              <Text
-                style={[
-                  styles.instructionMainText,
-                  { color: currentTheme.textPrimary },
-                ]}
-                numberOfLines={2}
-              >
-                {instruction}
-              </Text>
+            {/* Fila de Métricas del Viaje (Distancia y Tiempo Restantes) */}
+            <View
+              style={[
+                styles.instructionMetricsRow,
+                { borderTopColor: isDarkMode ? '#1E293B' : '#E2E8F0' },
+              ]}
+            >
+              <View style={styles.metricItem}>
+                <Ionicons name="time-outline" size={16} color={currentTheme.textSecondary} />
+                <Text style={[styles.metricText, { color: currentTheme.textSecondary }]}>
+                  {navProgress.formattedRemainingDuration || 'Calculando...'}
+                </Text>
+              </View>
+              <View style={[styles.metricDivider, { backgroundColor: isDarkMode ? '#334155' : '#E2E8F0' }]} />
+              <View style={styles.metricItem}>
+                <Ionicons name="navigate-outline" size={16} color={currentTheme.textSecondary} />
+                <Text style={[styles.metricText, { color: currentTheme.textSecondary }]}>
+                  {navProgress.formattedRemainingDistance || 'Calculando...'}
+                </Text>
+              </View>
+              <View style={[styles.metricDivider, { backgroundColor: isDarkMode ? '#334155' : '#E2E8F0' }]} />
+              <View style={styles.metricItem}>
+                <Ionicons name="flag-outline" size={16} color={currentTheme.textSecondary} />
+                <Text
+                  style={[styles.metricText, { color: currentTheme.textSecondary, maxWidth: 120 }]}
+                  numberOfLines={1}
+                >
+                  {targetDestination}
+                </Text>
+              </View>
             </View>
           </View>
         </View>
@@ -724,7 +1288,7 @@ const styles = StyleSheet.create({
   },
   topBar: {
     flexDirection: 'row',
-    justifyContent: 'flex-start',
+    justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 12,
   },
@@ -742,13 +1306,29 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginLeft: 4,
   },
-  instructionCard: {
+  simButton: {
     flexDirection: 'row',
     alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+  },
+  simButtonText: {
+    fontSize: 15,
+    fontWeight: '700',
+    marginLeft: 5,
+  },
+  instructionCard: {
     borderRadius: 20,
     borderWidth: 1,
     paddingVertical: 14,
     paddingHorizontal: 16,
+  },
+  instructionTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 6,
   },
   instructionIconContainer: {
     marginRight: 12,
@@ -756,16 +1336,56 @@ const styles = StyleSheet.create({
   instructionTextContainer: {
     flex: 1,
   },
+  badgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
   destinationBadge: {
     fontSize: 13,
     fontWeight: '800',
     letterSpacing: 1.1,
-    marginBottom: 4,
+  },
+  simulatingPill: {
+    backgroundColor: '#FF9800',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+    marginLeft: 6,
+  },
+  simulatingPillText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.8,
   },
   instructionMainText: {
-    fontSize: 20,
+    fontSize: 19,
     fontWeight: '700',
-    lineHeight: 26,
+    lineHeight: 25,
+  },
+  instructionMetricsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderTopWidth: 1,
+    paddingTop: 8,
+    marginTop: 6,
+  },
+  metricItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  metricText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  metricDivider: {
+    width: 1,
+    height: 12,
+    opacity: 0.6,
   },
   lightCardShadow: {
     shadowColor: '#000',

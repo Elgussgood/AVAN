@@ -363,9 +363,10 @@ export const GERONTOLOGICAL_SYSTEM_PROMPT = `
 Eres AVAN, un asistente de voz y navegación vehicular para adultos mayores en México.
 
 TUS DIRECTIVAS ESENCIALES:
-1. Tono y trato:
+1. Tono, trato y concordancia gramatical:
+   - Trato formal de respeto estricto y consistente: dirígete SIEMPRE al usuario de "usted" (ejemplo: "dígame", "desea", "conduzca", "espere").
+   - Queda estrictamente PROHIBIDO tutear al usuario (no uses "tú", "te escucho", "espera", "tu viaje", "toca").
    - Sé siempre cálido, empático, paciente y profundamente respetuoso.
-   - Habla con amabilidad y dignidad. Trata al usuario con respeto.
    - NUNCA infantilices al usuario: queda estrictamente prohibido usar diminutivos condescendientes (ej. "abuelito", "viejito", "caminito", "carrerita").
 
 2. Concisión y claridad cognitiva:
@@ -377,14 +378,18 @@ TUS DIRECTIVAS ESENCIALES:
    - Primero identifica el destino con la herramienta 'navegar_a(destino)' y pregunta amablemente para confirmar (ejemplo: "He localizado Bellas Artes. ¿Desea que iniciemos el viaje hacia allá?").
    - Advertencia especial para viajes foráneos (>50 km en carretera): si el destino es foráneo o de larga distancia (ej. Acapulco, Cuernavaca, Puebla, Toluca, Pachuca, Querétaro, Valle de Bravo), advierte la distancia y confirma con rigor: "Atención, este es un viaje foráneo en carretera a [Destino], a más de 50 kilómetros de distancia. ¿Está seguro de que desea iniciar este viaje en carretera ahora?".
    - Solo cuando el usuario confirme afirmativamente (ej. "Sí", "Vamos", "Iniciar", "Por favor"), invoca 'confirmar_viaje'.
-   - Si el usuario rechaza o cancela (ej. "No", "Espera", "Cancelar"), invoca 'cancelar'.
 
-4. Herramientas del sistema:
+4. Protocolo de cancelación y continuidad:
+   - Si el usuario pide cancelar un viaje o rechaza una confirmación de destino (ej. "No", "Cancela", "Ya no quiero ir"), invoca la herramienta 'cancelar'.
+   - REGLA CRÍTICA DE CANCELACIÓN (PASO 1): Al cancelar un viaje o confirmación, NUNCA te despidas prematuramente (NO digas "hasta luego", "que tenga buen día" ni frases de despedida). Confirma la cancelación y pregunta amablemente de continuidad: "Entendido. He cancelado el viaje a [Destino]. ¿Desea ir a algún otro lugar?".
+   - REGLA CRÍTICA DE CIERRE (PASO 2): Si ya le preguntaste al usuario "¿Desea ir a algún otro lugar?" y el usuario responde que no ("No", "No gracias", "Ninguno", "Ya no", "Para nada"), NO invoques ninguna herramienta; responde únicamente con una cálida despedida formal: "Excelente, que tenga un excelente día."
+
+5. Herramientas del sistema:
    - navegar_a(destino: string): Calcula ruta y solicita confirmación.
    - guardar_ubicacion(alias: string, direccion?: string): Guarda un sitio frecuente.
    - ajustar_zoom(direccion: 'acercar' | 'alejar' | 'centrar'): Adapta la vista del mapa.
    - confirmar_viaje(destino?: string): Inicia la marcha tras confirmación.
-   - cancelar(): Cancela confirmación o detiene navegación.
+   - cancelar(): Cancela confirmación o detiene navegación activa.
    - consultar_trafico(): Informa sobre el estado del tráfico.
    - reportar_incidente(tipo: string): Registra incidente vial (accidente, obras, tráfico).
 `.trim();
@@ -746,7 +751,9 @@ async function callGroqLLM(
   } else if (context.pendingAliasRegistration) {
     dynamicContextPrompt += `\n- ESTADO: REGISTRANDO ALIAS "${context.pendingAliasRegistration.aliasName}". Esperando que el usuario indique la dirección o colonia.`;
   } else if (context.pendingTripCompletion) {
-    dynamicContextPrompt += `\n- ESTADO: VIAJE FINALIZADO a "${context.pendingTripCompletion.destination}". Preguntando si desea viajar a algún otro lugar.`;
+    dynamicContextPrompt += `\n- ESTADO ACTUAL: El viaje a "${context.pendingTripCompletion.destination}" fue cancelado o finalizado. Acabas de preguntarle: "¿Desea ir a algún otro lugar?".
+    * Si el usuario dice "No", "No gracias", "Ninguno", "Ya no" o rechaza ir a otro lado: NO LLAMES A NINGUNA HERRAMIENTA. Responde únicamente con una cálida despedida formal: "Excelente, que tenga un excelente día."
+    * Si el usuario dice "Sí" o pide ir a otro lugar: responde preguntando a dónde desea ir ("Con gusto, ¿a qué destino le gustaría ir?") o llama a 'navegar_a' si ya mencionó el lugar.`;
   } else if (context.activeRoute?.inProgress) {
     dynamicContextPrompt += `\n- ESTADO: EN NAVEGACIÓN ACTIVA hacia "${context.activeRoute.destination}".`;
   } else {
@@ -830,6 +837,9 @@ async function callGroqLLM(
       // Integración con el contexto y reglas de negocio de AVAN
       switch (fnName) {
         case 'navegar_a': {
+          if (context.pendingTripCompletion) {
+            context.pendingTripCompletion = null;
+          }
           const rawDest = fnArgs.destino || userSpeechText;
           const aliasRes = AliasService.resolveDestinationWithAlias(rawDest);
           const destName = aliasRes.resolvedName;
@@ -917,6 +927,35 @@ async function callGroqLLM(
         }
 
         case 'cancelar': {
+          // Si ya estábamos en espera de respuesta a "¿Desea ir a algún otro lugar?"
+          // y el usuario rechaza/cancela, finalizamos el flujo con despedida cordial y apagamos el micro.
+          if (context.pendingTripCompletion) {
+            context.pendingTripCompletion = null;
+            context.pendingConfirmation = null;
+            if (context.activeRoute?.inProgress) {
+              context.activeRoute = null;
+            }
+
+            const spokenText = 'Excelente, que tenga un excelente día.';
+            context.history?.push({
+              role: 'assistant',
+              content: spokenText,
+              functionCall: {
+                name: 'cancelar',
+                args: { motivo: 'Usuario no desea ir a otro lugar' },
+              },
+              timestamp: Date.now(),
+            });
+
+            return {
+              spokenText,
+              functionCall: null,
+              updatedContext: context,
+              requiresConfirmation: false,
+              shouldAutoListen: false,
+            };
+          }
+
           const lastDest =
             context.pendingConfirmation?.destination ||
             context.activeRoute?.destination ||
@@ -931,8 +970,8 @@ async function callGroqLLM(
             timestamp: Date.now(),
           };
 
-          const spokenText =
-            rawContent || 'Entendido, viaje cancelado. ¿Desea ir a algún otro lugar?';
+          // REGLA CRÍTICA: Al cancelar un viaje o confirmación, confirmar y preguntar si desea ir a otro lugar.
+          const spokenText = `Entendido. He cancelado el viaje a ${lastDest}. ¿Desea ir a algún otro lugar?`;
           const functionCall: FunctionCall = {
             name: 'cancelar',
             args: { motivo: 'Cancelación solicitada por el usuario' },
@@ -1075,6 +1114,17 @@ async function callGroqLLM(
 
     // Si Groq respondió únicamente con texto conversacional (sin tool call)
     if (rawContent) {
+      // Si estábamos esperando respuesta a "¿Desea ir a algún otro lugar?", limpiamos el estado de continuidad
+      if (context.pendingTripCompletion) {
+        context.pendingTripCompletion = null;
+      }
+
+      const isFarewell =
+        /(?:hasta luego|excelente d[ií]a|buen d[ií]a|buenas noches|a su disposici[oó]n|nos vemos|adi[oó]s|que descanse|cu[ií]dese|que le vaya bien|con mucho gusto)/i.test(
+          rawContent
+        );
+      const asksQuestion = rawContent.includes('?');
+
       context.history?.push({
         role: 'assistant',
         content: rawContent,
@@ -1086,6 +1136,7 @@ async function callGroqLLM(
         functionCall: null,
         updatedContext: context,
         requiresConfirmation: false,
+        shouldAutoListen: asksQuestion && !isFarewell,
       };
     }
 
@@ -1680,10 +1731,11 @@ function processUserMessageLocal(
       functionCall: null,
       updatedContext: currentContext,
       requiresConfirmation: false,
+      shouldAutoListen: true,
     };
   }
 
-  if (/^(?:gracias|muchas gracias|te lo agradezco|muy amable)/i.test(normalized)) {
+  if (/^(?:gracias|muchas gracias|te lo agradezco|se lo agradezco|muy amable)/i.test(normalized)) {
     const spokenText = 'Con mucho gusto. Estoy aquí para ayudarle cuando lo necesite.';
 
     currentContext.history?.push({
@@ -1697,10 +1749,11 @@ function processUserMessageLocal(
       functionCall: null,
       updatedContext: currentContext,
       requiresConfirmation: false,
+      shouldAutoListen: false,
     };
   }
 
-  if (/(?:ayuda|que puedes hacer|como funciona|instrucciones|que haces)/i.test(normalized)) {
+  if (/(?:ayuda|que puedes hacer|que puede hacer|como funciona|instrucciones|que haces)/i.test(normalized)) {
     const spokenText =
       'Puedo guiarle a un destino, guardar sitios frecuentes, consultar el tráfico o ajustar el mapa. Solo dígame a dónde desea ir.';
 
@@ -1715,6 +1768,7 @@ function processUserMessageLocal(
       functionCall: null,
       updatedContext: currentContext,
       requiresConfirmation: false,
+      shouldAutoListen: true,
     };
   }
 
@@ -1735,6 +1789,7 @@ function processUserMessageLocal(
     functionCall: null,
     updatedContext: currentContext,
     requiresConfirmation: false,
+    shouldAutoListen: true,
   };
 }
 

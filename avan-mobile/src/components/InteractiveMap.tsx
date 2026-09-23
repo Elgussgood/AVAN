@@ -2,21 +2,37 @@ import React, {
   forwardRef,
   useImperativeHandle,
   useRef,
+  useState,
   useEffect,
+  useCallback,
 } from 'react';
 import { StyleSheet, View, StyleProp, ViewStyle } from 'react-native';
-import MapView, {
-  Marker,
-  Polyline,
-  Region,
-  LatLng,
-  EdgePadding,
-  Camera,
-} from 'react-native-maps';
-import Svg, { Path, Circle } from 'react-native-svg';
-import { lightMapStyle, darkMapStyle } from '../theme/mapStyles';
-import { lightTheme, darkTheme, ThemeColors } from '../theme/theme';
-import { NavigationArrow } from './NavigationArrow';
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
+
+export interface LatLng {
+  latitude: number;
+  longitude: number;
+}
+
+export interface Region extends LatLng {
+  latitudeDelta: number;
+  longitudeDelta: number;
+}
+
+export interface EdgePadding {
+  top?: number;
+  right?: number;
+  bottom?: number;
+  left?: number;
+}
+
+export interface Camera {
+  center: LatLng;
+  heading: number;
+  pitch: number;
+  zoom?: number;
+  altitude?: number;
+}
 
 export interface UserLocation {
   latitude: number;
@@ -63,26 +79,384 @@ const DEFAULT_REGION: Region = {
 };
 
 /**
- * Marcador de destino estilizado según la paleta del mockup de AVAN.
+ * Genera el documento HTML que ejecuta Leaflet.js con:
+ * 1. OpenStreetMap 100% libre sin marca de agua por defecto (con filtro dark mode nocturno).
+ * 2. Si el usuario cuenta con EXPO_PUBLIC_CARTO_API_KEY, usa las capas oficiales de CartoDB sin marcas de agua.
  */
-const DestinationPin: React.FC<{ isDarkMode: boolean }> = ({ isDarkMode }) => {
-  const pinColor = isDarkMode ? '#00E5FF' : '#204669';
-  const innerColor = isDarkMode ? '#0B111D' : '#FFFFFF';
+function generateLeafletHtml(
+  initialLat: number,
+  initialLng: number,
+  isDarkMode: boolean,
+  cartoApiKey: string
+): string {
+  const bgColor = isDarkMode ? '#0B111D' : '#F1F4F7';
 
-  return (
-    <View style={[styles.pinContainer, isDarkMode && styles.pinDarkGlow]}>
-      <Svg width={36} height={44} viewBox="0 0 36 44">
-        {/* Cuerpo del marcador tipo gota / pin */}
-        <Path
-          d="M18 0 C8.06 0 0 8.06 0 18 C0 31.5 18 44 18 44 C18 44 36 31.5 36 18 C36 8.06 27.94 0 18 0 Z"
-          fill={pinColor}
-        />
-        {/* Círculo interior */}
-        <Circle cx="18" cy="18" r="6.5" fill={innerColor} />
-      </Svg>
-    </View>
-  );
-};
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    html, body, #map {
+      width: 100%;
+      height: 100%;
+      background-color: ${bgColor};
+      overflow: hidden;
+    }
+    .leaflet-container {
+      background-color: ${bgColor} !important;
+    }
+    .custom-div-icon {
+      background: transparent !important;
+      border: none !important;
+    }
+    /* Filtro nocturno de alto contraste para teselas libres de OpenStreetMap */
+    .dark-tiles .leaflet-tile {
+      filter: brightness(0.65) invert(1) contrast(1.35) hue-rotate(195deg) saturate(0.35) !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    (function() {
+      var map = null;
+      var tileLayer = null;
+      var userMarker = null;
+      var routeGlowPolyline = null;
+      var routeMainPolyline = null;
+      var destinationMarker = null;
+      var currentThemeDark = ${isDarkMode ? 'true' : 'false'};
+
+      var hasCartoKey = ${cartoApiKey ? 'true' : 'false'};
+      var CARTO_KEY = ${JSON.stringify(cartoApiKey)};
+
+      var DARK_CARTO = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png' + (CARTO_KEY ? '?api_key=' + encodeURIComponent(CARTO_KEY) : '');
+      var LIGHT_CARTO = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png' + (CARTO_KEY ? '?api_key=' + encodeURIComponent(CARTO_KEY) : '');
+      var OSM_TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+
+      function getArrowSvg(heading, isDark) {
+        var fill = isDark ? 'transparent' : '#2B5B84';
+        var stroke = isDark ? '#00E5FF' : '#16324A';
+        var strokeW = isDark ? '6.5' : '5';
+        var shadow = isDark
+          ? 'filter: drop-shadow(0px 0px 8px #00E5FF);'
+          : 'filter: drop-shadow(0px 3px 6px rgba(0,0,0,0.35));';
+
+        return '<div id="arrow-rotator" style="width: 56px; height: 56px; display: flex; align-items: center; justify-content: center; transform: rotate(' + heading + 'deg); transform-origin: center center; transition: transform 0.2s ease-out;">'
+          + '<svg width="48" height="48" viewBox="0 0 100 100" style="overflow: visible;">'
+          + '<path d="M50 8 L88 88 L50 68 L12 88 Z" fill="' + fill + '" stroke="' + stroke + '" stroke-width="' + strokeW + '" stroke-linejoin="round" stroke-linecap="round" style="' + shadow + '" />'
+          + '</svg>'
+          + '</div>';
+      }
+
+      function getPinSvg(isDark) {
+        var fill = isDark ? '#00E5FF' : '#204669';
+        var inner = isDark ? '#0B111D' : '#FFFFFF';
+        var shadow = isDark
+          ? 'filter: drop-shadow(0px 0px 10px #00E5FF);'
+          : 'filter: drop-shadow(0px 4px 6px rgba(0,0,0,0.35));';
+
+        return '<div style="width: 36px; height: 44px; display: flex; align-items: center; justify-content: center;">'
+          + '<svg width="36" height="44" viewBox="0 0 36 44" style="overflow: visible;">'
+          + '<path d="M18 0 C8.06 0 0 8.06 0 18 C0 31.5 18 44 18 44 C18 44 36 31.5 36 18 C36 8.06 27.94 0 18 0 Z" fill="' + fill + '" style="' + shadow + '" />'
+          + '<circle cx="18" cy="18" r="6.5" fill="' + inner + '" />'
+          + '</svg>'
+          + '</div>';
+      }
+
+      function init() {
+        if (typeof L === 'undefined') {
+          setTimeout(init, 50);
+          return;
+        }
+
+        map = L.map('map', {
+          zoomControl: false,
+          attributionControl: false,
+          fadeAnimation: true,
+          zoomAnimation: true,
+        }).setView([${initialLat}, ${initialLng}], 15);
+
+        var initialTilesUrl = hasCartoKey
+          ? (currentThemeDark ? DARK_CARTO : LIGHT_CARTO)
+          : OSM_TILES;
+
+        var subdomains = hasCartoKey ? 'abcd' : 'abc';
+
+        tileLayer = L.tileLayer(initialTilesUrl, {
+          subdomains: subdomains,
+          maxZoom: 19
+        }).addTo(map);
+
+        var mapEl = document.getElementById('map');
+        if (currentThemeDark && !hasCartoKey && mapEl) {
+          mapEl.classList.add('dark-tiles');
+        }
+
+        map.on('click', function() {
+          if (window.ReactNativeWebView) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'MAP_PRESS' }));
+          }
+        });
+
+        map.on('moveend', function() {
+          var center = map.getCenter();
+          var bounds = map.getBounds();
+          var latDelta = Math.abs(bounds.getNorth() - bounds.getSouth());
+          var lngDelta = Math.abs(bounds.getEast() - bounds.getWest());
+          if (window.ReactNativeWebView) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              type: 'REGION_CHANGE',
+              region: {
+                latitude: center.lat,
+                longitude: center.lng,
+                latitudeDelta: latDelta,
+                longitudeDelta: lngDelta
+              }
+            }));
+          }
+        });
+
+        if (window.ReactNativeWebView) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'MAP_READY' }));
+        }
+      }
+
+      function updateLocation(lat, lng, heading, followUser) {
+        if (!map) return;
+        var rot = heading || 0;
+
+        if (!userMarker) {
+          var icon = L.divIcon({
+            className: 'custom-div-icon',
+            html: getArrowSvg(rot, currentThemeDark),
+            iconSize: [56, 56],
+            iconAnchor: [28, 28]
+          });
+          userMarker = L.marker([lat, lng], { icon: icon, zIndexOffset: 1000 }).addTo(map);
+        } else {
+          userMarker.setLatLng([lat, lng]);
+          var elem = document.getElementById('arrow-rotator');
+          if (elem) {
+            elem.style.transform = 'rotate(' + rot + 'deg)';
+          } else {
+            userMarker.setIcon(L.divIcon({
+              className: 'custom-div-icon',
+              html: getArrowSvg(rot, currentThemeDark),
+              iconSize: [56, 56],
+              iconAnchor: [28, 28]
+            }));
+          }
+        }
+
+        if (followUser) {
+          map.panTo([lat, lng], { animate: true, duration: 0.6 });
+        }
+      }
+
+      function setRoute(coords, destination) {
+        if (!map) return;
+
+        if (routeGlowPolyline) {
+          map.removeLayer(routeGlowPolyline);
+          routeGlowPolyline = null;
+        }
+        if (routeMainPolyline) {
+          map.removeLayer(routeMainPolyline);
+          routeMainPolyline = null;
+        }
+        if (destinationMarker) {
+          map.removeLayer(destinationMarker);
+          destinationMarker = null;
+        }
+
+        if (coords && coords.length >= 2) {
+          var latlngs = coords.map(function(c) { return [c.latitude, c.longitude]; });
+
+          if (currentThemeDark) {
+            routeGlowPolyline = L.polyline(latlngs, {
+              color: 'rgba(0, 229, 255, 0.3)',
+              weight: 14,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }).addTo(map);
+
+            routeMainPolyline = L.polyline(latlngs, {
+              color: '#00E5FF',
+              weight: 6,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }).addTo(map);
+          } else {
+            routeMainPolyline = L.polyline(latlngs, {
+              color: '#2B5B84',
+              weight: 6,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }).addTo(map);
+          }
+        }
+
+        if (destination) {
+          var pinIcon = L.divIcon({
+            className: 'custom-div-icon',
+            html: getPinSvg(currentThemeDark),
+            iconSize: [36, 44],
+            iconAnchor: [18, 44]
+          });
+          destinationMarker = L.marker([destination.latitude, destination.longitude], {
+            icon: pinIcon,
+            zIndexOffset: 900
+          }).addTo(map);
+        }
+      }
+
+      function setTheme(isDark) {
+        currentThemeDark = isDark;
+        var bg = isDark ? '#0B111D' : '#F1F4F7';
+        document.body.style.backgroundColor = bg;
+        var mapEl = document.getElementById('map');
+        if (mapEl) {
+          mapEl.style.backgroundColor = bg;
+          if (isDark && !hasCartoKey) {
+            mapEl.classList.add('dark-tiles');
+          } else {
+            mapEl.classList.remove('dark-tiles');
+          }
+        }
+
+        if (tileLayer) {
+          if (hasCartoKey) {
+            tileLayer.setUrl(isDark ? DARK_CARTO : LIGHT_CARTO);
+          } else {
+            tileLayer.setUrl(OSM_TILES);
+          }
+        }
+
+        if (userMarker) {
+          var elem = document.getElementById('arrow-rotator');
+          var curRot = 0;
+          if (elem && elem.style.transform) {
+            var match = elem.style.transform.match(/rotate\\(([-\\d.]+)deg\\)/);
+            if (match) curRot = parseFloat(match[1]);
+          }
+          userMarker.setIcon(L.divIcon({
+            className: 'custom-div-icon',
+            html: getArrowSvg(curRot, isDark),
+            iconSize: [56, 56],
+            iconAnchor: [28, 28]
+          }));
+        }
+
+        if (destinationMarker) {
+          destinationMarker.setIcon(L.divIcon({
+            className: 'custom-div-icon',
+            html: getPinSvg(isDark),
+            iconSize: [36, 44],
+            iconAnchor: [18, 44]
+          }));
+        }
+
+        if (routeMainPolyline) {
+          var latlngs = routeMainPolyline.getLatLngs();
+          if (routeGlowPolyline) {
+            map.removeLayer(routeGlowPolyline);
+            routeGlowPolyline = null;
+          }
+          map.removeLayer(routeMainPolyline);
+          routeMainPolyline = null;
+
+          if (isDark) {
+            routeGlowPolyline = L.polyline(latlngs, {
+              color: 'rgba(0, 229, 255, 0.3)',
+              weight: 14,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }).addTo(map);
+            routeMainPolyline = L.polyline(latlngs, {
+              color: '#00E5FF',
+              weight: 6,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }).addTo(map);
+          } else {
+            routeMainPolyline = L.polyline(latlngs, {
+              color: '#2B5B84',
+              weight: 6,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }).addTo(map);
+          }
+        }
+      }
+
+      function handleMessage(data) {
+        if (!data || !map) return;
+        switch (data.type) {
+          case 'SET_THEME':
+            setTheme(data.isDarkMode);
+            break;
+          case 'UPDATE_LOCATION':
+            updateLocation(data.lat, data.lng, data.heading, data.followUser);
+            break;
+          case 'SET_ROUTE':
+            setRoute(data.coordinates, data.destination);
+            break;
+          case 'ZOOM_IN':
+            map.zoomIn();
+            break;
+          case 'ZOOM_OUT':
+            map.zoomOut();
+            break;
+          case 'RECENTER':
+            if (data.lat !== undefined && data.lng !== undefined) {
+              map.panTo([data.lat, data.lng], { animate: true, duration: 0.6 });
+            }
+            break;
+          case 'FIT_BOUNDS':
+            if (data.coordinates && data.coordinates.length > 0) {
+              var bounds = data.coordinates.map(function(c) { return [c.latitude, c.longitude]; });
+              map.fitBounds(bounds, { padding: [60, 60], animate: true });
+            }
+            break;
+          case 'PAN_TO':
+            if (data.lat !== undefined && data.lng !== undefined) {
+              map.panTo([data.lat, data.lng], { animate: true, duration: 0.6 });
+            }
+            break;
+        }
+      }
+
+      window.handleAvanMessage = handleMessage;
+      window.addEventListener('message', function(e) {
+        try {
+          var data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+          handleMessage(data);
+        } catch (err) {}
+      });
+      document.addEventListener('message', function(e) {
+        try {
+          var data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+          handleMessage(data);
+        } catch (err) {}
+      });
+
+      init();
+    })();
+  </script>
+</body>
+</html>`;
+}
 
 export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>(
   (
@@ -91,7 +465,6 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
       userLocation,
       routeCoordinates,
       destinationMarker,
-      destinationTitle,
       initialRegion,
       followUser = false,
       onRegionChangeComplete,
@@ -100,169 +473,156 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
     },
     ref
   ) => {
-    const mapRef = useRef<MapView>(null);
-    const currentRegionRef = useRef<Region>(initialRegion || DEFAULT_REGION);
-    const currentTheme: ThemeColors = isDarkMode ? darkTheme : lightTheme;
+    const webViewRef = useRef<WebView>(null);
+    const [isMapReady, setIsMapReady] = useState<boolean>(false);
 
-    // Métodos imperativos expuestos para comandos de voz y botones de control
+    // Clave opcional de CartoDB si el usuario la provee vía variable de entorno
+    const cartoApiKey =
+      typeof process !== 'undefined' && process.env?.EXPO_PUBLIC_CARTO_API_KEY
+        ? process.env.EXPO_PUBLIC_CARTO_API_KEY.trim()
+        : '';
+
+    const initialLat = initialRegion?.latitude ?? DEFAULT_REGION.latitude;
+    const initialLng = initialRegion?.longitude ?? DEFAULT_REGION.longitude;
+
+    const sendMessage = useCallback((msg: object) => {
+      const json = JSON.stringify(msg);
+      webViewRef.current?.injectJavaScript(`
+        if (window.handleAvanMessage) {
+          window.handleAvanMessage(${json});
+        }
+        true;
+      `);
+    }, []);
+
+    // Expone la API imperativa de control para botones y comandos de voz
     useImperativeHandle(ref, () => ({
       zoomIn: () => {
-        const cur = currentRegionRef.current;
-        const newRegion: Region = {
-          latitude: cur.latitude,
-          longitude: cur.longitude,
-          latitudeDelta: Math.max(cur.latitudeDelta * 0.5, 0.0008),
-          longitudeDelta: Math.max(cur.longitudeDelta * 0.5, 0.0008),
-        };
-        currentRegionRef.current = newRegion;
-        mapRef.current?.animateToRegion(newRegion, 350);
+        sendMessage({ type: 'ZOOM_IN' });
       },
       zoomOut: () => {
-        const cur = currentRegionRef.current;
-        const newRegion: Region = {
-          latitude: cur.latitude,
-          longitude: cur.longitude,
-          latitudeDelta: Math.min(cur.latitudeDelta * 2.0, 60),
-          longitudeDelta: Math.min(cur.longitudeDelta * 2.0, 60),
-        };
-        currentRegionRef.current = newRegion;
-        mapRef.current?.animateToRegion(newRegion, 350);
+        sendMessage({ type: 'ZOOM_OUT' });
       },
       recenter: () => {
-        if (!userLocation) return;
-        const newRegion: Region = {
-          latitude: userLocation.latitude,
-          longitude: userLocation.longitude,
-          latitudeDelta: 0.008,
-          longitudeDelta: 0.008,
-        };
-        currentRegionRef.current = newRegion;
-        mapRef.current?.animateToRegion(newRegion, 500);
+        if (userLocation) {
+          sendMessage({
+            type: 'RECENTER',
+            lat: userLocation.latitude,
+            lng: userLocation.longitude,
+          });
+        }
       },
-      animateToRegion: (region: Region, duration = 500) => {
-        currentRegionRef.current = region;
-        mapRef.current?.animateToRegion(region, duration);
+      animateToRegion: (region: Region) => {
+        sendMessage({
+          type: 'PAN_TO',
+          lat: region.latitude,
+          lng: region.longitude,
+        });
       },
-      fitToCoordinates: (coordinates: LatLng[], options) => {
-        mapRef.current?.fitToCoordinates(coordinates, {
-          edgePadding: options?.edgePadding || {
-            top: 140,
-            right: 60,
-            bottom: 220,
-            left: 60,
-          },
-          animated: options?.animated !== false,
+      fitToCoordinates: (coordinates: LatLng[]) => {
+        sendMessage({
+          type: 'FIT_BOUNDS',
+          coordinates,
         });
       },
       getCamera: async () => {
-        if (!mapRef.current) return null;
-        return await mapRef.current.getCamera();
+        return null;
       },
     }));
 
-    // Si followUser está activo, recentramos suavemente el mapa al cambiar de posición
+    // Sincronización del tema Día / Noche
     useEffect(() => {
-      if (followUser && userLocation && mapRef.current) {
-        mapRef.current.animateCamera(
-          {
-            center: {
-              latitude: userLocation.latitude,
-              longitude: userLocation.longitude,
-            },
-            heading: userLocation.heading ?? 0,
-          },
-          { duration: 800 }
-        );
+      if (isMapReady) {
+        sendMessage({ type: 'SET_THEME', isDarkMode });
       }
-    }, [followUser, userLocation?.latitude, userLocation?.longitude, userLocation?.heading]);
+    }, [isDarkMode, isMapReady, sendMessage]);
 
-    const handleRegionChangeComplete = (region: Region) => {
-      currentRegionRef.current = region;
-      if (onRegionChangeComplete) {
-        onRegionChangeComplete(region);
+    // Sincronización de ubicación y rumbo en tiempo real
+    useEffect(() => {
+      if (isMapReady && userLocation) {
+        sendMessage({
+          type: 'UPDATE_LOCATION',
+          lat: userLocation.latitude,
+          lng: userLocation.longitude,
+          heading: userLocation.heading ?? 0,
+          followUser,
+        });
+      }
+    }, [
+      isMapReady,
+      userLocation?.latitude,
+      userLocation?.longitude,
+      userLocation?.heading,
+      followUser,
+      sendMessage,
+    ]);
+
+    // Sincronización de la polilínea de ruta y marcador de destino
+    useEffect(() => {
+      if (isMapReady) {
+        sendMessage({
+          type: 'SET_ROUTE',
+          coordinates: routeCoordinates || [],
+          destination: destinationMarker || null,
+        });
+      }
+    }, [isMapReady, routeCoordinates, destinationMarker, sendMessage]);
+
+    const handleMessage = (event: WebViewMessageEvent) => {
+      try {
+        const data = JSON.parse(event.nativeEvent.data);
+        if (data.type === 'MAP_READY') {
+          setIsMapReady(true);
+          // Enviar estado inicial acumulado
+          if (userLocation) {
+            sendMessage({
+              type: 'UPDATE_LOCATION',
+              lat: userLocation.latitude,
+              lng: userLocation.longitude,
+              heading: userLocation.heading ?? 0,
+              followUser,
+            });
+          }
+          if (routeCoordinates && routeCoordinates.length >= 2) {
+            sendMessage({
+              type: 'SET_ROUTE',
+              coordinates: routeCoordinates,
+              destination: destinationMarker || null,
+            });
+          }
+        } else if (data.type === 'REGION_CHANGE' && onRegionChangeComplete) {
+          onRegionChangeComplete(data.region);
+        } else if (data.type === 'MAP_PRESS' && onMapPress) {
+          onMapPress();
+        }
+      } catch (err) {
+        console.warn('Error al procesar mensaje de Leaflet:', err);
       }
     };
 
-    const hasRoute = routeCoordinates && routeCoordinates.length >= 2;
+    const htmlContent = generateLeafletHtml(initialLat, initialLng, isDarkMode, cartoApiKey);
 
     return (
-      <View style={[styles.container, style]}>
-        <MapView
-          ref={mapRef}
-          style={StyleSheet.absoluteFill}
-          customMapStyle={isDarkMode ? darkMapStyle : lightMapStyle}
-          initialRegion={initialRegion || DEFAULT_REGION}
-          onRegionChangeComplete={handleRegionChangeComplete}
-          onPress={onMapPress}
-          showsUserLocation={false}
-          showsCompass={false}
-          showsTraffic={false}
-          showsMyLocationButton={false}
-          showsScale={false}
-          showsBuildings={false}
-          showsIndoors={false}
-          rotateEnabled={true}
-          pitchEnabled={false}
-          toolbarEnabled={false}
-        >
-          {/* Polilínea de la ruta activa */}
-          {hasRoute && (
-            <>
-              {/* Resplandor neón exterior en modo nocturno */}
-              {isDarkMode && (
-                <Polyline
-                  coordinates={routeCoordinates}
-                  strokeColor="rgba(0, 229, 255, 0.28)"
-                  strokeWidth={14}
-                  lineCap="round"
-                  lineJoin="round"
-                  zIndex={2}
-                />
-              )}
-              {/* Trazo principal de la ruta */}
-              <Polyline
-                coordinates={routeCoordinates}
-                strokeColor={isDarkMode ? '#00E5FF' : '#2B5B84'}
-                strokeWidth={isDarkMode ? 6 : 6}
-                lineCap="round"
-                lineJoin="round"
-                zIndex={3}
-              />
-            </>
-          )}
-
-          {/* Marcador de Destino */}
-          {destinationMarker && (
-            <Marker
-              coordinate={destinationMarker}
-              anchor={{ x: 0.5, y: 1.0 }}
-              title={destinationTitle || 'Destino'}
-              zIndex={9}
-            >
-              <DestinationPin isDarkMode={isDarkMode} />
-            </Marker>
-          )}
-
-          {/* Marcador Vehicular con orientación de rumbo (heading) */}
-          {userLocation && (
-            <Marker
-              coordinate={{
-                latitude: userLocation.latitude,
-                longitude: userLocation.longitude,
-              }}
-              anchor={{ x: 0.5, y: 0.5 }}
-              flat={true}
-              zIndex={10}
-            >
-              <NavigationArrow
-                theme={currentTheme}
-                isDarkMode={isDarkMode}
-                rotation={userLocation.heading ?? 0}
-                size={54}
-              />
-            </Marker>
-          )}
-        </MapView>
+      <View
+        style={[
+          styles.container,
+          { backgroundColor: isDarkMode ? '#0B111D' : '#F1F4F7' },
+          style,
+        ]}
+      >
+        <WebView
+          ref={webViewRef}
+          source={{ html: htmlContent }}
+          style={styles.webView}
+          containerStyle={styles.webViewContainer}
+          scrollEnabled={false}
+          bounces={false}
+          javaScriptEnabled={true}
+          domStorageEnabled={true}
+          geolocationEnabled={false}
+          originWhitelist={['*']}
+          onMessage={handleMessage}
+        />
       </View>
     );
   }
@@ -273,17 +633,20 @@ InteractiveMap.displayName = 'InteractiveMap';
 const styles = StyleSheet.create({
   container: {
     ...StyleSheet.absoluteFill,
+    width: '100%',
+    height: '100%',
     overflow: 'hidden',
   },
-  pinContainer: {
-    alignItems: 'center',
-    justifyContent: 'center',
+  webViewContainer: {
+    ...StyleSheet.absoluteFill,
+    width: '100%',
+    height: '100%',
+    backgroundColor: 'transparent',
   },
-  pinDarkGlow: {
-    shadowColor: '#00E5FF',
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.9,
-    shadowRadius: 10,
-    elevation: 8,
+  webView: {
+    ...StyleSheet.absoluteFill,
+    width: '100%',
+    height: '100%',
+    backgroundColor: 'transparent',
   },
 });

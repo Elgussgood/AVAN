@@ -154,7 +154,7 @@ export const VoiceActionButton: React.FC<VoiceActionButtonProps> = ({
             },
           ]}
           accessibilityLabel="Botón de comunicación por voz"
-          accessibilityHint="Presiona para hablar con tu asistente de viaje"
+          accessibilityHint="Presione para hablar con su asistente de viaje"
           accessibilityRole="button"
         >
           {voiceState === 'processing' ? (

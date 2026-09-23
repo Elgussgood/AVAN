@@ -320,7 +320,7 @@ export class OpenRouteService {
     // Instrucciones paso a paso realistas
     const steps: StepInstruction[] = [
       {
-        instruction: 'Inicia tu recorrido dirigiéndote hacia la avenida principal',
+        instruction: 'Inicie su recorrido dirigiéndose hacia la avenida principal',
         distance: Math.round(estimatedDistance * 0.15),
         duration: Math.round(estimatedDuration * 0.15),
         type: 11, // Head
@@ -328,7 +328,7 @@ export class OpenRouteService {
         wayPoints: [0, 2],
       },
       {
-        instruction: 'Continúa recto durante 800 metros',
+        instruction: 'Continúe recto durante 800 metros',
         distance: Math.round(estimatedDistance * 0.35),
         duration: Math.round(estimatedDuration * 0.35),
         type: 0, // Continue
@@ -336,7 +336,7 @@ export class OpenRouteService {
         wayPoints: [2, 6],
       },
       {
-        instruction: 'Gira a la derecha en el cruce semaforizado',
+        instruction: 'Gire a la derecha en el cruce semaforizado',
         distance: Math.round(estimatedDistance * 0.25),
         duration: Math.round(estimatedDuration * 0.25),
         type: 1, // Turn right
@@ -344,7 +344,7 @@ export class OpenRouteService {
         wayPoints: [6, 10],
       },
       {
-        instruction: 'Gira a la izquierda con dirección a tu destino',
+        instruction: 'Gire a la izquierda con dirección a su destino',
         distance: Math.round(estimatedDistance * 0.2),
         duration: Math.round(estimatedDuration * 0.2),
         type: 2, // Turn left
@@ -352,7 +352,7 @@ export class OpenRouteService {
         wayPoints: [10, 13],
       },
       {
-        instruction: 'Has llegado a tu destino',
+        instruction: 'Ha llegado a su destino',
         distance: Math.round(estimatedDistance * 0.05),
         duration: Math.round(estimatedDuration * 0.05),
         type: 10, // Arrive

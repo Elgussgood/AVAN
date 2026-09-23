@@ -55,11 +55,63 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
 - [x] **TASK-08D**: **Flujo de Auto-Escucha en Cancelación y Continuidad**: El micrófono se mantiene escuchando automáticamente tras preguntar si desea viajar a otro lugar.
 - [x] **TASK-09**: **Ciclo Completo End-to-End**: Pulsación de botón, grabación de voz con tolerancia de 8s de silencio, transcripción Whisper, análisis NLU determinista, cálculo de ruta real con ORS, renderizado en mapa con flecha vehicular e interacción auditiva natural.
 
-### 5. Agente de Backend / Persistencia (`08-backend-infraestructura.md`)
-- [ ] **TASK-15**: Configuración de Supabase para almacenar sitios frecuentes ("casa de mi hijo") y sincronizar apodos en la nube.
-- [ ] **TASK-16**: Sincronización y backup de destinos frecuentes con autenticación discreta/familiar.
+---
 
-### 6. Agente de QA / Accesibilidad (`09-qa-accesibilidad.md`)
-- [x] **TASK-14**: Certificación de compilación TypeScript (`npx tsc --noEmit` con 0 errores).
-- [ ] **TASK-17**: Compilación de APK de prueba con EAS Build (`eas build -p android --profile preview`) para pruebas en vehículo real.
+## Fases del Proyecto
+
+### Fase 1: Arquitectura Base, One-Button UI y Visualización de Mapas [COMPLETADA]
+- [x] **TASK-01**: Inicializar proyecto Expo con TypeScript y permisos.
+- [x] **TASK-02**: Sistema de temas (Día / Noche) en `theme.ts`.
+- [x] **TASK-03**: Componente `GreetingCard.tsx`.
+- [x] **TASK-04**: Componente `VoiceActionButton.tsx` con alineación geométrica del halo pulsante.
+- [x] **TASK-05**: Pantalla `MinimalHomeScreen.tsx` (botón en medio para inicio, One-Button UI pura).
+- [x] **TASK-10**: Estilos JSON de mapa claro y oscuro con `react-native-maps`.
+- [x] **TASK-11**: Seguimiento de GPS y rumbo con `expo-location`.
+- [x] **TASK-12**: Integración OpenRouteService (`orsService.ts`) para ruteo vehicular.
+
+### Fase 2: Motor Conversacional NLU, TTS Humano y Flujos Gerontológicos [COMPLETADA]
+- [x] **TASK-06**: Síntesis TTS con `expo-speech` y fallback adaptativo.
+- [x] **TASK-07**: Grabación STT nativa (`audioRecorder.ts`) con Groq Whisper (Zero-Persistence).
+- [x] **TASK-07B**: Síntesis ultra-natural con ElevenLabs TTS y OpenAI TTS.
+- [x] **TASK-08**: NLU Function Calling en Groq (`openai/gpt-oss-120b`) con confirmación en 2 pasos.
+- [x] **TASK-08B**: Catálogo de alias y sitios frecuentes de CDMX (`aliasService.ts`).
+- [x] **TASK-08C**: Advertencia de seguridad para viajes foráneos (>50 km) y reporte de incidentes.
+- [x] **TASK-08D**: Protocolo de cancelación en 2 pasos, continuidad con auto-escucha y supresión de micro en despedidas.
+- [x] **TASK-09**: Integración End-to-End: botón -> voz natural -> confirmación -> mapa -> retorno a reposo.
+- [x] **TASK-05B**: Transición automática entre `MinimalHomeScreen` y `HomeScreen`.
+- [x] **TASK-05C**: Feedback visual gerontológico con pantalla de carga e indicador de procesamiento en botón.
+- [x] **TASK-14**: Certificación estricta de compilación TypeScript (`npx tsc --noEmit` con 0 errores).
+
+---
+
+### Fase 3: Persistencia en la Nube, Navegación Dinámica y Release en Vehículo Real [EN CURSO]
+
+#### 1. Agente de Backend e Infraestructura (`08-backend-infraestructura.md`)
+- [ ] **TASK-15**: **Integración de Supabase Client y Esquema de Datos**:
+  - Configurar cliente Supabase en `src/services/supabaseClient.ts` con `@supabase/supabase-js` y `@react-native-async-storage/async-storage`.
+  - Definir esquema SQL para `user_places` (`id`, `user_id`, `alias`, `display_name`, `address`, `latitude`, `longitude`, `created_at`, `updated_at`).
+  - Configurar Row Level Security (RLS) para proteger los datos de personas mayores y habilitar acceso a cuidadores familiares.
+- [ ] **TASK-16**: **Sincronización Bidireccional de Sitios Frecuentes**:
+  - Conectar `aliasService.ts` con Supabase para sincronizar destinos guardados ("casa de mi hijo", "médico", "clínica").
+  - Arquitectura offline-first: persistencia local inmediata en dispositivo con sincronización transparente a la nube.
+
+#### 2. Agente de Mapas y Ruteo (`06-mapas-ruteo.md`) & Agente Mobile (`07-mobile-frontend.md`)
+- [x] **TASK-18**: **Navegación Dinámica Turn-by-Turn en Marcha**:
+  - Algoritmo de seguimiento de maniobras paso a paso según la proximidad GPS al próximo waypoint en `navigationService.ts`.
+  - Anuncio por voz proactivo y automático de maniobras (<140m aviso de aproximación y <40m aviso inminente de giro) sin requerir tocar la pantalla ni distraer la vista.
+  - Tarjeta de maniobra superior dinámica en `HomeScreen.tsx` con icono vectorial según el tipo de maniobra (giros, rotondas, incorporaciones), badge de distancia ("EN 180 M • RUMBO A..."), instrucción principal y tira inferior de métricas (tiempo y distancia restantes).
+  - Modo simulador de recorrido ("Simular / Pausar") accesible desde la barra superior y por comandos de voz ("simular recorrido", "pausar simulación", "cuánto falta").
+- [x] **TASK-19**: **Detección de Llegada y Recálculo ante Desvíos**:
+  - Detección automática de llegada a destino (<45m), con vibración háptica de éxito, anuncio de voz ("Ha llegado a su destino en [Destino]") e inicio automático del diálogo de continuidad para retorno fluido a `MinimalHomeScreen`.
+  - Detección geométrica de pérdida de ruta (>100 metros fuera de la polilínea por 3 lecturas continuas de GPS) con recálculo automático y transparente vía OpenRouteService sin alarmas intrusivas.
+
+#### 3. Agente de Privacidad y Seguridad (`10-privacidad-seguridad.md`)
+- [ ] **TASK-20**: **Auditoría de Seguridad y Zero-Persistence en Producción**:
+  - Actualización y blindaje de `.env.example` con las credenciales de Supabase.
+  - Verificación de no-persistencia de audios ni datos de rastreo no autorizados.
+
+#### 4. Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)
+- [ ] **TASK-17**: **Configuración de EAS Build y Generación de APK de Prueba**:
+  - Configuración de `eas.json` con perfil `preview` para generación de APK independiente (sideloading en Android).
+  - Validación de compilación limpia y pruebas de campo en vehículo real.
 

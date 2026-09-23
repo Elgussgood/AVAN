@@ -3,6 +3,7 @@ import { useColorScheme } from 'react-native';
 import { LatLng } from 'react-native-maps';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { MinimalHomeScreen, RouteData } from './src/screens/MinimalHomeScreen';
+import { StepInstruction } from './src/services/orsService';
 import {
   ConversationService,
   ConversationContext,
@@ -28,6 +29,7 @@ export default function App() {
   const [currentInstruction, setCurrentInstruction] = useState<string>('');
   const [remainingDistance, setRemainingDistance] = useState<number>(0);
   const [remainingDuration, setRemainingDuration] = useState<number>(0);
+  const [routeSteps, setRouteSteps] = useState<StepInstruction[]>([]);
   const [zoomLevel, setZoomLevel] = useState<number>(1.0);
   const [conversationContext, setConversationContext] = useState<ConversationContext>(() =>
     ConversationService.createInitialContext('GUSTAVO')
@@ -57,6 +59,7 @@ export default function App() {
       setCurrentInstruction(routeData.instruction);
       setRemainingDistance(routeData.distance);
       setRemainingDuration(routeData.duration);
+      setRouteSteps(routeData.steps || []);
     }
     setZoomLevel(1.0);
     setViewMode('map');
@@ -72,7 +75,9 @@ export default function App() {
     setCurrentInstruction('');
     setRemainingDistance(0);
     setRemainingDuration(0);
+    setRouteSteps([]);
     setZoomLevel(1.0);
+    setConversationContext(ConversationService.createInitialContext('GUSTAVO'));
     setViewMode('minimal');
   };
 
@@ -94,6 +99,7 @@ export default function App() {
         instruction={currentInstruction}
         remainingDistance={remainingDistance}
         remainingDuration={remainingDuration}
+        steps={routeSteps}
         zoomLevel={zoomLevel}
         onZoomChange={handleZoomChange}
         onStopTrip={handleStopTrip}
