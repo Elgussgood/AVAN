@@ -21,6 +21,52 @@ export interface AudioRecordingResult {
   durationMillis: number;
 }
 
+export interface AudioRecordingOptions {
+  /**
+   * Si es true, activa la calibración para dictado de dirección (pausas más largas de 4s y máximo 25s).
+   */
+  isDictatingAddress?: boolean;
+
+  /**
+   * Ventana de silencio inicial en ms (tiempo esperando a que el usuario empiece a hablar). Por defecto: 8000ms.
+   */
+  initialSilenceMs?: number;
+
+  /**
+   * Ventana de silencio posterior (trailing silence) en ms (tiempo de silencio tras haber hablado para cerrar y procesar).
+   * Por defecto: 3000ms (o 4000ms si isDictatingAddress es true).
+   */
+  trailingSilenceMs?: number;
+
+  /**
+   * Duración máxima absoluta de grabación en ms.
+   * Por defecto: 15000ms (o 25000ms si isDictatingAddress es true).
+   */
+  maxDurationMs?: number;
+
+  /**
+   * Umbral de energía vocal en dB para considerar que el usuario empezó a hablar.
+   * Por defecto: -40 dB.
+   */
+  speechThresholdDb?: number;
+
+  /**
+   * Callback invocado cuando se detecta por primera vez energía de habla.
+   */
+  onSpeechDetected?: () => void;
+
+  /**
+   * Callback invocado si transcurre la ventana de silencio inicial (8s) sin que el usuario haya hablado.
+   */
+  onInitialSilenceTimeout?: () => void | Promise<void>;
+
+  /**
+   * Callback invocado cuando el usuario habló y transcurren 3s continuos de silencio (trailing silence),
+   * o se alcanza la duración máxima. Se le entrega el resultado de la transcripción.
+   */
+  onSpeechEnded?: (transcription: TranscriptionResult | null) => void | Promise<void>;
+}
+
 /**
  * Servicio de grabación de audio y transcripción STT (Speech-to-Text) para AVAN.
  * Utiliza `expo-audio` para máxima compatibilidad con Expo Go (SDK 52+).
@@ -33,6 +79,23 @@ export class AudioRecorderService {
   private static isRecordingAudio: boolean = false;
   private static lastDurationMillis: number = 0;
   private static status: RecordingStatus = 'idle';
+
+  // Monitor VAD (Voice Activity Detection)
+  private static vadInterval: ReturnType<typeof setInterval> | null = null;
+  private static isSpeechDetected: boolean = false;
+  private static speechStartTime: number | null = null;
+  private static lastSpeechTime: number | null = null;
+  private static recordingStartTime: number = 0;
+
+  /**
+   * Detiene el monitor de actividad vocal (VAD).
+   */
+  static stopVADMonitor(): void {
+    if (this.vadInterval) {
+      clearInterval(this.vadInterval);
+      this.vadInterval = null;
+    }
+  }
 
   /**
    * Solicita permisos de micrófono al usuario mediante expo-audio.
@@ -48,10 +111,12 @@ export class AudioRecorderService {
   }
 
   /**
-   * Solicita permisos de micrófono y comienza la grabación en alta calidad usando expo-audio.
+   * Solicita permisos de micrófono y comienza la grabación en alta calidad usando expo-audio
+   * con monitoreo VAD en tiempo real (silencio inicial de 8s y trailing silence de 3s).
    */
-  static async startRecording(): Promise<boolean> {
+  static async startRecording(options?: AudioRecordingOptions): Promise<boolean> {
     try {
+      this.stopVADMonitor();
       if (this.recording) {
         await this.cancelRecording();
       }
@@ -69,17 +134,104 @@ export class AudioRecorderService {
         playsInSilentMode: true,
       });
 
-      const recorder = new AudioModule.AudioRecorder(RecordingPresets.HIGH_QUALITY);
-      await recorder.prepareToRecordAsync();
+      const recordingOptions = {
+        ...RecordingPresets.HIGH_QUALITY,
+        isMeteringEnabled: true,
+      };
+
+      const recorder = new AudioModule.AudioRecorder(recordingOptions);
+      await recorder.prepareToRecordAsync(recordingOptions);
       recorder.record();
 
       this.recording = recorder;
       this.isRecordingAudio = true;
       this.status = 'recording';
       this.lastDurationMillis = 0;
+      this.isSpeechDetected = false;
+      this.speechStartTime = null;
+      this.lastSpeechTime = null;
+      this.recordingStartTime = Date.now();
+
+      // Configuración de umbrales y tiempos de VAD
+      const isDictating = Boolean(options?.isDictatingAddress);
+      const initialSilenceMs = options?.initialSilenceMs ?? 8000;
+      const trailingSilenceMs = options?.trailingSilenceMs ?? (isDictating ? 2500 : 1800);
+      const maxDurationMs = options?.maxDurationMs ?? (isDictating ? 25000 : 15000);
+      const speechThresholdDb = options?.speechThresholdDb ?? -38;
+
+      this.vadInterval = setInterval(async () => {
+        if (!this.recording || !this.isRecordingAudio) {
+          this.stopVADMonitor();
+          return;
+        }
+
+        const now = Date.now();
+        const elapsed = now - this.recordingStartTime;
+        let metering: number | undefined;
+
+        try {
+          const status = this.recording.getStatus();
+          metering = status.metering;
+        } catch {
+          // ignore
+        }
+
+        // Si metering está disponible y supera el umbral de voz
+        if (typeof metering === 'number') {
+          if (metering >= speechThresholdDb) {
+            if (!this.isSpeechDetected) {
+              this.isSpeechDetected = true;
+              this.speechStartTime = now;
+              console.log(`[AudioRecorderService] VAD: Habla iniciada (nivel: ${metering.toFixed(1)} dB >= ${speechThresholdDb} dB)`);
+              if (options?.onSpeechDetected) {
+                options.onSpeechDetected();
+              }
+            }
+            this.lastSpeechTime = now;
+          }
+        }
+
+        // Condición A: Silencio Posterior (Trailing Silence tras haber hablado)
+        if (this.isSpeechDetected && this.lastSpeechTime) {
+          const silenceDuration = now - this.lastSpeechTime;
+          if (silenceDuration >= trailingSilenceMs) {
+            console.log(`[AudioRecorderService] VAD: Silencio posterior completado (${silenceDuration}ms >= ${trailingSilenceMs}ms). Finalizando captura.`);
+            this.stopVADMonitor();
+            const transcription = await this.stopAndTranscribe();
+            if (options?.onSpeechEnded) {
+              await options.onSpeechEnded(transcription);
+            }
+            return;
+          }
+        }
+
+        // Condición B: Silencio Inicial (el usuario no ha hablado y pasaron 8 segundos)
+        if (!this.isSpeechDetected && elapsed >= initialSilenceMs) {
+          console.log(`[AudioRecorderService] VAD: Silencio inicial cumplido (${elapsed}ms >= ${initialSilenceMs}ms).`);
+          this.stopVADMonitor();
+          await this.stopRecording();
+          if (options?.onInitialSilenceTimeout) {
+            await options.onInitialSilenceTimeout();
+          }
+          return;
+        }
+
+        // Condición C: Límite máximo de duración de seguridad
+        if (elapsed >= maxDurationMs) {
+          console.log(`[AudioRecorderService] VAD: Límite máximo de duración alcanzado (${elapsed}ms >= ${maxDurationMs}ms).`);
+          this.stopVADMonitor();
+          const transcription = await this.stopAndTranscribe();
+          if (options?.onSpeechEnded) {
+            await options.onSpeechEnded(transcription);
+          }
+          return;
+        }
+      }, 100);
+
       return true;
     } catch (error) {
       console.warn('Error al iniciar grabación con expo-audio:', error);
+      this.stopVADMonitor();
       this.status = 'error';
       this.isRecordingAudio = false;
       this.recording = null;
@@ -93,6 +245,7 @@ export class AudioRecorderService {
    */
   static async stopRecording(): Promise<AudioRecordingResult> {
     try {
+      this.stopVADMonitor();
       if (!this.recording) {
         this.isRecordingAudio = false;
         this.status = 'idle';
@@ -123,6 +276,7 @@ export class AudioRecorderService {
       return { uri, durationMillis };
     } catch (error) {
       console.warn('Error al detener grabación de audio:', error);
+      this.stopVADMonitor();
       this.recording = null;
       this.isRecordingAudio = false;
       this.status = 'error';
@@ -186,6 +340,7 @@ export class AudioRecorderService {
   static async stopAndTranscribe(
     apiKey?: string
   ): Promise<TranscriptionResult | null> {
+    this.stopVADMonitor();
     if (!this.recording) {
       return null;
     }
@@ -325,6 +480,7 @@ export class AudioRecorderService {
    * Cancela cualquier grabación en curso y libera recursos
    */
   static async cancelRecording(): Promise<void> {
+    this.stopVADMonitor();
     let uri: string | null = null;
     try {
       if (this.recording) {

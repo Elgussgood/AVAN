@@ -65,6 +65,7 @@ export interface InteractiveMapProps {
   destinationMarker?: LatLng | null;
   destinationTitle?: string;
   initialRegion?: Region;
+  initialZoom?: number;
   followUser?: boolean;
   onRegionChangeComplete?: (region: Region) => void;
   onMapPress?: () => void;
@@ -87,7 +88,8 @@ function generateLeafletHtml(
   initialLat: number,
   initialLng: number,
   isDarkMode: boolean,
-  cartoApiKey: string
+  cartoApiKey: string,
+  initialZoom: number = 14
 ): string {
   const bgColor = isDarkMode ? '#0B111D' : '#F1F4F7';
 
@@ -185,7 +187,7 @@ function generateLeafletHtml(
           attributionControl: false,
           fadeAnimation: true,
           zoomAnimation: true,
-        }).setView([${initialLat}, ${initialLng}], 15);
+        }).setView([${initialLat}, ${initialLng}], ${initialZoom});
 
         var initialTilesUrl = hasCartoKey
           ? (currentThemeDark ? DARK_CARTO : LIGHT_CARTO)
@@ -318,6 +320,10 @@ function generateLeafletHtml(
             icon: pinIcon,
             zIndexOffset: 900
           }).addTo(map);
+
+          if (!coords || coords.length < 2) {
+            map.setView([destination.latitude, destination.longitude], ${initialZoom}, { animate: true });
+          }
         }
       }
 
@@ -466,6 +472,7 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
       routeCoordinates,
       destinationMarker,
       initialRegion,
+      initialZoom = 14,
       followUser = false,
       onRegionChangeComplete,
       onMapPress,
@@ -583,10 +590,10 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
               followUser,
             });
           }
-          if (routeCoordinates && routeCoordinates.length >= 2) {
+          if ((routeCoordinates && routeCoordinates.length >= 2) || destinationMarker) {
             sendMessage({
               type: 'SET_ROUTE',
-              coordinates: routeCoordinates,
+              coordinates: routeCoordinates || [],
               destination: destinationMarker || null,
             });
           }
@@ -600,7 +607,7 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
       }
     };
 
-    const htmlContent = generateLeafletHtml(initialLat, initialLng, isDarkMode, cartoApiKey);
+    const htmlContent = generateLeafletHtml(initialLat, initialLng, isDarkMode, cartoApiKey, initialZoom);
 
     return (
       <View

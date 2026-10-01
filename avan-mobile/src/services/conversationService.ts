@@ -18,6 +18,7 @@ import {
   SavedAlias,
   aliasService,
 } from './aliasService';
+import { orsService } from './orsService';
 
 // ============================================================================
 // CONFIGURACIÓN DE GROQ LLM
@@ -86,6 +87,8 @@ export interface ConfirmarViajeArgs {
   destino?: string;
   /** Indica si es un viaje foráneo en carretera */
   isForaneo?: boolean;
+  latitud?: number;
+  longitud?: number;
 }
 
 /**
@@ -308,7 +311,10 @@ export interface PendingConfirmation {
 
 export interface PendingAliasRegistration {
   aliasName: string;
-  step: 'awaiting_address';
+  step: 'awaiting_address' | 'confirming_address';
+  addressCandidate?: string;
+  coordinates?: LocationCoordinate;
+  retryCount?: number;
   timestamp: number;
 }
 
@@ -386,12 +392,19 @@ TUS DIRECTIVAS ESENCIALES:
 
 5. Herramientas del sistema:
    - navegar_a(destino: string): Calcula ruta y solicita confirmación.
-   - guardar_ubicacion(alias: string, direccion?: string): Guarda un sitio frecuente.
+   - guardar_ubicacion(alias: string, direccion?: string): Guarda un sitio frecuente o inicia el registro.
    - ajustar_zoom(direccion: 'acercar' | 'alejar' | 'centrar'): Adapta la vista del mapa.
    - confirmar_viaje(destino?: string): Inicia la marcha tras confirmación.
    - cancelar(): Cancela confirmación o detiene navegación activa.
    - consultar_trafico(): Informa sobre el estado del tráfico.
    - reportar_incidente(tipo: string): Registra incidente vial (accidente, obras, tráfico).
+
+6. Directiva de Salto de Contexto Ubicuo y Flexibilidad Total:
+   - El usuario puede cambiar de opinión o pedir cualquier acción desde cualquier pantalla o estado sin tener que cancelar manualmente el proceso anterior.
+   - Si se estaba confirmando una dirección o registrando un alias y el usuario dice "Quiero ir a Chapultepec" o pide cualquier destino, DEBES invocar 'navegar_a(destino: "Chapultepec")'. El sistema cancelará el registro previo automáticamente.
+   - Si se estaba por confirmar un viaje y el usuario dice "Quiero registrar una nueva dirección" o "Guarda la casa de mi hijo", DEBES invocar 'guardar_ubicacion'. El sistema cancelará la confirmación del viaje anterior automáticamente.
+   - Si el usuario pide ajustar el mapa ("acercar", "alejar"), invoca 'ajustar_zoom'.
+   - Atiende SIEMPRE la intención inmediata del usuario sin atraparlo en preguntas repetitivas ni forzar cancelaciones manuales.
 `.trim();
 
 // ============================================================================
@@ -622,7 +635,8 @@ function detectPersonOrHomeQuery(
 ): string | null {
   const personPatterns = [
     /(?:ir\s+con|llevarme\s+con|llevame\s+con|vamos\s+con)\s+(.+)/i,
-    /(?:a\s+casa\s+de|casa\s+de|a\s+lo\s+de)\s+(.+)/i,
+    /(?:a\s+la\s+casa\s+de|a\s+casa\s+de|casa\s+de|a\s+lo\s+de|lo\s+de|donde)\s+(.+)/i,
+    /(?:visitar\s+a|ver\s+a)\s+(.+)/i,
   ];
 
   for (const pattern of personPatterns) {
@@ -638,20 +652,162 @@ function detectPersonOrHomeQuery(
   return null;
 }
 
+function isAddAddressIntent(normalized: string): boolean {
+  return (
+    /(?:anadir|agregar|guardar|registrar|nueva|nuevo|alta)\s+(?:una\s+|un\s+)?(?:direccion|ubicacion|lugar|sitio|destino)/i.test(
+      normalized
+    ) ||
+    /(?:quiero|deseo|necesito|me gustaria)\s+(?:anadir|agregar|guardar|registrar|dar de alta)\s+(?:una\s+|un\s+)?(?:direccion|ubicacion|lugar|sitio|destino)/i.test(
+      normalized
+    ) ||
+    /(?:dar\s+de\s+alta)\s+(?:una\s+|un\s+)?(?:direccion|ubicacion|lugar|sitio|destino)/i.test(
+      normalized
+    ) ||
+    /^(?:anadir|agregar|guardar|registrar)\s+(?:direccion|ubicacion|lugar|sitio)$/i.test(
+      normalized
+    ) ||
+    /(?:quiero|deseo|necesito|me gustaria|voy a)\s+(?:guardar|registrar|anadir|agregar)\s+(?:mi\s+|la\s+|el\s+)?(?:casa|trabajo|oficina|rancho|doctor|dentista|hijo|hija|hermano|hermana|papa|mama|primo|prima|compadre|amigo|amiga)/i.test(
+      normalized
+    ) ||
+    /^(?:guardar|registrar|anadir|agregar)\s+(?:mi\s+|la\s+|el\s+)?(?:casa|trabajo|oficina|rancho|doctor|dentista|hijo|hija|hermano|hermana|papa|mama|primo|prima|compadre|amigo|amiga)/i.test(
+      normalized
+    )
+  );
+}
+
+function cleanAliasName(raw: string): string {
+  let cleaned = raw
+    .replace(/^(?:ir\s+a|ir\s+al|ir\s+con|llevarme\s+a|llevarme\s+con|llevame\s+a|llevame\s+con|vamos\s+a|vamos\s+con|viajar\s+a|navegar\s+a)\s+/i, '')
+    .replace(/^(?:a\s+la|a\s+el|al|a|con|hacia|en|para)\s+/i, '')
+    .replace(/^(?:mi\s+destino\s+es|destino|quiero\s+ir\s+a|quiero\s+ir\s+al|quiero\s+ir\s+con|quiero\s+ir)\s+/i, '')
+    .trim();
+
+  return capitalizeWords(cleaned);
+}
+
+function isPersonalPlaceIntent(query: string): boolean {
+  const norm = normalizeText(query);
+
+  // 1. Patrones de parentesco y hogar ("casa de...", "depto de...", "a lo de...", "con...", "donde...")
+  if (
+    /(?:casa de|casa del|depto de|departamento de|a lo de|lo de|donde|rancho de|oficina de|taller de)\s+(.+)/i.test(
+      norm
+    )
+  ) {
+    return true;
+  }
+
+  // 2. Patrones con "con [persona]": "ir con...", "vamos con..."
+  if (/(?:con|visitar a|ver a)\s+(?:mi\s+|el\s+|la\s+)?([a-z]+)/i.test(norm)) {
+    return true;
+  }
+
+  // 3. Posesivos y familiares frecuentes
+  const personalKeywords = [
+    'hijo',
+    'hija',
+    'nieto',
+    'nieta',
+    'hermano',
+    'hermana',
+    'mama',
+    'papa',
+    'madre',
+    'padre',
+    'abuelo',
+    'abuela',
+    'tio',
+    'tia',
+    'primo',
+    'prima',
+    'sobrino',
+    'sobrina',
+    'suegro',
+    'suegra',
+    'cunado',
+    'cunada',
+    'amigo',
+    'amiga',
+    'compadre',
+    'comadre',
+    'novio',
+    'novia',
+    'esposo',
+    'esposa',
+    'marido',
+    'mujer',
+    'doctor',
+    'dentista',
+    'medico',
+    'mecanico',
+    'veterinario',
+    'terapeuta',
+    'trabajo',
+    'oficina',
+    'negocio',
+    'rancho',
+    'terreno',
+    'casa',
+    'bodega',
+    'departamento',
+    'depa',
+    'consultorio',
+  ];
+
+  for (const keyword of personalKeywords) {
+    const pattern = new RegExp(`\\b(?:mi|el|la|mis)\\s+${keyword}\\b`, 'i');
+    if (pattern.test(norm)) {
+      return true;
+    }
+    if (new RegExp(`\\b${keyword}\\b`, 'i').test(norm)) {
+      if (!norm.includes('hospital general') && !norm.includes('centro medico')) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function extractSaveAlias(normalized: string): string | null {
   const patterns = [
-    /(?:guarda|guardar|guarde|anota|anotar|registra|registrar|grabar|graba)\s+(?:esta\s+ubicacion\s+como|este\s+lugar\s+como|como|aqui\s+como|mi\s+ubicacion\s+como)\s+(.+)/i,
-    /(?:guarda|guardar|guarde|anota|anotar)\s+(?:este\s+sitio\s+como|el\s+sitio\s+como)\s+(.+)/i,
-    /(?:guarda|guardar|guarde|anota|anotar)\s+(?:mi\s+casa|la\s+casa\s+de\s+.+|el\s+doctor|la\s+farmacia|el\s+hospital|mi\s+trabajo)/i,
-    /(?:guardar\s+ubicacion)\s+(.+)/i,
+    /(?:guarda|guardar|guarde|anota|anotar|registra|registrar|grabar|graba|agrega|agregar|anade|anadir)\s+(?:esta\s+ubicacion\s+como|este\s+lugar\s+como|como|aqui\s+como|mi\s+ubicacion\s+como)\s+(.+)/i,
+    /(?:guarda|guardar|guarde|anota|anotar|agrega|agregar|anade|anadir|registra|registrar)\s+(?:este\s+sitio\s+como|el\s+sitio\s+como|esta\s+direccion\s+como)\s+(.+)/i,
+    /(?:guarda|guardar|guarde|anota|anotar|agrega|agregar|anade|anadir|registra|registrar)\s+(?:mi\s+casa|la\s+casa\s+de\s+.+|el\s+doctor|la\s+farmacia|el\s+hospital|mi\s+trabajo)/i,
+    /(?:guardar\s+ubicacion|anadir\s+ubicacion|agregar\s+ubicacion|anadir\s+direccion|agregar\s+direccion|guardar\s+direccion)\s+(.+)/i,
   ];
 
   for (const pattern of patterns) {
     const match = normalized.match(pattern);
     if (match) {
-      const alias = (match[1] || match[0]).replace(/^(?:guarda|guardar|guarde)\s+/i, '').trim();
+      const alias = (match[1] || match[0]).replace(/^(?:guarda|guardar|guarde|agrega|agregar|anade|anadir)\s+/i, '').trim();
       if (alias.length > 1) {
         return capitalizeWords(alias);
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractAddressCorrection(rawText: string, normalized: string): string | null {
+  const patterns = [
+    /(?:no\s*,?\s*)?(?:no es ahi|no es esa|esta mal|me equivoque|era en|es en|cambiar a|ponle en|mejor en|en realidad es en|la direccion es|en)\s+(.+)/i,
+    /^no\s*,?\s+(.+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = rawText.match(pattern);
+    if (match && match[1]) {
+      const candidate = match[1]
+        .replace(/^(?:la direccion|calle|en)\s+/i, '')
+        .trim();
+      const lower = candidate.toLowerCase();
+      if (
+        candidate.length > 2 &&
+        !['gracias', 'cancelar', 'cancela', 'ya no', 'olvidalo', 'detener', 'deten'].includes(lower)
+      ) {
+        return candidate;
       }
     }
   }
@@ -693,6 +849,255 @@ function capitalizeWords(text: string): string {
     .filter(Boolean)
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(' ');
+}
+
+// ============================================================================
+// NORMALIZACIÓN DE DIRECCIONES Y LUGARES CON LLM
+// ============================================================================
+
+export interface NormalizedAddressResult {
+  formattedSearchQuery: string;
+  formattedUserLabel: string;
+  aliasCandidate?: string;
+  calle?: string;
+  numero?: string;
+  colonia?: string;
+  alcaldia_o_ciudad?: string;
+  landmark?: string;
+}
+
+/**
+ * Normaliza y estructura direcciones habladas en lenguaje natural mexicano mediante LLM (Groq)
+ * o mediante heurísticas sintácticas en caso de modo offline.
+ * Es capaz de ordenar componentes desordenados (ej: "allá por la Roma en Sonora 120 casi esquina Insurgentes"
+ * o "Cuauhtémoc, calle 5 de mayo número 10, colonia centro") en una consulta estandarizada para el geocodificador.
+ */
+export async function normalizeAddressWithLLM(
+  rawInput: string,
+  context?: ConversationContext
+): Promise<NormalizedAddressResult> {
+  const trimmed = (rawInput || '').trim();
+  if (!trimmed) {
+    return {
+      formattedSearchQuery: 'Ciudad de México',
+      formattedUserLabel: 'Ubicación no especificada',
+    };
+  }
+
+  const apiKey = process.env.EXPO_PUBLIC_GROQ_API_KEY;
+
+  if (apiKey && apiKey.trim() !== '') {
+    try {
+      const systemPrompt = `Eres un asistente experto en nomenclatura urbana, direcciones y cartografía de México para AVAN.
+Tu trabajo es recibir una dirección o lugar dictado por un adulto mayor (frecuentemente con orden desorganizado, muletillas o frases como "allá por la...", "es en...", "casa de mi hijo en...") y devolver ÚNICAMENTE un JSON bien formado sin texto adicional ni bloques markdown.
+
+Estructura requerida:
+{
+  "aliasCandidate": "nombre del alias o familiar si fue mencionado (ej: 'casa de mi sobrino', 'el doctor'), o null",
+  "calle": "nombre de la calle, avenida, calzada o eje (ej: 'Sonora', 'Insurgentes Sur'), o null",
+  "numero": "número exterior (ej: '120'), o null",
+  "colonia": "colonia, barrio o fraccionamiento (ej: 'Roma Norte', 'Del Valle'), o null",
+  "alcaldia_o_ciudad": "alcaldía, municipio o ciudad (ej: 'Cuauhtémoc', 'Ciudad de México')",
+  "landmark": "nombre del sitio público de interés si aplica (ej: 'Palacio de Bellas Artes', 'Parque México'), o null",
+  "formattedSearchQuery": "cadena completa y ordenada para geocodificación (ej: 'Calle Sonora 120, Roma Norte, Cuauhtémoc, Ciudad de México' o 'Palacio de Bellas Artes, Centro Histórico, Ciudad de México')",
+  "formattedUserLabel": "etiqueta corta, natural y clara para confirmación al usuario (ej: 'Calle Sonora 120, Roma Norte' o 'Palacio de Bellas Artes')"
+}
+
+Reglas:
+1. Si el usuario dictó la colonia primero y luego la calle y número (ej. "En la Roma, Sonora 120"), ordénalo correctamente como "Calle Sonora 120, Roma Norte".
+2. Si es un sitio emblemático como "Bellas Artes", "Zócalo", "Soumaya", "Hospital General", identifícalo en 'landmark' y asigna una dirección verosímil y precisa en 'formattedSearchQuery'.
+3. Elimina muletillas como "allá por", "es en", "queda en", "por el rumbo de", "está sobre".
+4. Devuelve ÚNICAMENTE el JSON.`;
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3500);
+
+      const response = await fetch(GROQ_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: GROQ_MODEL,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: trimmed },
+          ],
+          temperature: 0.1,
+          max_tokens: 512,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content?.trim();
+        if (content) {
+          const jsonMatch = content.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (parsed.formattedSearchQuery && parsed.formattedUserLabel) {
+              return {
+                formattedSearchQuery: parsed.formattedSearchQuery,
+                formattedUserLabel: parsed.formattedUserLabel,
+                aliasCandidate: parsed.aliasCandidate || undefined,
+                calle: parsed.calle || undefined,
+                numero: parsed.numero || undefined,
+                colonia: parsed.colonia || undefined,
+                alcaldia_o_ciudad: parsed.alcaldia_o_ciudad || undefined,
+                landmark: parsed.landmark || undefined,
+              };
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[conversationService] Fallo al normalizar dirección con Groq LLM, usando parser heurístico:', err);
+    }
+  }
+
+  // Fallback heurístico inteligente para modo offline o sin API key
+  return normalizeAddressHeuristic(trimmed);
+}
+
+function normalizeAddressHeuristic(rawInput: string): NormalizedAddressResult {
+  let cleaned = rawInput
+    .replace(/^(?:la direccion es|es en|esta en|queda en|alla por|allá por|por el rumbo de|en|calle|deja guardada la|guarda la|es la|es el)\s+/i, '')
+    .trim();
+
+  // 1. Detectar si viene con un alias previo (ej: "casa de mi primo en sonora 120, roma")
+  let aliasCandidate: string | undefined;
+  const aliasMatch = cleaned.match(
+    /^(.+?)\s+(?:,\s*en\s+|,\s*sobre\s+|,\s*queda\s+en\s+|,\s*esta\s+en\s+|,\s*es\s+en\s+|\s+en\s+|\s+sobre\s+|\s+queda\s+en\s+|\s+esta\s+en\s+|\s+es\s+en\s+)(.+)$/i
+  );
+  if (aliasMatch && (isPersonalPlaceIntent(aliasMatch[1]) || /^(?:casa|oficina|trabajo|doctor|farmacia|hijo|hija|hermano|hermana|papa|mama|abuelo|compadre)/i.test(aliasMatch[1]))) {
+    aliasCandidate = cleanAliasName(aliasMatch[1]);
+    cleaned = aliasMatch[2].trim();
+  }
+
+  // 2. Detectar si es un landmark conocido de CDMX
+  const lower = cleaned.toLowerCase();
+  if (lower.includes('bellas artes')) {
+    return {
+      aliasCandidate,
+      landmark: 'Palacio de Bellas Artes',
+      formattedSearchQuery: 'Palacio de Bellas Artes, Av. Juárez S/N, Centro Histórico, Ciudad de México',
+      formattedUserLabel: 'Palacio de Bellas Artes, Centro Histórico',
+    };
+  }
+  if (lower.includes('zocalo') || lower.includes('zócalo')) {
+    return {
+      aliasCandidate,
+      landmark: 'Plaza de la Constitución / Zócalo',
+      formattedSearchQuery: 'Plaza de la Constitución, Centro Histórico, Cuauhtémoc, Ciudad de México',
+      formattedUserLabel: 'Zócalo, Centro Histórico',
+    };
+  }
+  if (lower.includes('alameda')) {
+    return {
+      aliasCandidate,
+      landmark: 'Alameda Central',
+      formattedSearchQuery: 'Alameda Central, Av. Hidalgo S/N, Centro Histórico, Ciudad de México',
+      formattedUserLabel: 'Alameda Central, Centro Histórico',
+    };
+  }
+  if (lower.includes('soumaya')) {
+    return {
+      aliasCandidate,
+      landmark: 'Museo Soumaya',
+      formattedSearchQuery: 'Museo Soumaya, Blvd. Miguel de Cervantes Saavedra 303, Granada, Miguel Hidalgo, Ciudad de México',
+      formattedUserLabel: 'Museo Soumaya, Granada, Polanco',
+    };
+  }
+  if (lower.includes('parque mexico') || lower.includes('parque méxico')) {
+    return {
+      aliasCandidate,
+      landmark: 'Parque México',
+      formattedSearchQuery: 'Parque México, Av. México S/N, Hipódromo Condesa, Cuauhtémoc, Ciudad de México',
+      formattedUserLabel: 'Parque México, Condesa',
+    };
+  }
+  if (lower.includes('siglo xxi') || lower.includes('centro medico')) {
+    return {
+      aliasCandidate,
+      landmark: 'Centro Médico Siglo XXI',
+      formattedSearchQuery: 'Centro Médico Nacional Siglo XXI, Av. Cuauhtémoc 330, Doctores, Ciudad de México',
+      formattedUserLabel: 'Centro Médico Siglo XXI, Doctores',
+    };
+  }
+  if (lower.includes('hospital general')) {
+    return {
+      aliasCandidate,
+      landmark: 'Hospital General de México',
+      formattedSearchQuery: 'Hospital General de México, Dr. Balmis 148, Doctores, Ciudad de México',
+      formattedUserLabel: 'Hospital General, Doctores',
+    };
+  }
+
+  // 3. Extracción de patrones de calle, número y colonia desordenados
+  let colonia: string | undefined;
+  let calle: string | undefined;
+  let numero: string | undefined;
+
+  const numMatch = cleaned.match(/(?:(?:n[uú]mero|no\.?|num\.?|#)\s*)?(\d{1,5})/i);
+  if (numMatch) {
+    numero = numMatch[1];
+  }
+
+  const colMatch = cleaned.match(/(?:colonia|col\.?)\s+([^,]+)/i);
+  if (colMatch) {
+    colonia = capitalizeWords(colMatch[1].trim());
+  } else {
+    const commonNeighborhoods = [
+      'Roma Norte', 'Roma Sur', 'Roma', 'Condesa', 'Hipódromo', 'Del Valle', 'Narvarte',
+      'Polanco', 'Juárez', 'Cuauhtémoc', 'Centro', 'Coyoacán', 'San Ángel', 'Nápoles',
+      'Santa Fe', 'Doctores', 'Anzures', 'San Rafael', 'Portales', 'Álamos', 'Lindavista'
+    ];
+    for (const n of commonNeighborhoods) {
+      const re = new RegExp(`\\b${n}\\b`, 'i');
+      if (re.test(cleaned)) {
+        colonia = n;
+        break;
+      }
+    }
+  }
+
+  let streetCandidate = cleaned;
+  if (colonia) {
+    streetCandidate = streetCandidate.replace(new RegExp(`(?:colonia|col\.?|en la|en el|por la)?\\s*${colonia}`, 'i'), '');
+  }
+  if (numero) {
+    streetCandidate = streetCandidate.replace(new RegExp(`(?:(?:n[uú]mero|no\.?|num\.?|#)\\s*)?${numero}\\b`, 'i'), '');
+  }
+  streetCandidate = streetCandidate
+    .replace(/^(?:en\s+|por\s+|calle\s+|avenida\s+|av\.?\s+)+/i, '')
+    .replace(/[,\.]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (streetCandidate.length > 2) {
+    calle = capitalizeWords(streetCandidate);
+  }
+
+  const streetPart = calle ? (numero ? `${calle} ${numero}` : calle) : (numero ? `Número ${numero}` : '');
+  const userParts = [streetPart, colonia].filter(Boolean);
+  const formattedUserLabel = userParts.length > 0 ? userParts.join(', ') : capitalizeWords(cleaned);
+
+  const searchParts = [streetPart, colonia, 'Ciudad de México'].filter(Boolean);
+  const formattedSearchQuery = searchParts.length > 0 ? searchParts.join(', ') : `${cleaned}, Ciudad de México`;
+
+  return {
+    aliasCandidate,
+    calle,
+    numero,
+    colonia,
+    alcaldia_o_ciudad: 'Ciudad de México',
+    formattedSearchQuery,
+    formattedUserLabel,
+  };
 }
 
 // ============================================================================
@@ -837,13 +1242,59 @@ async function callGroqLLM(
       // Integración con el contexto y reglas de negocio de AVAN
       switch (fnName) {
         case 'navegar_a': {
-          if (context.pendingTripCompletion) {
-            context.pendingTripCompletion = null;
-          }
+          // Salto de contexto ubicuo: Limpiar cualquier registro pendiente o viaje anterior
+          context.pendingAliasRegistration = null;
+          context.pendingTripCompletion = null;
+
           const rawDest = fnArgs.destino || userSpeechText;
           const aliasRes = AliasService.resolveDestinationWithAlias(rawDest);
+
+          // VERIFICACIÓN CRÍTICA: ¿Es un lugar personal o alias no registrado?
+          const isPersonal =
+            isPersonalPlaceIntent(rawDest) ||
+            isPersonalPlaceIntent(userSpeechText) ||
+            isPersonalPlaceIntent(fnArgs.destino || '');
+
+          if (!aliasRes.isAlias && isPersonal) {
+            const cleanAlias = cleanAliasName(rawDest.length > 2 ? rawDest : userSpeechText);
+            context.pendingAliasRegistration = {
+              aliasName: cleanAlias,
+              step: 'awaiting_address',
+              retryCount: 0,
+              timestamp: Date.now(),
+            };
+
+            const spokenText = `No tengo guardada la ubicación de "${cleanAlias}". ¿Cuál es la dirección o colonia para registrarla?`;
+
+            context.history?.push({
+              role: 'assistant',
+              content: spokenText,
+              timestamp: Date.now(),
+            });
+
+            return {
+              spokenText,
+              functionCall: null,
+              updatedContext: context,
+              requiresConfirmation: true,
+              shouldAutoListen: true,
+            };
+          }
+
           const destName = aliasRes.resolvedName;
-          const destCoords = aliasRes.coordinates;
+          let destCoords = aliasRes.coordinates;
+
+          if (!destCoords) {
+            try {
+              const geocoded = await orsService.geocodeDestination(destName, context.currentLocation);
+              if (geocoded && geocoded.length > 0) {
+                destCoords = geocoded[0].coordinates;
+              }
+            } catch (err) {
+              console.warn('[conversationService] Error al geocodificar destino para confirmación:', err);
+            }
+          }
+
           const isForaneo = isForaneoTrip(destName, destCoords, context.currentLocation);
 
           context.pendingConfirmation = {
@@ -890,6 +1341,7 @@ async function callGroqLLM(
           const destName =
             fnArgs.destino || context.pendingConfirmation?.destination || 'su destino';
           const isForaneo = !!context.pendingConfirmation?.isForaneo;
+          const confirmedCoords = context.pendingConfirmation?.coordinates;
 
           context.pendingConfirmation = null;
           context.activeRoute = {
@@ -908,7 +1360,12 @@ async function callGroqLLM(
 
           const functionCall: FunctionCall = {
             name: 'confirmar_viaje',
-            args: { destino: destName, isForaneo },
+            args: {
+              destino: destName,
+              isForaneo,
+              latitud: confirmedCoords?.latitude,
+              longitud: confirmedCoords?.longitude,
+            },
           };
 
           context.history?.push({
@@ -994,36 +1451,81 @@ async function callGroqLLM(
         }
 
         case 'guardar_ubicacion': {
-          const alias = fnArgs.alias || 'ubicación guardada';
-          const address = fnArgs.direccion || 'Ubicación registrada';
-          const coords = context.currentLocation || CDMX_CENTER;
+          // Salto de contexto: Limpiar cualquier confirmación o viaje previo
+          context.pendingConfirmation = null;
+          context.pendingTripCompletion = null;
 
-          AliasService.saveAlias(alias, capitalizeWords(alias), address, coords);
+          let alias = fnArgs.alias || 'nueva ubicación';
+          const address = fnArgs.direccion;
 
-          const spokenText =
-            rawContent || `He guardado esta ubicación con el nombre "${alias}".`;
-          const functionCall: FunctionCall = {
-            name: 'guardar_ubicacion',
-            args: {
-              alias,
-              direccion: address,
-              latitud: coords.latitude,
-              longitud: coords.longitude,
-            },
+          // Si el usuario pidió registrar pero no especificó dirección todavía
+          if (!address || address.trim() === '' || address === 'Ubicación registrada' || address.toLowerCase() === 'ubicación registrada') {
+            const cleanAlias = cleanAliasName(alias);
+            context.pendingAliasRegistration = {
+              aliasName: cleanAlias,
+              step: 'awaiting_address',
+              retryCount: 0,
+              timestamp: Date.now(),
+            };
+
+            const spokenText = `Entendido, vamos a registrar "${cleanAlias}". ¿Cuál es la dirección o colonia?`;
+            context.history?.push({
+              role: 'assistant',
+              content: spokenText,
+              timestamp: Date.now(),
+            });
+
+            return {
+              spokenText,
+              functionCall: null,
+              updatedContext: context,
+              requiresConfirmation: true,
+              shouldAutoListen: true,
+            };
+          }
+
+          // Si sí especificó dirección, normalizar con LLM y geocodificar para vista previa exacta
+          const normalizedAddr = await normalizeAddressWithLLM(address, context);
+          if (normalizedAddr.aliasCandidate && (alias === 'nueva ubicación' || alias === 'nueva ubicacion')) {
+            alias = normalizedAddr.aliasCandidate;
+          }
+
+          let targetCoords = context.currentLocation || CDMX_CENTER;
+          let formattedAddress = normalizedAddr.formattedUserLabel;
+
+          try {
+            const geocoded = await orsService.geocodeDestination(
+              normalizedAddr.formattedSearchQuery,
+              context.currentLocation
+            );
+            if (geocoded && geocoded.length > 0) {
+              targetCoords = geocoded[0].coordinates;
+              formattedAddress = normalizedAddr.formattedUserLabel || geocoded[0].label || geocoded[0].name;
+            }
+          } catch {}
+
+          context.pendingAliasRegistration = {
+            aliasName: alias,
+            step: 'confirming_address',
+            addressCandidate: formattedAddress,
+            coordinates: targetCoords,
+            retryCount: 0,
+            timestamp: Date.now(),
           };
 
+          const spokenText = `Entendí: ${formattedAddress}. ¿Es correcta esta ubicación para ${alias}?`;
           context.history?.push({
             role: 'assistant',
             content: spokenText,
-            functionCall,
             timestamp: Date.now(),
           });
 
           return {
             spokenText,
-            functionCall,
+            functionCall: null,
             updatedContext: context,
-            requiresConfirmation: false,
+            requiresConfirmation: true,
+            shouldAutoListen: true,
           };
         }
 
@@ -1119,11 +1621,28 @@ async function callGroqLLM(
         context.pendingTripCompletion = null;
       }
 
+      const asksQuestion = rawContent.includes('?');
       const isFarewell =
-        /(?:hasta luego|excelente d[ií]a|buen d[ií]a|buenas noches|a su disposici[oó]n|nos vemos|adi[oó]s|que descanse|cu[ií]dese|que le vaya bien|con mucho gusto)/i.test(
+        !asksQuestion &&
+        /(?:hasta luego|buenas noches|a su disposici[oó]n|nos vemos|adi[oó]s|que descanse|cu[ií]dese|que le vaya bien)/i.test(
           rawContent
         );
-      const asksQuestion = rawContent.includes('?');
+
+      // Si la respuesta del LLM parece estar solicitando una dirección para registrar:
+      if (
+        isAddAddressIntent(normalizeText(rawContent)) ||
+        /(?:direccion|ubicacion|donde queda|donde esta).*\?/i.test(rawContent) ||
+        /(?:nombre|alias|lugar).*(?:direccion|ubicacion)/i.test(rawContent)
+      ) {
+        if (!context.pendingAliasRegistration) {
+          context.pendingAliasRegistration = {
+            aliasName: 'nueva ubicación',
+            step: 'awaiting_address',
+            retryCount: 0,
+            timestamp: Date.now(),
+          };
+        }
+      }
 
       context.history?.push({
         role: 'assistant',
@@ -1135,8 +1654,8 @@ async function callGroqLLM(
         spokenText: rawContent,
         functionCall: null,
         updatedContext: context,
-        requiresConfirmation: false,
-        shouldAutoListen: asksQuestion && !isFarewell,
+        requiresConfirmation: Boolean(context.pendingAliasRegistration),
+        shouldAutoListen: (asksQuestion || Boolean(context.pendingAliasRegistration)) && !isFarewell,
       };
     }
 
@@ -1152,88 +1671,331 @@ async function callGroqLLM(
 // MOTOR LOCAL DE HEURÍSTICAS (FALLBACK INFALIBLE)
 // ============================================================================
 
-function processUserMessageLocal(
+async function processUserMessageLocal(
   userSpeechText: string,
   context: ConversationContext
-): ConversationResponse {
+): Promise<ConversationResponse> {
   const currentContext = context;
   const rawText = (userSpeechText || '').trim();
   const normalized = normalizeText(rawText);
 
   // --------------------------------------------------------------------------
-  // CASO A: FLUJO DE REGISTRO ASISTIDO DE ALIAS (T-2.2)
+  // CASO A: FLUJO DE REGISTRO ASISTIDO Y CONFIRMACIÓN DE DIRECCIÓN (TASK-21)
   // --------------------------------------------------------------------------
   if (currentContext.pendingAliasRegistration) {
-    const aliasName = currentContext.pendingAliasRegistration.aliasName;
+    const pending = currentContext.pendingAliasRegistration;
+    const aliasName = pending.aliasName;
 
-    if (isNegativeOrCancel(normalized)) {
+    // Salto de contexto 1: Si el usuario solicita navegar hacia otro lugar en vez de continuar registrando
+    // Ejemplos: "Quiero ir a Chapultepec", "Llévame al doctor", "Vamos a Bellas Artes"
+    const explicitDest = extractDestination(rawText, normalized);
+    if (explicitDest) {
+      console.log(`[conversationService] Salto de contexto: de registro de "${aliasName}" a navegación hacia "${explicitDest}".`);
       currentContext.pendingAliasRegistration = null;
-      const responseText = 'Entendido, no he guardado la ubicación. ¿A dónde desea ir?';
-      const functionCall: FunctionCall = {
-        name: 'cancelar',
-        args: { motivo: 'Registro de alias cancelado' },
+      return await processUserMessageLocal(rawText, currentContext);
+    }
+
+    // Salto de contexto 2: Ajuste de mapa sin romper el registro de alias
+    const zoomDir = detectZoomDirection(normalized);
+    if (zoomDir) {
+      let spokenText = 'Ajustando vista del mapa.';
+      if (zoomDir === 'acercar') spokenText = 'Acercando el mapa.';
+      if (zoomDir === 'alejar') spokenText = 'Alejando el mapa.';
+      if (zoomDir === 'centrar') spokenText = 'Centrando el mapa en su posición.';
+
+      return {
+        spokenText,
+        functionCall: { name: 'ajustar_zoom', args: { direccion: zoomDir } },
+        updatedContext: currentContext,
+        requiresConfirmation: true,
+        shouldAutoListen: true,
       };
+    }
+      // 1. Cancelación explícita ("cancelar", "ya no", "olvídalo", "detener")
+      if (
+        /(?:cancelar|cancela|ya no|olvidalo|detener|deten|ninguno|no quiero)/i.test(normalized)
+      ) {
+        currentContext.pendingAliasRegistration = null;
+        const responseText = 'Entendido, he cancelado el registro. ¿A dónde desea ir?';
+        const functionCall: FunctionCall = {
+          name: 'cancelar',
+          args: { motivo: 'Registro de alias cancelado' },
+        };
+
+        currentContext.history?.push({
+          role: 'assistant',
+          content: responseText,
+          functionCall,
+          timestamp: Date.now(),
+        });
+
+        return {
+          spokenText: responseText,
+          functionCall,
+          updatedContext: currentContext,
+          requiresConfirmation: false,
+          shouldAutoListen: true,
+        };
+      }
+
+      // SUB-ESTADO 1: ESPERANDO LA DIRECCIÓN (awaiting_address)
+      if (pending.step === 'awaiting_address') {
+      if (isNegativeOrCancel(normalized)) {
+        currentContext.pendingAliasRegistration = null;
+        const responseText = 'Entendido, no he guardado la ubicación. ¿A dónde desea ir?';
+        const functionCall: FunctionCall = {
+          name: 'cancelar',
+          args: { motivo: 'Registro de alias cancelado' },
+        };
+
+        currentContext.history?.push({
+          role: 'assistant',
+          content: responseText,
+          functionCall,
+          timestamp: Date.now(),
+        });
+
+        return {
+          spokenText: responseText,
+          functionCall,
+          updatedContext: currentContext,
+          requiresConfirmation: false,
+          shouldAutoListen: true,
+        };
+      }
+
+      let aliasToUse = aliasName;
+      let addressToUse = rawText;
+
+      // Si el alias aún es genérico ("nueva ubicación") o el usuario dice alias y dirección en la misma frase:
+      // Ej: "Es la casa de mi primo, en calle Sonora 120" o "Casa de mi compadre en insurgentes sur 300"
+      const splitMatch = rawText.match(
+        /^(.+?)\s+(?:,\s*en\s+|,\s*sobre\s+|,\s*queda\s+en\s+|,\s*esta\s+en\s+|,\s*es\s+en\s+|,\s*ubicada?\s+en\s+|\s+en\s+|\s+sobre\s+|\s+queda\s+en\s+|\s+esta\s+en\s+|\s+es\s+en\s+|\s+ubicada?\s+en\s+)(.+)$/i
+      );
+
+      if (splitMatch && (aliasToUse === 'nueva ubicación' || isPersonalPlaceIntent(splitMatch[1]))) {
+        const potentialAlias = cleanAliasName(splitMatch[1].replace(/^(?:es\s+|la\s+|el\s+)/i, ''));
+        const potentialAddress = splitMatch[2].trim();
+        if (potentialAlias.length > 1 && potentialAddress.length > 2) {
+          aliasToUse = potentialAlias;
+          addressToUse = potentialAddress;
+        }
+      } else if (aliasToUse === 'nueva ubicación') {
+        // Si no hubo conector: ¿dijo solo un nombre personal o solo una dirección?
+        if (isPersonalPlaceIntent(rawText) && !/\d+/.test(rawText)) {
+          const cleanName = cleanAliasName(rawText);
+          currentContext.pendingAliasRegistration = {
+            aliasName: cleanName,
+            step: 'awaiting_address',
+            retryCount: 0,
+            timestamp: Date.now(),
+          };
+
+          const responseText = `Entendido, ${cleanName}. ¿Cuál es la dirección o colonia para registrarla?`;
+          currentContext.history?.push({
+            role: 'assistant',
+            content: responseText,
+            timestamp: Date.now(),
+          });
+
+          return {
+            spokenText: responseText,
+            functionCall: null,
+            updatedContext: currentContext,
+            requiresConfirmation: true,
+            shouldAutoListen: true,
+          };
+        }
+      }
+
+      // Normalizar la dirección con LLM para ordenar componentes desordenados
+      const normalizedAddr = await normalizeAddressWithLLM(addressToUse, currentContext);
+      if (normalizedAddr.aliasCandidate && (aliasToUse === 'nueva ubicación' || aliasToUse === 'nueva ubicacion')) {
+        aliasToUse = normalizedAddr.aliasCandidate;
+      }
+
+      // Geocodificar la dirección ingresada para obtener coordenadas precisas
+      let targetCoords = currentContext.currentLocation || CDMX_CENTER;
+      let formattedAddress = normalizedAddr.formattedUserLabel;
+
+      try {
+        const geocoded = await orsService.geocodeDestination(
+          normalizedAddr.formattedSearchQuery,
+          currentContext.currentLocation
+        );
+        if (geocoded && geocoded.length > 0) {
+          targetCoords = geocoded[0].coordinates;
+          formattedAddress = normalizedAddr.formattedUserLabel || geocoded[0].label || geocoded[0].name;
+        }
+      } catch (err) {
+        console.log('[conversationService] Fallback de geocodificación para alias:', err);
+      }
+
+      currentContext.pendingAliasRegistration = {
+        aliasName: aliasToUse,
+        step: 'confirming_address',
+        addressCandidate: formattedAddress,
+        coordinates: targetCoords,
+        retryCount: 0,
+        timestamp: Date.now(),
+      };
+
+      const responseText = `Entendí: ${formattedAddress}. ¿Es correcta esta ubicación para ${aliasToUse}?`;
 
       currentContext.history?.push({
         role: 'assistant',
         content: responseText,
-        functionCall,
         timestamp: Date.now(),
       });
 
       return {
         spokenText: responseText,
-        functionCall,
+        functionCall: null,
         updatedContext: currentContext,
-        requiresConfirmation: false,
+        requiresConfirmation: true,
+        shouldAutoListen: true,
       };
     }
 
-    const address = rawText;
-    const defaultCoords = currentContext.currentLocation || CDMX_CENTER;
+    // SUB-ESTADO 2: CONFIRMANDO LA DIRECCIÓN (confirming_address)
+    if (pending.step === 'confirming_address') {
+      // 1. Caso Afirmativo: Usuario confirma ("Sí", "Es correcto", "Así es", etc.)
+      if (isAffirmative(normalized)) {
+        const addressToSave = pending.addressCandidate || rawText;
+        const coordsToSave = pending.coordinates || currentContext.currentLocation || CDMX_CENTER;
 
-    const saved = AliasService.saveAlias(
-      aliasName,
-      capitalizeWords(aliasName),
-      address,
-      defaultCoords
-    );
+        const saved = AliasService.saveAlias(
+          aliasName,
+          capitalizeWords(aliasName),
+          addressToSave,
+          coordsToSave
+        );
 
-    currentContext.pendingAliasRegistration = null;
+        currentContext.pendingAliasRegistration = null;
 
-    const isForaneo = isForaneoTrip(aliasName, saved.coordinates, currentContext.currentLocation);
-    currentContext.pendingConfirmation = {
-      destination: saved.name,
-      coordinates: saved.coordinates,
-      isForaneo,
-      timestamp: Date.now(),
-      originalQuery: rawText,
-    };
+        const isForaneo = isForaneoTrip(
+          aliasName,
+          saved.coordinates,
+          currentContext.currentLocation
+        );
 
-    const responseText = `He guardado ${saved.name}. ¿Desea que iniciemos el viaje hacia allá?`;
-    const functionCall: FunctionCall = {
-      name: 'guardar_ubicacion',
-      args: {
-        alias: aliasName,
-        direccion: address,
-        latitud: saved.coordinates.latitude,
-        longitud: saved.coordinates.longitude,
-      },
-    };
+        currentContext.pendingConfirmation = {
+          destination: saved.name,
+          coordinates: saved.coordinates,
+          isForaneo,
+          timestamp: Date.now(),
+          originalQuery: rawText,
+        };
 
-    currentContext.history?.push({
-      role: 'assistant',
-      content: responseText,
-      functionCall,
-      timestamp: Date.now(),
-    });
+        const responseText = `He guardado ${saved.name}. ¿Desea que iniciemos el viaje hacia allá ahora mismo?`;
+        const functionCall: FunctionCall = {
+          name: 'guardar_ubicacion',
+          args: {
+            alias: aliasName,
+            direccion: addressToSave,
+            latitud: saved.coordinates.latitude,
+            longitud: saved.coordinates.longitude,
+          },
+        };
 
-    return {
-      spokenText: responseText,
-      functionCall,
-      updatedContext: currentContext,
-      requiresConfirmation: true,
-    };
+        currentContext.history?.push({
+          role: 'assistant',
+          content: responseText,
+          functionCall,
+          timestamp: Date.now(),
+        });
+
+        return {
+          spokenText: responseText,
+          functionCall,
+          updatedContext: currentContext,
+          requiresConfirmation: true,
+          shouldAutoListen: true,
+        };
+      }
+
+      // 2. Caso Corrección Directa (ej. "No, era en la Roma", "Es en insurgentes 400", "En calle sonora")
+      const directCorrection = extractAddressCorrection(rawText, normalized);
+      if (directCorrection) {
+        const normalizedCorr = await normalizeAddressWithLLM(directCorrection, currentContext);
+        let newCoords = currentContext.currentLocation || CDMX_CENTER;
+        let newFormatted = normalizedCorr.formattedUserLabel;
+
+        try {
+          const geocoded = await orsService.geocodeDestination(
+            normalizedCorr.formattedSearchQuery,
+            currentContext.currentLocation
+          );
+          if (geocoded && geocoded.length > 0) {
+            newCoords = geocoded[0].coordinates;
+            newFormatted = normalizedCorr.formattedUserLabel || geocoded[0].label || geocoded[0].name;
+          }
+        } catch (err) {
+          console.log('[conversationService] Fallback de geocodificación en corrección:', err);
+        }
+
+        currentContext.pendingAliasRegistration = {
+          aliasName,
+          step: 'confirming_address',
+          addressCandidate: newFormatted,
+          coordinates: newCoords,
+          retryCount: 0,
+          timestamp: Date.now(),
+        };
+
+        const responseText = `Entendido, corregí a: ${newFormatted}. ¿Es correcta esta ubicación para ${aliasName}?`;
+
+        currentContext.history?.push({
+          role: 'assistant',
+          content: responseText,
+          timestamp: Date.now(),
+        });
+
+        return {
+          spokenText: responseText,
+          functionCall: null,
+          updatedContext: currentContext,
+          requiresConfirmation: true,
+          shouldAutoListen: true,
+        };
+      }
+
+      // 3. Caso Negación Simple (ej. "No", "No es ahí", "Está mal", "No está bien")
+      if (isNegativeOrCancel(normalized)) {
+        currentContext.pendingAliasRegistration = {
+          aliasName,
+          step: 'awaiting_address',
+          retryCount: 0,
+          timestamp: Date.now(),
+        };
+
+        const responseText = `De acuerdo. Por favor dígame la dirección o colonia correcta para ${aliasName}.`;
+
+        currentContext.history?.push({
+          role: 'assistant',
+          content: responseText,
+          timestamp: Date.now(),
+        });
+
+        return {
+          spokenText: responseText,
+          functionCall: null,
+          updatedContext: currentContext,
+          requiresConfirmation: true,
+          shouldAutoListen: true,
+        };
+      }
+
+      // 4. Caso respuesta no clara o ambigua
+      const clarifyText = `Por favor dígame si la ubicación para ${aliasName} es correcta. Puede decir "Sí" para confirmar o "No" para corregir.`;
+      return {
+        spokenText: clarifyText,
+        functionCall: null,
+        updatedContext: currentContext,
+        requiresConfirmation: true,
+        shouldAutoListen: true,
+      };
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -1377,14 +2139,29 @@ function processUserMessageLocal(
     const destination = currentContext.pendingConfirmation.destination;
     const isForaneo = !!currentContext.pendingConfirmation.isForaneo;
 
+    // Salto de contexto: Si el usuario solicita registrar una nueva dirección mientras confirmaba viaje
+    // Ej: "Quiero registrar una nueva dirección", "Guarda la casa de mi hijo"
+    if (isAddAddressIntent(normalized) || extractSaveAlias(normalized)) {
+      console.log(`[conversationService] Salto de contexto: cancelando confirmación de viaje a "${destination}" para registrar dirección.`);
+      currentContext.pendingConfirmation = null;
+      return await processUserMessageLocal(rawText, currentContext);
+    }
+
     if (isAffirmative(normalized)) {
       const responseText = isForaneo
         ? `Entendido. Iniciando la ruta en carretera hacia ${destination}. Conduzca con precaución y descanse cuando lo requiera.`
         : `Excelente. Iniciando la ruta hacia ${destination}. Conduzca con precaución.`;
 
+      const confirmedCoords = currentContext.pendingConfirmation.coordinates;
+
       const functionCall: FunctionCall = {
         name: 'confirmar_viaje',
-        args: { destino: destination, isForaneo },
+        args: {
+          destino: destination,
+          isForaneo,
+          latitud: confirmedCoords?.latitude,
+          longitud: confirmedCoords?.longitude,
+        },
       };
 
       currentContext.pendingConfirmation = null;
@@ -1411,17 +2188,14 @@ function processUserMessageLocal(
     }
 
     if (isNegativeOrCancel(normalized)) {
-      const responseText = `Entendido. He cancelado el viaje a ${destination}. ¿Desea ir a algún otro lugar?`;
+      const responseText = `Entendido, he cancelado el viaje a ${destination}.`;
       const functionCall: FunctionCall = {
         name: 'cancelar',
         args: { motivo: 'Confirmación rechazada por el usuario' },
       };
 
       currentContext.pendingConfirmation = null;
-      currentContext.pendingTripCompletion = {
-        destination,
-        timestamp: Date.now(),
-      };
+      currentContext.pendingTripCompletion = null;
 
       currentContext.history?.push({
         role: 'assistant',
@@ -1435,7 +2209,7 @@ function processUserMessageLocal(
         functionCall,
         updatedContext: currentContext,
         requiresConfirmation: false,
-        shouldAutoListen: true,
+        shouldAutoListen: false,
       };
     }
 
@@ -1443,15 +2217,27 @@ function processUserMessageLocal(
     if (newDestination && newDestination.toLowerCase() !== destination.toLowerCase()) {
       const aliasResult = AliasService.resolveDestinationWithAlias(newDestination);
       const resolvedTarget = aliasResult.resolvedName;
+      let newCoords = aliasResult.coordinates;
+      if (!newCoords) {
+        try {
+          const geocoded = await orsService.geocodeDestination(resolvedTarget, currentContext.currentLocation);
+          if (geocoded && geocoded.length > 0 && geocoded[0].coordinates) {
+            newCoords = geocoded[0].coordinates;
+          }
+        } catch (err) {
+          console.warn('[conversationService] Error al geocodificar destino:', err);
+        }
+      }
+
       const foraneoNew = isForaneoTrip(
         resolvedTarget,
-        aliasResult.coordinates,
+        newCoords,
         currentContext.currentLocation
       );
 
       currentContext.pendingConfirmation = {
         destination: resolvedTarget,
-        coordinates: aliasResult.coordinates,
+        coordinates: newCoords,
         isForaneo: foraneoNew,
         timestamp: Date.now(),
         originalQuery: rawText,
@@ -1500,6 +2286,39 @@ function processUserMessageLocal(
   }
 
   // --------------------------------------------------------------------------
+  // CASO 1b: INTENCIÓN DIRECTA DE AÑADIR O REGISTRAR DIRECCIÓN (TASK-21)
+  // --------------------------------------------------------------------------
+  if (isAddAddressIntent(normalized)) {
+    const specificAlias = extractSaveAlias(normalized);
+    const targetAlias = specificAlias || 'nueva ubicación';
+
+    currentContext.pendingAliasRegistration = {
+      aliasName: targetAlias,
+      step: 'awaiting_address',
+      retryCount: 0,
+      timestamp: Date.now(),
+    };
+
+    const responseText = specificAlias
+      ? `Con gusto. Por favor dígame la dirección o colonia para registrar ${specificAlias}.`
+      : 'Con gusto. Por favor dígame el nombre del lugar y su dirección.';
+
+    currentContext.history?.push({
+      role: 'assistant',
+      content: responseText,
+      timestamp: Date.now(),
+    });
+
+    return {
+      spokenText: responseText,
+      functionCall: null,
+      updatedContext: currentContext,
+      requiresConfirmation: true,
+      shouldAutoListen: true,
+    };
+  }
+
+  // --------------------------------------------------------------------------
   // CASO 2: SOLICITUD DE NAVEGACIÓN (PASO 1)
   // --------------------------------------------------------------------------
   const personQuery = detectPersonOrHomeQuery(rawText, normalized);
@@ -1509,16 +2328,22 @@ function processUserMessageLocal(
   if (rawDestination) {
     const aliasResolution = AliasService.resolveDestinationWithAlias(rawDestination);
 
-    if (!aliasResolution.isAlias && personQuery) {
-      const personName = personQuery.replace(/^(?:mi|el|la)\s+/i, '').trim();
+    const isPersonal =
+      isPersonalPlaceIntent(rawDestination) ||
+      isPersonalPlaceIntent(rawText) ||
+      Boolean(personQuery);
+
+    if (!aliasResolution.isAlias && isPersonal) {
+      const aliasName = cleanAliasName(rawDestination);
 
       currentContext.pendingAliasRegistration = {
-        aliasName: `casa de ${personQuery}`,
+        aliasName,
         step: 'awaiting_address',
+        retryCount: 0,
         timestamp: Date.now(),
       };
 
-      const responseText = `No tengo guardada la casa de tu ${personName}. ¿Cuál es la dirección o colonia para guardarla?`;
+      const responseText = `No tengo guardada la ubicación de "${aliasName}". ¿Cuál es la dirección o colonia para registrarla?`;
 
       currentContext.history?.push({
         role: 'assistant',
@@ -1531,11 +2356,26 @@ function processUserMessageLocal(
         functionCall: null,
         updatedContext: currentContext,
         requiresConfirmation: true,
+        shouldAutoListen: true,
       };
     }
 
     const destinationName = aliasResolution.resolvedName;
-    const destinationCoords = aliasResolution.coordinates;
+    let destinationCoords = aliasResolution.coordinates;
+
+    if (!destinationCoords) {
+      try {
+        const geocoded = await orsService.geocodeDestination(
+          destinationName,
+          currentContext.currentLocation
+        );
+        if (geocoded && geocoded.length > 0) {
+          destinationCoords = geocoded[0].coordinates;
+        }
+      } catch (err) {
+        console.warn('[conversationService] Error al geocodificar destino local para confirmación:', err);
+      }
+    }
 
     const isForaneo = isForaneoTrip(
       destinationName,
@@ -1624,6 +2464,32 @@ function processUserMessageLocal(
   // --------------------------------------------------------------------------
   const saveAlias = extractSaveAlias(normalized);
   if (saveAlias) {
+    const isCurrentLocationSave = /(?:esta ubicacion|este lugar|aqui como|mi ubicacion como)/i.test(normalized);
+    if (!isCurrentLocationSave) {
+      currentContext.pendingAliasRegistration = {
+        aliasName: saveAlias,
+        step: 'awaiting_address',
+        retryCount: 0,
+        timestamp: Date.now(),
+      };
+
+      const responseText = `Con gusto. ¿Cuál es la dirección o colonia para guardar ${saveAlias}?`;
+
+      currentContext.history?.push({
+        role: 'assistant',
+        content: responseText,
+        timestamp: Date.now(),
+      });
+
+      return {
+        spokenText: responseText,
+        functionCall: null,
+        updatedContext: currentContext,
+        requiresConfirmation: true,
+        shouldAutoListen: true,
+      };
+    }
+
     const latitud = currentContext.currentLocation?.latitude;
     const longitud = currentContext.currentLocation?.longitude;
 
@@ -1832,17 +2698,32 @@ export async function processUserMessage(
     timestamp: Date.now(),
   });
 
-  // 0. Si hay confirmación pendiente o finalización de viaje pendiente y el usuario afirma/niega:
-  // Procesar de forma inmediata y determinista sin latencia ni riesgo de desvío por LLM
   const normalized = normalizeText(rawText);
-  if (currentContext.pendingConfirmation) {
-    if (isAffirmative(normalized) || isNegativeOrCancel(normalized)) {
-      return processUserMessageLocal(rawText, currentContext);
+
+  // 0a. Si estamos en confirmación de dirección (confirming_address) y el usuario afirma, niega o dicta corrección directa:
+  // Procesar de forma inmediata y determinista sin latencia de red
+  if (currentContext.pendingAliasRegistration?.step === 'confirming_address') {
+    if (
+      isAffirmative(normalized) ||
+      isNegativeOrCancel(normalized) ||
+      extractAddressCorrection(rawText, normalized)
+    ) {
+      return await processUserMessageLocal(rawText, currentContext);
     }
   }
+
+  // 0b. Si hay confirmación de viaje pendiente y el usuario afirma/niega:
+  // Procesar de forma inmediata y determinista sin latencia ni riesgo de desvío por LLM
+  if (currentContext.pendingConfirmation) {
+    if (isAffirmative(normalized) || isNegativeOrCancel(normalized)) {
+      return await processUserMessageLocal(rawText, currentContext);
+    }
+  }
+
+  // 0c. Si hay finalización de viaje pendiente y el usuario niega:
   if (currentContext.pendingTripCompletion) {
     if (isNegativeOrCancel(normalized)) {
-      return processUserMessageLocal(rawText, currentContext);
+      return await processUserMessageLocal(rawText, currentContext);
     }
   }
 
@@ -1857,7 +2738,7 @@ export async function processUserMessage(
   }
 
   // 2. Fallback infalible al motor local
-  return processUserMessageLocal(rawText, currentContext);
+  return await processUserMessageLocal(rawText, currentContext);
 }
 
 // ============================================================================

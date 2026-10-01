@@ -1,8 +1,16 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { SupabaseService, UserPlaceRow } from './supabaseClient';
+
 /**
  * Servicio de Gestión y Resolución de Alias para AVAN.
  *
  * Permite a adultos mayores referirse a sus destinos frecuentes con lenguaje
  * natural y afectivo (ej. "casa de mi hijo", "el doctor", "mi casa", "la farmacia").
+ *
+ * Arquitectura Offline-First:
+ * - Persistencia local inmediata con AsyncStorage para disponibilidad sin conexión.
+ * - Sincronización transparente con Supabase en la nube para permitir gestión remota
+ *   por parte de familiares o cuidadores.
  */
 
 export interface SavedAlias {
@@ -84,12 +92,17 @@ const DEFAULT_ALIASES: SavedAlias[] = [
   },
 ];
 
+const STORAGE_KEY = '@avan_user_aliases_v1';
+
 export class AliasService {
   private static instance: AliasService | null = null;
   private aliases: Map<string, SavedAlias> = new Map();
+  private isInitialized: boolean = false;
+  private isSyncing: boolean = false;
 
   private constructor() {
     this.preloadDefaults();
+    this.initializeStorage();
   }
 
   /**
@@ -109,6 +122,120 @@ export class AliasService {
     DEFAULT_ALIASES.forEach((item) => {
       this.aliases.set(item.id, { ...item });
     });
+  }
+
+  /**
+   * Inicializa la persistencia local desde AsyncStorage y dispara sincronización con la nube
+   */
+  private async initializeStorage(): Promise<void> {
+    try {
+      const stored = await AsyncStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const parsed: SavedAlias[] = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          parsed.forEach((alias) => {
+            this.aliases.set(alias.id, alias);
+          });
+        }
+      } else {
+        // Primera ejecución: guardar los valores por defecto en AsyncStorage
+        await this.persistToLocal();
+      }
+      this.isInitialized = true;
+
+      // Disparar sincronización con Supabase en segundo plano si hay red y credenciales
+      this.syncWithCloud().catch((err) => {
+        console.log('[AliasService] Sincronización inicial en segundo plano pospuesta:', err);
+      });
+    } catch (error) {
+      console.warn('[AliasService] Error al cargar alias desde AsyncStorage:', error);
+      this.isInitialized = true;
+    }
+  }
+
+  /**
+   * Guarda los alias actuales de memoria en AsyncStorage
+   */
+  private async persistToLocal(): Promise<void> {
+    try {
+      const list = Array.from(this.aliases.values());
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+    } catch (error) {
+      console.warn('[AliasService] Error al persistir alias localmente:', error);
+    }
+  }
+
+  /**
+   * Sincronización bidireccional con Supabase:
+   * 1. Descarga lugares remotos actualizados por familiares / cuidadores.
+   * 2. Sube lugares locales nuevos registrados por voz en el vehículo.
+   */
+  public async syncWithCloud(): Promise<void> {
+    const supabase = SupabaseService.getClient();
+    if (!supabase || this.isSyncing) return;
+
+    this.isSyncing = true;
+    try {
+      // 1. Obtener lugares registrados en Supabase
+      const { data: cloudPlaces, error } = await supabase
+        .from('user_places')
+        .select('*');
+
+      if (error) {
+        console.log('[AliasService] Aviso al consultar Supabase:', error.message);
+        this.isSyncing = false;
+        return;
+      }
+
+      if (cloudPlaces && cloudPlaces.length > 0) {
+        // Fusionar lugares de la nube en la memoria local
+        cloudPlaces.forEach((row: UserPlaceRow) => {
+          const aliasItem: SavedAlias = {
+            id: row.id,
+            alias: row.alias,
+            name: row.display_name,
+            address: row.address,
+            coordinates: {
+              latitude: row.latitude,
+              longitude: row.longitude,
+            },
+            category: row.category,
+          };
+          this.aliases.set(aliasItem.id, aliasItem);
+        });
+
+        // Guardar actualización en caché local
+        await this.persistToLocal();
+      }
+
+      // 2. Subir alias locales que no existan en Supabase
+      const localAliases = Array.from(this.aliases.values());
+      for (const local of localAliases) {
+        // Si el id es generado localmente (ej. "alias-hijo" o "alias-123")
+        const existsInCloud = cloudPlaces?.some(
+          (cp: UserPlaceRow) =>
+            cp.id === local.id ||
+            normalizeForSearch(cp.alias) === normalizeForSearch(local.alias)
+        );
+
+        if (!existsInCloud) {
+          await supabase.from('user_places').insert([
+            {
+              alias: local.alias,
+              display_name: local.name,
+              address: local.address,
+              latitude: local.coordinates.latitude,
+              longitude: local.coordinates.longitude,
+              category: local.category || 'family',
+            },
+          ]);
+        }
+      }
+    } catch (error) {
+      console.log('[AliasService] Sincronización de nube en espera de conectividad.');
+    } finally {
+      this.isSyncing = false;
+    }
   }
 
   /**
@@ -193,7 +320,8 @@ export class AliasService {
   }
 
   /**
-   * Guarda un nuevo alias o actualiza uno existente
+   * Guarda un nuevo alias o actualiza uno existente de manera persistente (Offline-First)
+   * y sincroniza en segundo plano con Supabase.
    */
   public saveAlias(
     alias: string,
@@ -204,6 +332,7 @@ export class AliasService {
   ): SavedAlias {
     const existing = this.getAlias(alias);
     const id = existing ? existing.id : `alias-${Date.now()}`;
+    const resolvedCat = category || this.inferCategory(alias);
 
     const newAlias: SavedAlias = {
       id,
@@ -211,11 +340,61 @@ export class AliasService {
       name: name.trim(),
       address: address.trim(),
       coordinates,
-      category: category || this.inferCategory(alias),
+      category: resolvedCat,
     };
 
+    // 1. Guardar en memoria
     this.aliases.set(id, newAlias);
+
+    // 2. Persistir localmente en AsyncStorage
+    this.persistToLocal().catch((err) => {
+      console.warn('[AliasService] Error al guardar en AsyncStorage:', err);
+    });
+
+    // 3. Sincronizar con Supabase en la nube en segundo plano
+    const supabase = SupabaseService.getClient();
+    if (supabase) {
+      (async () => {
+        try {
+          const { error } = await supabase.from('user_places').upsert({
+            alias: newAlias.alias,
+            display_name: newAlias.name,
+            address: newAlias.address,
+            latitude: newAlias.coordinates.latitude,
+            longitude: newAlias.coordinates.longitude,
+            category: newAlias.category,
+          });
+          if (error) {
+            console.log('[AliasService] Error al sincronizar nuevo alias con Supabase:', error.message);
+          } else {
+            console.log('[AliasService] Alias sincronizado exitosamente con Supabase:', newAlias.alias);
+          }
+        } catch (err: any) {
+          console.log('[AliasService] Sincronización remota pendiente de conexión:', err);
+        }
+      })();
+    }
+
     return newAlias;
+  }
+
+  /**
+   * Elimina un alias local y remotamente
+   */
+  public async deleteAlias(id: string): Promise<boolean> {
+    const existed = this.aliases.delete(id);
+    if (existed) {
+      await this.persistToLocal();
+      const supabase = SupabaseService.getClient();
+      if (supabase) {
+        (async () => {
+          try {
+            await supabase.from('user_places').delete().eq('id', id);
+          } catch {}
+        })();
+      }
+    }
+    return existed;
   }
 
   /**
@@ -286,6 +465,14 @@ export class AliasService {
 
   public static getAllAliases(): SavedAlias[] {
     return AliasService.getInstance().getAllAliases();
+  }
+
+  public static async syncWithCloud(): Promise<void> {
+    return AliasService.getInstance().syncWithCloud();
+  }
+
+  public static async deleteAlias(id: string): Promise<boolean> {
+    return AliasService.getInstance().deleteAlias(id);
   }
 }
 

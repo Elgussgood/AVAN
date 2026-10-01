@@ -10,15 +10,15 @@ import {
 } from './src/services/conversationService';
 
 export default function App() {
-  // Modo Día/Noche automático según la hora (19:00 a 06:30 es noche)
+  // Modo Día/Noche automático según la hora de conducción (19:00 a 07:00 es noche)
   const isNightHour = (): boolean => {
     const hour = new Date().getHours();
     return hour >= 19 || hour < 7;
   };
 
-  const systemColorScheme = useColorScheme();
+  // Por defecto al iniciar, se basa en la hora real de conducción (Día si es de día, Noche si es de noche)
   const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
-    return isNightHour() || systemColorScheme === 'dark';
+    return isNightHour();
   });
 
   // Requisito 1: La app DEBE iniciar en MinimalHomeScreen (One-Button UI pura)
@@ -68,7 +68,7 @@ export default function App() {
   /**
    * Detener la navegación y regresar automáticamente a MinimalHomeScreen
    */
-  const handleStopTrip = () => {
+  const handleStopTrip = (newContext?: ConversationContext) => {
     setCurrentDestination('');
     setRouteCoordinates([]);
     setDestinationCoords(null);
@@ -77,7 +77,11 @@ export default function App() {
     setRemainingDuration(0);
     setRouteSteps([]);
     setZoomLevel(1.0);
-    setConversationContext(ConversationService.createInitialContext('GUSTAVO'));
+    if (newContext) {
+      setConversationContext(newContext);
+    } else {
+      setConversationContext(ConversationService.createInitialContext('GUSTAVO'));
+    }
     setViewMode('minimal');
   };
 

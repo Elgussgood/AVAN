@@ -37,6 +37,9 @@ export class VoiceService {
   private static currentWebObjectUrl: string | null = null;
   private static currentAbortController: AbortController | null = null;
   private static cachedBestVoice: Speech.Voice | null = null;
+  private static isElevenLabsQuotaExceeded: boolean = false;
+  private static quotaExceededTimestamp: number = 0;
+  private static useDefaultVoiceOnly: boolean = false; // Listo para presentación: usa voz API (ElevenLabs) con fallback automático
 
   // Configuración por defecto
   private static customApiKey: string | null = null;
@@ -45,6 +48,35 @@ export class VoiceService {
   private static apiBaseUrl = 'https://api.openai.com/v1/audio/speech';
   private static speed = 0.88;
   private static pitch = 0.95;
+
+  /**
+   * Configura si se debe forzar el uso exclusivo de la voz default del sistema (expo-speech).
+   */
+  static setDefaultVoiceMode(useDefault: boolean): void {
+    this.useDefaultVoiceOnly = useDefault;
+  }
+
+  /**
+   * Indica si está activo el modo exclusivo de voz default del sistema.
+   */
+  static isDefaultVoiceMode(): boolean {
+    return this.useDefaultVoiceOnly;
+  }
+
+  /**
+   * Indica si la cuota de ElevenLabs se ha agotado.
+   */
+  static isQuotaExceeded(): boolean {
+    return this.isElevenLabsQuotaExceeded;
+  }
+
+  /**
+   * Permite resetear el estado de cuota agotada tras actualizar la clave o al renovarse el ciclo.
+   */
+  static resetQuotaStatus(): void {
+    this.isElevenLabsQuotaExceeded = false;
+    this.quotaExceededTimestamp = 0;
+  }
 
   /**
    * Configura la clave de API global (OpenAI o ElevenLabs).
@@ -131,6 +163,19 @@ export class VoiceService {
         : undefined);
 
     this.isSpeakingState = true;
+
+    // Si la cuota expiró pero ya pasaron más de 15 minutos (ej. cambio de día o reinicio de ciclo),
+    // permitir reintentar con la API de ElevenLabs
+    if (this.isElevenLabsQuotaExceeded && Date.now() - this.quotaExceededTimestamp > 15 * 60 * 1000) {
+      this.isElevenLabsQuotaExceeded = false;
+    }
+
+    // Si el usuario seleccionó la voz default para pruebas o la cuota externa está agotada,
+    // utilizar expo-speech de inmediato sin latencia de red
+    if (this.useDefaultVoiceOnly || this.isElevenLabsQuotaExceeded) {
+      await this.speakWithSpeechFallback(naturalText, onDone, onStart);
+      return;
+    }
 
     let success = false;
 
@@ -292,6 +337,10 @@ export class VoiceService {
     onDone?: () => void,
     onStart?: () => void
   ): Promise<boolean> {
+    if (this.isElevenLabsQuotaExceeded) {
+      return false;
+    }
+
     const controller = new AbortController();
     this.currentAbortController = controller;
 
@@ -351,7 +400,15 @@ export class VoiceService {
 
       if (!response.ok) {
         const errorDetail = await response.text();
-        console.warn(`[VoiceService] Error en ElevenLabs TTS (${response.status}):`, errorDetail);
+        if (errorDetail.includes('quota_exceeded')) {
+          this.isElevenLabsQuotaExceeded = true;
+          this.quotaExceededTimestamp = Date.now();
+          console.warn(
+            '[VoiceService] ⚠️ Cuota mensual de ElevenLabs alcanzada (10,000 caracteres del plan gratuito). Activando automáticamente fallback local con expo-speech.'
+          );
+        } else {
+          console.warn(`[VoiceService] Error en ElevenLabs TTS (${response.status}):`, errorDetail);
+        }
         return false;
       }
 

@@ -37,43 +37,161 @@ export interface RouteResult {
   isFallback?: boolean;
 }
 
-// Destinos predefinidos para desarrollo y pruebas rápidas en CDMX
-const FALLBACK_DESTINATIONS: GeocodeResult[] = [
+// Destinos predefinidos y puntos de interés de referencia en CDMX y área metropolitana
+const FALLBACK_DESTINATIONS: (GeocodeResult & { keywords: string[] })[] = [
   {
-    id: 'mock-1',
-    name: 'Ángel de la Independencia',
-    label: 'Paseo de la Reforma, Cuauhtémoc, Ciudad de México',
-    coordinates: { latitude: 19.427025, longitude: -99.167665 },
-  },
-  {
-    id: 'mock-2',
+    id: 'poi-bellas-artes',
     name: 'Palacio de Bellas Artes',
-    label: 'Av. Juárez S/N, Centro Histórico, Ciudad de México',
+    label: 'Av. Juárez S/N, Centro Histórico, Cuauhtémoc, Ciudad de México',
     coordinates: { latitude: 19.4352, longitude: -99.1412 },
+    keywords: ['bellas artes', 'palacio de bellas artes', 'teatro bellas artes', 'alameda'],
   },
   {
-    id: 'mock-3',
+    id: 'poi-angel',
+    name: 'Ángel de la Independencia',
+    label: 'Paseo de la Reforma y Eje 2 Pte, Cuauhtémoc, Ciudad de México',
+    coordinates: { latitude: 19.427025, longitude: -99.167665 },
+    keywords: ['angel', 'ángel', 'independencia', 'reforma', 'paseo de la reforma'],
+  },
+  {
+    id: 'poi-zocalo',
+    name: 'Plaza de la Constitución / Zócalo',
+    label: 'Plaza de la Constitución S/N, Centro Histórico, Cuauhtémoc, Ciudad de México',
+    coordinates: { latitude: 19.4326, longitude: -99.1332 },
+    keywords: ['zocalo', 'zócalo', 'constitucion', 'catedral', 'palacio nacional', 'centro historico'],
+  },
+  {
+    id: 'poi-alameda',
+    name: 'Alameda Central',
+    label: 'Av. Hidalgo S/N, Centro Histórico, Cuauhtémoc, Ciudad de México',
+    coordinates: { latitude: 19.4359, longitude: -99.1439 },
+    keywords: ['alameda', 'alameda central', 'hidalgo', 'hemiciclo a juarez'],
+  },
+  {
+    id: 'poi-chapultepec',
+    name: 'Bosque de Chapultepec / Castillo',
+    label: 'Bosque de Chapultepec I Sección, Miguel Hidalgo, Ciudad de México',
+    coordinates: { latitude: 19.4204, longitude: -99.1819 },
+    keywords: ['chapultepec', 'castillo de chapultepec', 'bosque chapultepec', 'lago chapultepec'],
+  },
+  {
+    id: 'poi-auditorio',
+    name: 'Auditorio Nacional',
+    label: 'Paseo de la Reforma 50, Bosque de Chapultepec, Miguel Hidalgo, Ciudad de México',
+    coordinates: { latitude: 19.4258, longitude: -99.1918 },
+    keywords: ['auditorio', 'auditorio nacional', 'reforma 50'],
+  },
+  {
+    id: 'poi-soumaya',
     name: 'Museo Soumaya / Polanco',
-    label: 'Blvd. Miguel de Cervantes Saavedra 303, Granada, Miguel Hidalgo',
+    label: 'Blvd. Miguel de Cervantes Saavedra 303, Granada, Miguel Hidalgo, Ciudad de México',
     coordinates: { latitude: 19.4407, longitude: -99.2047 },
+    keywords: ['soumaya', 'museo soumaya', 'plaza carso', 'granada', 'polanco'],
   },
   {
-    id: 'mock-4',
+    id: 'poi-parque-mexico',
     name: 'Parque México / Condesa',
-    label: 'Av México s/n, Hipódromo, Cuauhtémoc, Ciudad de México',
+    label: 'Av. México S/N, Hipódromo Condesa, Cuauhtémoc, Ciudad de México',
     coordinates: { latitude: 19.4124, longitude: -99.1697 },
+    keywords: ['parque mexico', 'parque méxico', 'condesa', 'hipodromo', 'amsterdam'],
   },
   {
-    id: 'mock-5',
+    id: 'poi-siglo-xxi',
     name: 'Centro Médico Nacional Siglo XXI',
     label: 'Av. Cuauhtémoc 330, Doctores, Cuauhtémoc, Ciudad de México',
     coordinates: { latitude: 19.4069, longitude: -99.1558 },
+    keywords: ['siglo xxi', 'centro medico', 'imss', 'hospital siglo xxi', 'doctores'],
   },
   {
-    id: 'mock-6',
+    id: 'poi-hospital-general',
+    name: 'Hospital General de México Dr. Eduardo Liceaga',
+    label: 'Dr. Balmis 148, Doctores, Cuauhtémoc, Ciudad de México',
+    coordinates: { latitude: 19.4124, longitude: -99.1537 },
+    keywords: ['hospital general', 'dr balmis', 'liceaga'],
+  },
+  {
+    id: 'poi-basilica',
+    name: 'Basílica de Santa María de Guadalupe',
+    label: 'Fray Juan de Zumárraga 2, Villa Gustavo A. Madero, Gustavo A. Madero, Ciudad de México',
+    coordinates: { latitude: 19.4847, longitude: -99.1175 },
+    keywords: ['basilica', 'basílica', 'guadalupe', 'la villa', 'tepeyac'],
+  },
+  {
+    id: 'poi-unam',
+    name: 'Ciudad Universitaria (UNAM)',
+    label: 'Av. Universidad 3000, Coyoacán, Ciudad de México',
+    coordinates: { latitude: 19.3328, longitude: -99.1868 },
+    keywords: ['unam', 'ciudad universitaria', 'rectoria', 'estadio olimpico', 'cu'],
+  },
+  {
+    id: 'poi-escom',
+    name: 'ESCOM - Escuela Superior de Cómputo IPN',
+    label: 'Av. Juan de Dios Bátiz S/N, Nueva Industrial Vallejo, Gustavo A. Madero, Ciudad de México',
+    coordinates: { latitude: 19.5046, longitude: -99.1468 },
+    keywords: ['escom', 'escuela superior de computo', 'ipn escom', 'computo ipn'],
+  },
+  {
+    id: 'poi-zacatenco',
+    name: 'Unidad Profesional Adolfo López Mateos (IPN Zacatenco)',
+    label: 'Av. Wilfrido Massieu S/N, Lindavista, Gustavo A. Madero, Ciudad de México',
+    coordinates: { latitude: 19.5034, longitude: -99.1357 },
+    keywords: ['zacatenco', 'ipn zacatenco', 'poli zacatenco', 'cinvestav'],
+  },
+  {
+    id: 'poi-coyoacan',
+    name: 'Jardín Hidalgo / Coyoacán Centro',
+    label: 'Jardín Hidalgo 1, Coyoacán Centro, Coyoacán, Ciudad de México',
+    coordinates: { latitude: 19.3497, longitude: -99.1623 },
+    keywords: ['coyoacan', 'coyoacán', 'jardin hidalgo', 'parque centenario', 'plaza hidalgo'],
+  },
+  {
+    id: 'poi-wtc',
+    name: 'World Trade Center (WTC México)',
+    label: 'Montecito 38, Nápoles, Benito Juárez, Ciudad de México',
+    coordinates: { latitude: 19.3939, longitude: -99.1738 },
+    keywords: ['wtc', 'world trade center', 'montecito', 'napoles', 'nápoles'],
+  },
+  {
+    id: 'poi-satelite',
     name: 'Plaza Satélite',
-    label: 'Cto Centro Comercial 2251, Cd. Satélite, Naucalpan de Juárez',
+    label: 'Cto. Centro Comercial 2251, Ciudad Satélite, Naucalpan de Juárez, Estado de México',
     coordinates: { latitude: 19.5104, longitude: -99.2346 },
+    keywords: ['plaza satelite', 'plaza satélite', 'satelite', 'satélite', 'torres de satelite'],
+  },
+  {
+    id: 'poi-revolucion',
+    name: 'Monumento a la Revolución',
+    label: 'Plaza de la República S/N, Tabacalera, Cuauhtémoc, Ciudad de México',
+    coordinates: { latitude: 19.4362, longitude: -99.1546 },
+    keywords: ['monumento a la revolucion', 'monumento revolucion', 'plaza de la republica'],
+  },
+  {
+    id: 'poi-parque-hundido',
+    name: 'Parque Hundido / Extremadura',
+    label: 'Av. Insurgentes Sur S/N, Extremadura Insurgentes, Benito Juárez, Ciudad de México',
+    coordinates: { latitude: 19.3789, longitude: -99.1788 },
+    keywords: ['parque hundido', 'extremadura', 'insurgentes parque hundido'],
+  },
+  {
+    id: 'poi-aicm',
+    name: 'Aeropuerto Internacional de la Ciudad de México (AICM)',
+    label: 'Av. Capitán Carlos León S/N, Peñón de los Baños, Venustiano Carranza, Ciudad de México',
+    coordinates: { latitude: 19.4361, longitude: -99.0719 },
+    keywords: ['aeropuerto', 'aicm', 'terminal 1', 'terminal 2', 'aeropuerto cdmx'],
+  },
+  {
+    id: 'poi-hospital-espanol',
+    name: 'Hospital Español de México',
+    label: 'Av. Ejército Nacional 613, Granada, Miguel Hidalgo, Ciudad de México',
+    coordinates: { latitude: 19.4385, longitude: -99.1866 },
+    keywords: ['hospital espanol', 'hospital español', 'ejercito nacional'],
+  },
+  {
+    id: 'poi-hospital-angeles-pedregal',
+    name: 'Hospital Ángeles del Pedregal',
+    label: 'Camino a Santa Teresa 1055, Héroes de Padierna, La Magdalena Contreras, Ciudad de México',
+    coordinates: { latitude: 19.3094, longitude: -99.2144 },
+    keywords: ['angeles pedregal', 'ángeles pedregal', 'hospital angeles', 'hospital ángeles'],
   },
 ];
 
@@ -93,8 +211,13 @@ export class OpenRouteService {
   }
 
   /**
-   * Geocodifica un destino en lenguaje natural (ej. "Reforma", "Bellas Artes", "Hospital").
-   * Si no hay API key o la red falla, utiliza el catálogo de fallback realista.
+   * Geocodifica un destino en lenguaje natural (ej. "Reforma", "Bellas Artes", "Sonora 120, Roma Norte").
+   * Estrategia Multi-Tier Resiliente:
+   *  Tier 0: Catálogo curado de puntos de interés y landmarks emblemáticos de CDMX (0ms, 100% exacto)
+   *  Tier 1: OpenRouteService con boundary.circle metropolitano (65km)
+   *  Tier 2: OpenStreetMap Nominatim (con viewbox metropolitano y filtrado MX)
+   *  Tier 3: Photon API de Komoot (OSM global, gratis, sin API key, con bias CDMX)
+   *  Tier 4: Fallback aproximado
    */
   public async geocodeDestination(
     query: string,
@@ -105,56 +228,359 @@ export class OpenRouteService {
       return [];
     }
 
-    // Si hay API key disponible, intentamos consultar el endpoint oficial de geocodificación
+    // 1. TIER 0: Búsqueda inmediata en el Catálogo Curado de Alta Fidelidad
+    // Resuelve sitios emblemáticos de CDMX con coordenadas exactas verificadas manualmente
+    const catalogResults = this.searchFallbackDestinations(trimmed);
+    if (catalogResults.length > 0) {
+      return catalogResults;
+    }
+
+    // 2. TIER 1: OpenRouteService con delimitación por círculo metropolitano (65km)
     if (this.apiKey) {
       try {
-        const params = new URLSearchParams({
+        const orsResults = await this.geocodeWithORS(trimmed, userLocation);
+        if (orsResults && orsResults.length > 0) {
+          const coloniaMatch = trimmed.match(/\b(roma|condesa|polanco|del valle|narvarte|doctores|juarez|juárez|napoles|nápoles|san angel|san ángel|coyoacan|coyoacán|lindavista|santa fe|centro|anzures|escandon|escandón)\b/i);
+          if (coloniaMatch) {
+            const expectedColonia = coloniaMatch[1].toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+            const labelNorm = orsResults[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+            if (labelNorm.includes(expectedColonia)) {
+              return orsResults;
+            }
+            // Si ORS ignoró la colonia (ej. devolvió Tlalnepantla para "Sonora 120, Roma"), continuar a Nominatim
+          } else {
+            return orsResults;
+          }
+        }
+      } catch (err) {
+        console.warn('[orsService] Error en geocodificación ORS, recurriendo a Nominatim:', err);
+      }
+    }
+
+    // 3. TIER 2: OpenStreetMap Nominatim con delimitación por viewbox
+    try {
+      const nominatimResults = await this.geocodeWithNominatim(trimmed, userLocation);
+      if (nominatimResults && nominatimResults.length > 0) {
+        return nominatimResults;
+      }
+    } catch (err) {
+      console.warn('[orsService] Error en geocodificación Nominatim, recurriendo a Photon:', err);
+    }
+
+    // 4. TIER 3: Photon API de Komoot (libre, rápido, con bias de CDMX)
+    try {
+      const photonResults = await this.geocodeWithPhoton(trimmed, userLocation);
+      if (photonResults && photonResults.length > 0) {
+        return photonResults;
+      }
+    } catch (err) {
+      console.warn('[orsService] Error en geocodificación Photon:', err);
+    }
+
+    // 5. Fallback seguro: Si no hubo red ni coincidencias
+    const baseLat = userLocation?.latitude ?? 19.4326;
+    const baseLng = userLocation?.longitude ?? -99.1332;
+
+    return [
+      {
+        id: `approx-${Date.now()}`,
+        name: trimmed,
+        label: `${trimmed}, Ciudad de México`,
+        coordinates: {
+          latitude: baseLat,
+          longitude: baseLng,
+        },
+      },
+    ];
+  }
+
+  /**
+   * Geocodificación vía OpenRouteService oficial con delimitación geográfica
+   */
+  private async geocodeWithORS(
+    query: string,
+    userLocation?: Coordinates
+  ): Promise<GeocodeResult[]> {
+    const centerLat = userLocation?.latitude ?? 19.4326;
+    const centerLon = userLocation?.longitude ?? -99.1332;
+
+    const isForaneoQuery = /(?:acapulco|cuernavaca|puebla|toluca|pachuca|queretaro|guadalajara|monterrey|cancun|veracruz|oaxaca|merida|leon|guanajuato|morelia|san luis|hidalgo|morelos|jalisco|nuevo leon)/i.test(query);
+
+    // Intento 1: Búsqueda con círculo metropolitano (65km) para evitar falsos positivos en otros estados
+    if (!isForaneoQuery) {
+      try {
+        const localParams = new URLSearchParams({
           api_key: this.apiKey,
-          text: trimmed,
+          text: query,
           size: '5',
           'boundary.country': 'MEX',
+          'boundary.circle.lat': centerLat.toString(),
+          'boundary.circle.lon': centerLon.toString(),
+          'boundary.circle.radius': '65',
+          'focus.point.lat': centerLat.toString(),
+          'focus.point.lon': centerLon.toString(),
         });
 
-        if (userLocation) {
-          params.append('focus.point.lat', userLocation.latitude.toString());
-          params.append('focus.point.lon', userLocation.longitude.toString());
-        }
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3500);
 
         const response = await fetch(
-          `${this.baseUrl}/geocode/search?${params.toString()}`,
+          `${this.baseUrl}/geocode/search?${localParams.toString()}`,
           {
-            headers: {
-              Accept: 'application/json',
-            },
+            headers: { Accept: 'application/json' },
+            signal: controller.signal,
           }
         );
+        clearTimeout(timeoutId);
 
         if (response.ok) {
           const data = await response.json();
           if (data.features && Array.isArray(data.features) && data.features.length > 0) {
-            return data.features.map((feature: any, index: number): GeocodeResult => {
-              const coords = feature.geometry?.coordinates || [0, 0];
-              const props = feature.properties || {};
-              return {
-                id: props.id || `ors-${index}`,
-                name: props.name || props.label || trimmed,
-                label: props.label || props.name || trimmed,
-                coordinates: {
-                  latitude: coords[1],
-                  longitude: coords[0],
-                },
-                distanceMeters: props.distance ? Math.round(props.distance * 1000) : undefined,
-              };
-            });
+            return this.parsePeliasFeatures(data.features, query);
           }
         }
-      } catch (error) {
-        console.warn('OpenRouteService geocode error, recurriendo a fallback:', error);
+      } catch (err) {
+        console.warn('[orsService] Fallo búsqueda local con círculo en ORS:', err);
       }
     }
 
-    // Fallback: búsqueda en catálogo local o generación inteligente
-    return this.getFallbackGeocode(trimmed, userLocation);
+    // Intento 2: Búsqueda nacional con focus.point si no se encontraron en círculo local
+    try {
+      const nationalParams = new URLSearchParams({
+        api_key: this.apiKey,
+        text: query,
+        size: '5',
+        'boundary.country': 'MEX',
+        'focus.point.lat': centerLat.toString(),
+        'focus.point.lon': centerLon.toString(),
+      });
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3500);
+
+      const response = await fetch(
+        `${this.baseUrl}/geocode/search?${nationalParams.toString()}`,
+        {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        }
+      );
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.features && Array.isArray(data.features) && data.features.length > 0) {
+          return this.parsePeliasFeatures(data.features, query);
+        }
+      }
+    } catch (err) {
+      console.warn('[orsService] Fallo búsqueda nacional en ORS:', err);
+    }
+
+    return [];
+  }
+
+  /**
+   * Parsea las features devueltas por el geocodificador Pelias de ORS
+   */
+  private parsePeliasFeatures(features: any[], query: string): GeocodeResult[] {
+    return features.map((feature: any, index: number): GeocodeResult => {
+      const coords = feature.geometry?.coordinates || [0, 0];
+      const props = feature.properties || {};
+      return {
+        id: props.id || `ors-${index}`,
+        name: props.name || props.label || query,
+        label: props.label || props.name || query,
+        coordinates: {
+          latitude: coords[1],
+          longitude: coords[0],
+        },
+        distanceMeters: props.distance ? Math.round(props.distance * 1000) : undefined,
+      };
+    });
+  }
+
+  /**
+   * Geocodificación vía Photon (Komoot / OSM) - Sin costo y sin API Key
+   */
+  private async geocodeWithPhoton(
+    query: string,
+    userLocation?: Coordinates
+  ): Promise<GeocodeResult[]> {
+    const lat = userLocation?.latitude ?? 19.4326;
+    const lon = userLocation?.longitude ?? -99.1332;
+
+    const params = new URLSearchParams({
+      q: query,
+      lang: 'es',
+      limit: '5',
+      lat: lat.toString(),
+      lon: lon.toString(),
+    });
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3500);
+
+    const response = await fetch(`https://photon.komoot.io/api/?${params.toString()}`, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const data = await response.json();
+      if (data.features && Array.isArray(data.features) && data.features.length > 0) {
+        return data.features.map((feat: any, index: number): GeocodeResult => {
+          const coords = feat.geometry?.coordinates || [0, 0];
+          const p = feat.properties || {};
+          const street = p.street;
+          const num = p.housenumber;
+          const name = p.name;
+          const district = p.district || p.suburb;
+          const city = p.city || p.county || p.state || 'Ciudad de México';
+
+          let mainName = name;
+          if (!mainName && street) {
+            mainName = num ? `${street} ${num}` : street;
+          }
+          if (!mainName) mainName = query;
+
+          const labelParts = [
+            street && num ? `${street} ${num}` : (name || street),
+            district,
+            city,
+          ].filter(Boolean);
+
+          return {
+            id: `photon-${p.osm_id || index}`,
+            name: mainName,
+            label: labelParts.length > 0 ? labelParts.join(', ') : query,
+            coordinates: {
+              latitude: coords[1],
+              longitude: coords[0],
+            },
+          };
+        });
+      }
+    }
+
+    return [];
+  }
+
+  /**
+   * Geocodificación vía OpenStreetMap Nominatim - Gratuito
+   */
+  private async geocodeWithNominatim(
+    query: string,
+    userLocation?: Coordinates
+  ): Promise<GeocodeResult[]> {
+    // Si la consulta no especifica estado o ciudad, anexar Ciudad de México para contexto
+    const isStateSpecified = /(?:cdmx|ciudad de mexico|mexico|edomex|estado de mexico|puebla|toluca|cuernavaca|hidalgo|pachuca|queretaro|jalisco|guadalajara|monterrey)/i.test(query);
+    const searchString = isStateSpecified ? query : `${query}, Ciudad de México`;
+
+    const params = new URLSearchParams({
+      q: searchString,
+      format: 'json',
+      countrycodes: 'mx',
+      addressdetails: '1',
+      limit: '5',
+      // Viewbox metropolitano de CDMX/Valle de México: [minLon, maxLat, maxLon, minLat]
+      viewbox: '-99.38,19.62,-98.92,19.15',
+      bounded: '0',
+    });
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3500);
+
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/search?${params.toString()}`,
+      {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'AVAN-Senior-Navigation-App/1.0 (contacto: avan-app@escom.ipn.mx)',
+        },
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const data = await response.json();
+      if (Array.isArray(data) && data.length > 0) {
+        return data.map((item: any, index: number): GeocodeResult => {
+          const lat = parseFloat(item.lat);
+          const lon = parseFloat(item.lon);
+          const addr = item.address || {};
+          const street = addr.road || addr.pedestrian || addr.street;
+          const houseNumber = addr.house_number;
+          const suburb = addr.suburb || addr.neighbourhood || addr.quarter;
+          const city = addr.city || addr.town || addr.municipality || addr.state || 'Ciudad de México';
+
+          const mainName = item.name || (street ? (houseNumber ? `${street} ${houseNumber}` : street) : item.display_name.split(',')[0]);
+          const labelParts = [
+            street && houseNumber ? `${street} ${houseNumber}` : (item.name || street),
+            suburb,
+            city,
+          ].filter(Boolean);
+
+          return {
+            id: `nominatim-${item.place_id || index}`,
+            name: mainName,
+            label: labelParts.length > 0 ? labelParts.join(', ') : item.display_name,
+            coordinates: {
+              latitude: lat,
+              longitude: lon,
+            },
+          };
+        });
+      }
+    }
+
+    return [];
+  }
+
+  /**
+   * Búsqueda semántica y difusa en el catálogo curado de landmarks de CDMX
+   */
+  private searchFallbackDestinations(query: string): GeocodeResult[] {
+    const normalize = (t: string) =>
+      t
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .trim();
+
+    const qNorm = normalize(query);
+    const qTokens = qNorm.split(/\s+/).filter((t) => t.length > 2);
+
+    const matches = FALLBACK_DESTINATIONS.filter((item) => {
+      const nameNorm = normalize(item.name);
+      const labelNorm = normalize(item.label);
+
+      // Coincidencia exacta o contenida
+      if (nameNorm.includes(qNorm) || qNorm.includes(nameNorm)) return true;
+      if (labelNorm.includes(qNorm)) return true;
+
+      // Coincidencia por palabras clave
+      const keywordMatch = item.keywords.some((kw) => {
+        const kwNorm = normalize(kw);
+        return qNorm.includes(kwNorm) || kwNorm.includes(qNorm);
+      });
+      if (keywordMatch) return true;
+
+      // Coincidencia por tokens relevantes (ej: "bellas" + "artes")
+      const matchedTokens = qTokens.filter(
+        (token) => nameNorm.includes(token) || item.keywords.some((kw) => normalize(kw).includes(token))
+      );
+      return matchedTokens.length >= Math.min(qTokens.length, 2) && matchedTokens.length > 0;
+    });
+
+    return matches.map((m) => ({
+      id: m.id,
+      name: m.name,
+      label: m.label,
+      coordinates: m.coordinates,
+    }));
   }
 
   /**
@@ -240,47 +666,6 @@ export class OpenRouteService {
 
     // Fallback realista para desarrollo
     return this.generateFallbackRoute(start, destination);
-  }
-
-  /**
-   * Genera resultados de búsqueda simulados basados en la consulta y ubicación.
-   */
-  private getFallbackGeocode(
-    query: string,
-    userLocation?: Coordinates
-  ): GeocodeResult[] {
-    const qLower = query.toLowerCase();
-    const matches = FALLBACK_DESTINATIONS.filter(
-      (item) =>
-        item.name.toLowerCase().includes(qLower) ||
-        item.label.toLowerCase().includes(qLower)
-    );
-
-    if (matches.length > 0) {
-      return matches;
-    }
-
-    // Si no coincide con la lista fija, genera un destino realista cercano al usuario
-    const baseLat = userLocation?.latitude ?? 19.427025;
-    const baseLng = userLocation?.longitude ?? -99.167665;
-
-    // Desplazamiento verosímil de ~2 km
-    const offsetLat = (Math.sin(query.length) * 0.015) + 0.008;
-    const offsetLng = (Math.cos(query.length) * 0.015) + 0.008;
-
-    return [
-      {
-        id: `mock-generated-${Date.now()}`,
-        name: query,
-        label: `${query}, Ciudad de México`,
-        coordinates: {
-          latitude: baseLat + offsetLat,
-          longitude: baseLng + offsetLng,
-        },
-        distanceMeters: 2350,
-      },
-      ...FALLBACK_DESTINATIONS.slice(0, 2),
-    ];
   }
 
   /**

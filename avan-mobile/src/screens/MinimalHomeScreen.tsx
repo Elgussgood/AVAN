@@ -21,6 +21,7 @@ import {
 } from '../services/conversationService';
 import { orsService, StepInstruction } from '../services/orsService';
 import { LocationService } from '../services/locationService';
+import { InteractiveMap } from '../components/InteractiveMap';
 
 export type VoiceState = 'idle' | 'listening' | 'processing' | 'speaking';
 
@@ -54,10 +55,11 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   context: propContext,
   onContextChange,
 }) => {
-  const systemColorScheme = useColorScheme();
-  const [internalDarkMode, setInternalDarkMode] = useState<boolean>(
-    systemColorScheme === 'dark'
-  );
+  const [internalDarkMode, setInternalDarkMode] = useState<boolean>(() => {
+    if (propIsDarkMode !== undefined) return propIsDarkMode;
+    const hour = new Date().getHours();
+    return hour >= 19 || hour < 7;
+  });
   const isDarkMode = propIsDarkMode !== undefined ? propIsDarkMode : internalDarkMode;
   const handleToggleTheme =
     propOnToggleTheme || (() => setInternalDarkMode((prev) => !prev));
@@ -82,11 +84,41 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   const [isLoadingTrip, setIsLoadingTrip] = useState<boolean>(false);
   const [loadingDestination, setLoadingDestination] = useState<string>('');
 
-  // Sincronizar contexto entrante
+  // T-2.6: Saludo y guía auditiva al iniciar la app (reproducido solo una vez con retardo de 800ms)
+  const hasAnnouncedWelcomeRef = useRef<boolean>(false);
+  const lastProcessedRegistrationRef = useRef<any>(null);
+
+  // Sincronizar contexto entrante (incluyendo salto de contexto desde el mapa para registro de direcciones)
   useEffect(() => {
     if (propContext) {
       setCurrentContext(propContext);
       contextRef.current = propContext;
+
+      const reg = propContext.pendingAliasRegistration;
+      if (reg && reg !== lastProcessedRegistrationRef.current) {
+        lastProcessedRegistrationRef.current = reg;
+        hasAnnouncedWelcomeRef.current = true; // Suprimir bienvenida genérica para no encimar
+
+        if (reg.step === 'awaiting_address') {
+          const prompt = `Con gusto. ¿Cuál es la dirección o colonia que desea guardar para ${reg.aliasName}?`;
+          setSpokenMessage(prompt);
+          setVoiceState('speaking');
+          setTimeout(() => {
+            VoiceService.speak(prompt, async () => {
+              await startListeningWithVAD();
+            });
+          }, 350);
+        } else if (reg.step === 'confirming_address' && reg.addressCandidate) {
+          const prompt = `Entendí: ${reg.addressCandidate}. ¿Es correcta esta ubicación para ${reg.aliasName}?`;
+          setSpokenMessage(prompt);
+          setVoiceState('speaking');
+          setTimeout(() => {
+            VoiceService.speak(prompt, async () => {
+              await startListeningWithVAD();
+            });
+          }, 350);
+        }
+      }
     }
   }, [propContext]);
 
@@ -105,11 +137,29 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     return () => clearTimeout(timer);
   }, [greetingOpacityAnim]);
 
-  // T-2.6: Saludo y guía auditiva al iniciar la app (reproducido solo una vez con retardo de 800ms)
-  const hasAnnouncedWelcomeRef = useRef<boolean>(false);
+  // Obtener ubicación GPS inicial del usuario para contexto geocodificador inmediato
+  useEffect(() => {
+    LocationService.getCurrentLocation()
+      .then((loc) => {
+        if (loc) {
+          const coords = { latitude: loc.latitude, longitude: loc.longitude };
+          contextRef.current = {
+            ...contextRef.current,
+            currentLocation: coords,
+          };
+          setCurrentContext((prev) => ({
+            ...prev,
+            currentLocation: coords,
+          }));
+        }
+      })
+      .catch((err) => {
+        console.warn('No se pudo obtener ubicación GPS inicial en MinimalHomeScreen:', err);
+      });
+  }, []);
 
   useEffect(() => {
-    if (!hasAnnouncedWelcomeRef.current) {
+    if (!hasAnnouncedWelcomeRef.current && !contextRef.current.pendingAliasRegistration) {
       hasAnnouncedWelcomeRef.current = true;
       const timer = setTimeout(async () => {
         setVoiceState('speaking');
@@ -331,6 +381,158 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   };
 
   /**
+   * Manejo gerontológico paciente de silencio cuando no se detecta voz (8 segundos)
+   */
+  const handleSilenceTimeout = async () => {
+    const currentCtx = contextRef.current;
+    const pendingReg = currentCtx.pendingAliasRegistration;
+
+    // TASK-22: Manejo de Silencio con Segunda Repetición Paciente para Confirmación de Dirección
+    if (pendingReg && pendingReg.step === 'confirming_address') {
+      const retries = pendingReg.retryCount || 0;
+
+      if (retries === 0) {
+        // 1ra Repetición: no cancelar, repetir por voz con calidez gerontológica y dar 8s adicionales
+        const updatedCtx: ConversationContext = {
+          ...currentCtx,
+          pendingAliasRegistration: {
+            ...pendingReg,
+            retryCount: 1,
+          },
+        };
+        contextRef.current = updatedCtx;
+        setCurrentContext(updatedCtx);
+        if (onContextChange) onContextChange(updatedCtx);
+
+        const repeatPrompt =
+          'Disculpe, ¿desea guardar esta dirección? Puede decir Sí para confirmar o No para corregir.';
+        setSpokenMessage(repeatPrompt);
+        setVoiceState('speaking');
+
+        await VoiceService.speak(repeatPrompt, async () => {
+          await startListeningWithVAD();
+        });
+        return;
+      } else {
+        // 2do Silencio Consecutivo: Cierre cordial sin frustración ni errores
+        const updatedCtx: ConversationContext = {
+          ...currentCtx,
+          pendingAliasRegistration: null,
+        };
+        contextRef.current = updatedCtx;
+        setCurrentContext(updatedCtx);
+        if (onContextChange) onContextChange(updatedCtx);
+
+        const closePrompt =
+          'No se preocupe, podemos guardar la dirección en otro momento. Presione el botón cuando lo necesite.';
+        setSpokenMessage(closePrompt);
+        setVoiceState('speaking');
+
+        await VoiceService.speak(closePrompt, () => {
+          setVoiceState('idle');
+        });
+        return;
+      }
+    }
+
+    // Manejo de silencio paciente para awaiting_address
+    if (pendingReg && pendingReg.step === 'awaiting_address') {
+      const retries = pendingReg.retryCount || 0;
+
+      if (retries === 0) {
+        const updatedCtx: ConversationContext = {
+          ...currentCtx,
+          pendingAliasRegistration: {
+            ...pendingReg,
+            retryCount: 1,
+          },
+        };
+        contextRef.current = updatedCtx;
+        setCurrentContext(updatedCtx);
+        if (onContextChange) onContextChange(updatedCtx);
+
+        const repeatPrompt =
+          pendingReg.aliasName && pendingReg.aliasName !== 'nueva ubicación'
+            ? `Disculpe, ¿cuál es la dirección o colonia para registrar ${pendingReg.aliasName}?`
+            : 'Disculpe, ¿podría decirme el nombre del lugar y su dirección?';
+        setSpokenMessage(repeatPrompt);
+        setVoiceState('speaking');
+
+        await VoiceService.speak(repeatPrompt, async () => {
+          await startListeningWithVAD();
+        });
+        return;
+      } else {
+        const updatedCtx: ConversationContext = {
+          ...currentCtx,
+          pendingAliasRegistration: null,
+        };
+        contextRef.current = updatedCtx;
+        setCurrentContext(updatedCtx);
+        if (onContextChange) onContextChange(updatedCtx);
+
+        const closePrompt =
+          'No se preocupe, podemos registrar la dirección en otro momento. Presione el botón cuando lo necesite.';
+        setSpokenMessage(closePrompt);
+        setVoiceState('speaking');
+
+        await VoiceService.speak(closePrompt, () => {
+          setVoiceState('idle');
+        });
+        return;
+      }
+    }
+
+    // Fallback para otros silencios en reposo o confirmación de viaje
+    setVoiceState('idle');
+    setSpokenMessage('No logré escucharle con claridad. Presione el botón para hablar.');
+    await VoiceService.speak('No logré escucharle con claridad. Presione el botón para hablar.');
+  };
+
+  /**
+   * TASK-24: Inicia la escucha con detección de actividad vocal (VAD dinámico):
+   * - 8 segundos de silencio inicial si no habla.
+   * - 1.8 segundos de silencio continuo (trailing silence) tras terminar de hablar para procesar de inmediato (2.5s en dictado de dirección).
+   */
+  const startListeningWithVAD = async (): Promise<boolean> => {
+    const currentCtx = contextRef.current;
+    const isDictatingAddress =
+      currentCtx.pendingAliasRegistration?.step === 'awaiting_address';
+
+    setVoiceState('listening');
+
+    const started = await AudioRecorderService.startRecording({
+      isDictatingAddress,
+      initialSilenceMs: 8000,
+      trailingSilenceMs: isDictatingAddress ? 2500 : 1800,
+      maxDurationMs: isDictatingAddress ? 25000 : 15000,
+      onSpeechDetected: () => {
+        console.log('[MinimalHomeScreen] VAD: Habla detectada en micrófono.');
+      },
+      onInitialSilenceTimeout: async () => {
+        console.log('[MinimalHomeScreen] VAD: Timeout de silencio inicial (8s sin voz).');
+        await handleSilenceTimeout();
+      },
+      onSpeechEnded: async (transcription) => {
+        console.log('[MinimalHomeScreen] VAD: Silencio posterior completado (1.8s sin voz). Procesando.');
+        setVoiceState('processing');
+        const speechText = transcription?.text?.trim() || '';
+        if (!speechText) {
+          await handleSilenceTimeout();
+          return;
+        }
+        await handleProcessInput(speechText);
+      },
+    });
+
+    if (!started) {
+      setVoiceState('idle');
+      return false;
+    }
+    return true;
+  };
+
+  /**
    * Procesa un comando de voz o texto a través de ConversationService
    */
   const handleProcessInput = async (inputText: string) => {
@@ -372,6 +574,20 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     }
 
     try {
+      if (!contextRef.current.currentLocation) {
+        try {
+          const loc = await LocationService.getCurrentLocation();
+          if (loc) {
+            contextRef.current = {
+              ...contextRef.current,
+              currentLocation: { latitude: loc.latitude, longitude: loc.longitude },
+            };
+          }
+        } catch {
+          // Continuar con ubicación por defecto
+        }
+      }
+
       const response = await ConversationService.processUserMessage(
         textToProcess,
         contextRef.current
@@ -412,12 +628,25 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
             longitude: userLocation.longitude,
           };
 
-          // 1. Geocodificar destino
-          const geocoded = await orsService.geocodeDestination(dest, startCoords);
-          const targetCoords = geocoded[0]?.coordinates || {
-            latitude: 19.4352,
-            longitude: -99.1412,
-          };
+          // 1. Obtener coordenadas destino (aprovechando las ya geocodificadas si están disponibles)
+          const args = response.functionCall.args as any;
+          let targetCoords: { latitude: number; longitude: number } | null = null;
+          if (args?.latitud && args?.longitud) {
+            targetCoords = {
+              latitude: Number(args.latitud),
+              longitude: Number(args.longitud),
+            };
+          } else if (contextRef.current.pendingConfirmation?.coordinates) {
+            targetCoords = contextRef.current.pendingConfirmation.coordinates;
+          }
+
+          if (!targetCoords) {
+            const geocoded = await orsService.geocodeDestination(dest, startCoords);
+            targetCoords = geocoded[0]?.coordinates || {
+              latitude: 19.4352,
+              longitude: -99.1412,
+            };
+          }
 
           // 2. Calcular ruta vehicular con ORS
           const routeResult = await orsService.getDirections(startCoords, targetCoords);
@@ -464,22 +693,28 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         response.spokenText,
         async () => {
           // Requerimiento gerontológico: Coherencia estricta entre mensaje y escucha activa
-          // Si el asistente emitió una despedida o cortesía de cierre, NUNCA abrir el micrófono.
+          // Una despedida SOLO aplica si NO se espera respuesta, NO hay preguntas y NO hay flujos pendientes.
+          const asksQuestion = response.spokenText.includes('?');
           const isFarewell =
-            /(?:hasta luego|excelente d[ií]a|buen d[ií]a|buenas noches|a su disposici[oó]n|nos vemos|adi[oó]s|que descanse|cu[ií]dese|que le vaya bien|con mucho gusto)/i.test(
+            !response.shouldAutoListen &&
+            !asksQuestion &&
+            /(?:hasta luego|excelente d[ií]a|buenas noches|a su disposici[oó]n|nos vemos|adi[oó]s|que descanse|cu[ií]dese|que le vaya bien)/i.test(
               response.spokenText
             );
 
           const shouldAutoListen =
             !isFarewell &&
-            (response.shouldAutoListen !== undefined
-              ? response.shouldAutoListen
-              : Boolean(response.updatedContext.pendingConfirmation) ||
-                (Boolean(response.updatedContext.pendingTripCompletion) && response.spokenText.includes('?')) ||
-                response.spokenText.toLowerCase().includes('otro lugar') ||
-                response.spokenText.toLowerCase().includes('a dónde desea ir') ||
-                response.spokenText.toLowerCase().includes('a donde desea ir') ||
-                response.spokenText.toLowerCase().includes('a qué lugar'));
+            (response.shouldAutoListen === true ||
+              Boolean(response.updatedContext.pendingConfirmation) ||
+              Boolean(response.updatedContext.pendingAliasRegistration) ||
+              (Boolean(response.updatedContext.pendingTripCompletion) && asksQuestion) ||
+              (response.shouldAutoListen !== false &&
+                (asksQuestion ||
+                  response.spokenText.toLowerCase().includes('otro lugar') ||
+                  response.spokenText.toLowerCase().includes('a dónde desea ir') ||
+                  response.spokenText.toLowerCase().includes('a donde desea ir') ||
+                  response.spokenText.toLowerCase().includes('a qué lugar') ||
+                  response.spokenText.toLowerCase().includes('es correcta'))));
 
           if (shouldAutoListen) {
             try {
@@ -488,36 +723,26 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
               // Ignorar si haptics no está disponible
             }
 
-            const started = await AudioRecorderService.startRecording();
-            if (started) {
-              setVoiceState('listening');
-              if (response.updatedContext.pendingConfirmation) {
-                setSpokenMessage(
-                  `¿Desea iniciar el viaje a ${response.updatedContext.pendingConfirmation.destination}?`
-                );
-              } else if (response.updatedContext.pendingTripCompletion) {
-                setSpokenMessage('¿Desea viajar a algún otro lugar?');
-              } else {
-                setSpokenMessage('Diga su nuevo destino con calma...');
-              }
+            if (response.updatedContext.pendingConfirmation) {
+              setSpokenMessage(
+                `¿Desea iniciar el viaje a ${response.updatedContext.pendingConfirmation.destination}?`
+              );
+            } else if (response.updatedContext.pendingAliasRegistration?.step === 'confirming_address') {
+              setSpokenMessage(
+                `¿Es correcta la ubicación para ${response.updatedContext.pendingAliasRegistration.aliasName}?`
+              );
+            } else if (response.updatedContext.pendingAliasRegistration?.step === 'awaiting_address') {
+              setSpokenMessage(
+                `Diga la dirección para ${response.updatedContext.pendingAliasRegistration.aliasName}...`
+              );
+            } else if (response.updatedContext.pendingTripCompletion) {
+              setSpokenMessage('¿Desea viajar a algún otro lugar?');
+            } else {
+              setSpokenMessage('Diga su nuevo destino con calma...');
+            }
 
-              if (recordingTimeoutRef.current) {
-                clearTimeout(recordingTimeoutRef.current);
-              }
-              recordingTimeoutRef.current = setTimeout(async () => {
-                if (AudioRecorderService.isRecording()) {
-                  setVoiceState('processing');
-                  const transcription = await AudioRecorderService.stopAndTranscribe();
-                  const speechText = transcription?.text?.trim() || '';
-                  if (!speechText) {
-                    setVoiceState('idle');
-                    setSpokenMessage('No logré escucharle con claridad. Presione el botón para hablar.');
-                    await VoiceService.speak('No logré escucharle con claridad. Presione el botón para hablar.');
-                    return;
-                  }
-                  await handleProcessInput(speechText);
-                }
-              }, 8000);
+            const started = await startListeningWithVAD();
+            if (started) {
               return;
             }
           }
@@ -551,19 +776,12 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     }
 
     if (voiceState === 'listening') {
-      if (recordingTimeoutRef.current) {
-        clearTimeout(recordingTimeoutRef.current);
-        recordingTimeoutRef.current = null;
-      }
-
       setVoiceState('processing');
 
       const transcription = await AudioRecorderService.stopAndTranscribe();
       const speechText = transcription?.text?.trim() || '';
       if (!speechText) {
-        setVoiceState('idle');
-        setSpokenMessage('No logré escucharle con claridad. Presione el botón para hablar.');
-        await VoiceService.speak('No logré escucharle con claridad. Presione el botón para hablar.');
+        await handleSilenceTimeout();
         return;
       }
       await handleProcessInput(speechText);
@@ -571,18 +789,18 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     }
 
     if (voiceState === 'idle') {
-      // Iniciar grabación de audio y pasar a estado listening
-      const started = await AudioRecorderService.startRecording();
-      if (!started) {
-        setVoiceState('idle');
-        return;
-      }
-      setVoiceState('listening');
-
       // Si hay confirmación pendiente o continuidad, guiar al usuario
       if (contextRef.current.pendingConfirmation) {
         setSpokenMessage(
           `¿Desea iniciar el viaje a ${contextRef.current.pendingConfirmation.destination}?`
+        );
+      } else if (contextRef.current.pendingAliasRegistration?.step === 'confirming_address') {
+        setSpokenMessage(
+          `¿Es correcta la ubicación para ${contextRef.current.pendingAliasRegistration.aliasName}?`
+        );
+      } else if (contextRef.current.pendingAliasRegistration?.step === 'awaiting_address') {
+        setSpokenMessage(
+          `Diga la dirección para ${contextRef.current.pendingAliasRegistration.aliasName}...`
         );
       } else if (contextRef.current.pendingTripCompletion) {
         setSpokenMessage('¿Desea viajar a algún otro lugar?');
@@ -590,24 +808,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         setSpokenMessage('Diga su destino con calma...');
       }
 
-      // T-1.4: Temporizador de auto-detención calibrado a 8.0 segundos de silencio para adultos mayores
-      if (recordingTimeoutRef.current) {
-        clearTimeout(recordingTimeoutRef.current);
-      }
-      recordingTimeoutRef.current = setTimeout(async () => {
-        if (AudioRecorderService.isRecording()) {
-          setVoiceState('processing');
-          const transcription = await AudioRecorderService.stopAndTranscribe();
-          const speechText = transcription?.text?.trim() || '';
-          if (!speechText) {
-            setVoiceState('idle');
-            setSpokenMessage('No logré escucharle con claridad. Presione el botón para hablar.');
-            await VoiceService.speak('No logré escucharle con claridad. Presione el botón para hablar.');
-            return;
-          }
-          await handleProcessInput(speechText);
-        }
-      }, 8000);
+      await startListeningWithVAD();
     }
   };
 
@@ -617,6 +818,14 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   const getStatusText = (): string => {
     if (voiceState === 'processing') {
       return 'Pensando...';
+    }
+
+    if (currentContext.pendingAliasRegistration?.step === 'confirming_address') {
+      return `¿Guardar "${currentContext.pendingAliasRegistration.aliasName}"?`;
+    }
+
+    if (currentContext.pendingAliasRegistration?.step === 'awaiting_address') {
+      return `¿Dirección para ${currentContext.pendingAliasRegistration.aliasName}?`;
     }
 
     if (currentContext.pendingConfirmation) {
@@ -646,6 +855,14 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       return 'Un momento por favor, procesando su solicitud...';
     }
 
+    if (currentContext.pendingAliasRegistration?.step === 'confirming_address') {
+      return 'Diga "Sí" para confirmar o "No" para corregir';
+    }
+
+    if (currentContext.pendingAliasRegistration?.step === 'awaiting_address') {
+      return 'Diga la calle, número o colonia con calma';
+    }
+
     if (currentContext.pendingConfirmation) {
       return 'Diga "Sí" para confirmar o "Cancelar" para detener';
     }
@@ -665,6 +882,51 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     }
   };
 
+  const isConfirmingAddress =
+    currentContext.pendingAliasRegistration?.step === 'confirming_address' &&
+    Boolean(currentContext.pendingAliasRegistration.coordinates);
+
+  const isConfirmingTrip =
+    Boolean(currentContext.pendingConfirmation) &&
+    Boolean(currentContext.pendingConfirmation?.coordinates);
+
+  const isShowingConfirmationPreview = isConfirmingAddress || isConfirmingTrip;
+
+  // Variables unificadas para confirmación visual en mapa (dirección o viaje)
+  const previewCoords = isConfirmingTrip
+    ? currentContext.pendingConfirmation!.coordinates!
+    : currentContext.pendingAliasRegistration?.coordinates;
+
+  const previewTitle = isConfirmingTrip
+    ? currentContext.pendingConfirmation!.destination.toUpperCase()
+    : currentContext.pendingAliasRegistration?.aliasName.toUpperCase() || 'UBICACIÓN';
+
+  const previewSubtitle = isConfirmingTrip
+    ? (currentContext.pendingConfirmation!.isForaneo
+        ? 'Viaje foráneo en carretera (>50 km)'
+        : 'Destino seleccionado')
+    : currentContext.pendingAliasRegistration?.addressCandidate || 'Dirección seleccionada';
+
+  const headerTitle = isConfirmingTrip ? 'CONFIRMAR VIAJE' : 'CONFIRMAR UBICACIÓN';
+  const headerIcon = isConfirmingTrip ? 'navigate-circle' : 'location';
+
+  const confirmQuestion = isConfirmingTrip
+    ? (currentContext.pendingConfirmation!.isForaneo
+        ? '¿Iniciar viaje foráneo hacia allá?'
+        : '¿Desea iniciar el viaje hacia allá?')
+    : '¿Es correcta esta ubicación?';
+
+  const confirmButtonLabel = isConfirmingTrip ? 'SÍ, INICIAR VIAJE' : 'SÍ, GUARDAR';
+  const confirmButtonIcon = isConfirmingTrip ? 'navigate' : 'checkmark-circle';
+  const confirmButtonHint = isConfirmingTrip
+    ? 'Inicia el cálculo de ruta y navegación guiada'
+    : 'Guarda esta ubicación con el nombre asignado';
+
+  const rejectButtonLabel = isConfirmingTrip ? 'CANCELAR' : 'NO, CORREGIR';
+  const rejectButtonHint = isConfirmingTrip
+    ? 'Cancela el viaje y regresa a la pantalla principal'
+    : 'Permite dictar nuevamente la dirección';
+
   return (
     <View style={[styles.container, { backgroundColor: currentTheme.background }]}>
       <StatusBar
@@ -674,107 +936,282 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       />
 
       <SafeAreaView style={styles.safeArea}>
-        {/* Centro de la pantalla: One-Button UI pura con botón central dominante */}
-        <View style={styles.centerContainer}>
-          {/* T-1.1: Saludo temporal autodesvanecible tras 4 segundos */}
-          <Animated.View style={{ opacity: greetingOpacityAnim }}>
+        {isShowingConfirmationPreview && previewCoords ? (
+          /* TASK-23: Vista Previa Visual en Mapa Durante la Confirmación (Dirección o Viaje) */
+          <View style={styles.confirmingContainer}>
+            {/* Cabecera accesible con icono de ubicación o viaje */}
+            <View style={styles.previewHeaderRow}>
+              <Ionicons name={headerIcon as any} size={24} color={currentTheme.buttonOrange} />
+              <Text
+                style={[
+                  styles.previewHeaderText,
+                  { color: currentTheme.textPrimary },
+                ]}
+              >
+                {headerTitle}
+              </Text>
+            </View>
+
+            {/* Mapa Interactivo con el Pin centrado en las coordenadas geocodificadas */}
+            <View
+              style={[
+                styles.mapPreviewCard,
+                {
+                  borderColor: isDarkMode ? '#233857' : '#CBD5E1',
+                  backgroundColor: isDarkMode ? '#0B111D' : '#F1F4F7',
+                },
+              ]}
+            >
+              <InteractiveMap
+                key={`preview-${previewCoords.latitude.toFixed(5)}-${previewCoords.longitude.toFixed(5)}`}
+                isDarkMode={isDarkMode}
+                initialZoom={14}
+                initialRegion={{
+                  latitude: previewCoords.latitude,
+                  longitude: previewCoords.longitude,
+                  latitudeDelta: 0.024,
+                  longitudeDelta: 0.024,
+                }}
+                destinationMarker={previewCoords}
+                destinationTitle={previewTitle}
+                style={StyleSheet.absoluteFill}
+              />
+            </View>
+
+            {/* Tarjeta de Información de la Dirección o Destino */}
+            <View
+              style={[
+                styles.addressCard,
+                {
+                  backgroundColor: currentTheme.cardBackground,
+                  borderColor: isDarkMode ? '#1E293B' : currentTheme.cardBorder,
+                },
+              ]}
+            >
+              <Text
+                style={[styles.addressAliasText, { color: currentTheme.textPrimary }]}
+                numberOfLines={1}
+              >
+                {previewTitle}
+              </Text>
+              <Text
+                style={[styles.addressDetailText, { color: currentTheme.textSecondary }]}
+                numberOfLines={2}
+              >
+                {previewSubtitle}
+              </Text>
+            </View>
+
+            {/* Pregunta clara de confirmación */}
+            <Text
+              style={[styles.confirmPromptText, { color: currentTheme.textPrimary }]}
+              accessibilityLiveRegion="polite"
+            >
+              {confirmQuestion}
+            </Text>
+
+            {/* Controles Multimodales: Botón Micrófono central + Botones táctiles Sí / No */}
+            <View style={styles.confirmationControlsRow}>
+              {/* Botón táctil Sí */}
+              <TouchableOpacity
+                style={[
+                  styles.decisionTouchButton,
+                  {
+                    backgroundColor: isDarkMode ? '#14532D' : '#DCFCE7',
+                    borderColor: '#22C55E',
+                  },
+                ]}
+                onPress={() => handleProcessInput('sí')}
+                activeOpacity={0.8}
+                accessibilityRole="button"
+                accessibilityLabel={confirmButtonLabel}
+                accessibilityHint={confirmButtonHint}
+              >
+                <Ionicons name={confirmButtonIcon as any} size={26} color="#22C55E" />
+                <Text
+                  style={[
+                    styles.decisionTouchText,
+                    { color: isDarkMode ? '#4ADE80' : '#15803D' },
+                  ]}
+                >
+                  {confirmButtonLabel}
+                </Text>
+              </TouchableOpacity>
+
+              {/* Micrófono central accesible */}
+              <View style={styles.miniMicWrapper}>
+                <Animated.View
+                  style={[
+                    styles.miniGlowHalo,
+                    {
+                      backgroundColor: getHaloColor(),
+                      opacity: haloOpacityAnim,
+                      transform: [{ scale: pulseAnim }],
+                    },
+                  ]}
+                  pointerEvents="none"
+                />
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={handleVoicePress}
+                  style={[
+                    styles.miniMicButton,
+                    {
+                      backgroundColor: getButtonColor(),
+                      shadowColor: getButtonColor(),
+                    },
+                  ]}
+                  accessibilityLabel="Botón de micrófono para hablar"
+                  accessibilityRole="button"
+                >
+                  {voiceState === 'processing' ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Ionicons name={getButtonIcon()} size={36} color="#FFFFFF" />
+                  )}
+                </TouchableOpacity>
+              </View>
+
+              {/* Botón táctil No / Cancelar */}
+              <TouchableOpacity
+                style={[
+                  styles.decisionTouchButton,
+                  {
+                    backgroundColor: isDarkMode ? '#450A0A' : '#FEE2E2',
+                    borderColor: '#EF4444',
+                  },
+                ]}
+                onPress={() => handleProcessInput('no')}
+                activeOpacity={0.8}
+                accessibilityRole="button"
+                accessibilityLabel={rejectButtonLabel}
+                accessibilityHint={rejectButtonHint}
+              >
+                <Ionicons name="close-circle" size={26} color="#EF4444" />
+                <Text
+                  style={[
+                    styles.decisionTouchText,
+                    { color: isDarkMode ? '#F87171' : '#B91C1C' },
+                  ]}
+                >
+                  {rejectButtonLabel}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Subtexto aclaratorio */}
             <Text
               style={[
-                styles.greetingText,
+                styles.voiceOrTouchHint,
                 { color: currentTheme.textSecondary },
               ]}
             >
-              HOLA, {userName.toUpperCase()}
+              Hable al micrófono o presione una opción
             </Text>
-          </Animated.View>
+          </View>
+        ) : (
+          /* Centro de la pantalla: One-Button UI pura con botón central dominante */
+          <View style={styles.centerContainer}>
+            {/* T-1.1: Saludo temporal autodesvanecible tras 4 segundos */}
+            <Animated.View style={{ opacity: greetingOpacityAnim }}>
+              <Text
+                style={[
+                  styles.greetingText,
+                  { color: currentTheme.textSecondary },
+                ]}
+              >
+                HOLA, {userName.toUpperCase()}
+              </Text>
+            </Animated.View>
 
-          {/* Mensaje de estado accesible WCAG AAA */}
-          <Text
-            style={[
-              styles.statusPrompt,
-              { color: currentTheme.textPrimary },
-            ]}
-            accessibilityLiveRegion="polite"
-            accessibilityRole="header"
-          >
-            {getStatusText()}
-          </Text>
-
-          {/* Instrucción clara de orientación */}
-          <Text
-            style={[
-              styles.instructionHint,
-              { color: currentTheme.textSecondary },
-            ]}
-            numberOfLines={2}
-          >
-            {getInstructionHint()}
-          </Text>
-
-          {/* T-1.3: Botón Gigante del Micrófono (144dp) con sistema cromático y ondas concéntricas */}
-          <View style={styles.micButtonWrapper}>
-            {/* Primera onda concéntrica / halo animado */}
-            <Animated.View
+            {/* Mensaje de estado accesible WCAG AAA */}
+            <Text
               style={[
-                styles.glowHalo,
-                {
-                  backgroundColor: getHaloColor(),
-                  opacity: haloOpacityAnim,
-                  transform: [{ scale: pulseAnim }],
-                },
+                styles.statusPrompt,
+                { color: currentTheme.textPrimary },
               ]}
-              pointerEvents="none"
-            />
+              accessibilityLiveRegion="polite"
+              accessibilityRole="header"
+            >
+              {getStatusText()}
+            </Text>
 
-            {/* Segunda onda concéntrica animada al escuchar */}
-            {voiceState === 'listening' && (
+            {/* Instrucción clara de orientación */}
+            <Text
+              style={[
+                styles.instructionHint,
+                { color: currentTheme.textSecondary },
+              ]}
+              numberOfLines={2}
+            >
+              {getInstructionHint()}
+            </Text>
+
+            {/* T-1.3: Botón Gigante del Micrófono (144dp) con sistema cromático y ondas concéntricas */}
+            <View style={styles.micButtonWrapper}>
+              {/* Primera onda concéntrica / halo animado */}
               <Animated.View
                 style={[
                   styles.glowHalo,
                   {
                     backgroundColor: getHaloColor(),
-                    opacity: Animated.multiply(haloOpacityAnim, 0.7),
-                    transform: [{ scale: pulseAnim2 }],
+                    opacity: haloOpacityAnim,
+                    transform: [{ scale: pulseAnim }],
                   },
                 ]}
                 pointerEvents="none"
               />
-            )}
 
-            {/* Botón circular táctil sin texto de alto contraste */}
-            <TouchableOpacity
-              activeOpacity={0.85}
-              onPress={handleVoicePress}
-              style={[
-                styles.micButton,
-                {
-                  backgroundColor: getButtonColor(),
-                  shadowColor: getButtonColor(),
-                },
-              ]}
-              accessibilityLabel="Botón principal de micrófono"
-              accessibilityHint="Presione para hablar y solicitar su viaje"
-              accessibilityRole="button"
-            >
-              {voiceState === 'processing' ? (
-                <ActivityIndicator
-                  size="large"
-                  color="#FFFFFF"
-                  style={{ transform: [{ scale: 1.6 }] }}
-                />
-              ) : (
-                <Ionicons
-                  name={getButtonIcon()}
-                  size={68}
-                  color="#FFFFFF"
+              {/* Segunda onda concéntrica animada al escuchar */}
+              {voiceState === 'listening' && (
+                <Animated.View
+                  style={[
+                    styles.glowHalo,
+                    {
+                      backgroundColor: getHaloColor(),
+                      opacity: Animated.multiply(haloOpacityAnim, 0.7),
+                      transform: [{ scale: pulseAnim2 }],
+                    },
+                  ]}
+                  pointerEvents="none"
                 />
               )}
-            </TouchableOpacity>
+
+              {/* Botón circular táctil sin texto de alto contraste */}
+              <TouchableOpacity
+                activeOpacity={0.85}
+                onPress={handleVoicePress}
+                style={[
+                  styles.micButton,
+                  {
+                    backgroundColor: getButtonColor(),
+                    shadowColor: getButtonColor(),
+                  },
+                ]}
+                accessibilityLabel="Botón principal de micrófono"
+                accessibilityHint="Presione para hablar y solicitar su viaje"
+                accessibilityRole="button"
+              >
+                {voiceState === 'processing' ? (
+                  <ActivityIndicator
+                    size="large"
+                    color="#FFFFFF"
+                    style={{ transform: [{ scale: 1.6 }] }}
+                  />
+                ) : (
+                  <Ionicons
+                    name={getButtonIcon()}
+                    size={68}
+                    color="#FFFFFF"
+                  />
+                )}
+              </TouchableOpacity>
+            </View>
           </View>
-        </View>
+        )}
 
         {/* Espaciador inferior */}
-        <View style={styles.bottomSpacer} />
+        {!isConfirmingAddress && <View style={styles.bottomSpacer} />}
       </SafeAreaView>
 
       {/* Requerimiento 3: Pantalla / Indicador de Carga Gerontológico */}
@@ -909,5 +1346,114 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     textAlign: 'center',
     lineHeight: 28,
+  },
+  confirmingContainer: {
+    flex: 1,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 16,
+    justifyContent: 'space-between',
+  },
+  previewHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginVertical: 4,
+  },
+  previewHeaderText: {
+    fontSize: 16,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+  },
+  mapPreviewCard: {
+    flex: 1,
+    minHeight: 200,
+    maxHeight: 280,
+    borderRadius: 20,
+    borderWidth: 2,
+    overflow: 'hidden',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+    elevation: 5,
+    marginVertical: 6,
+  },
+  addressCard: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    marginVertical: 4,
+  },
+  addressAliasText: {
+    fontSize: 18,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginBottom: 2,
+  },
+  addressDetailText: {
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  confirmPromptText: {
+    fontSize: 20,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginVertical: 4,
+  },
+  confirmationControlsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+    marginVertical: 6,
+  },
+  decisionTouchButton: {
+    flex: 1,
+    height: 60,
+    borderRadius: 16,
+    borderWidth: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginHorizontal: 4,
+  },
+  decisionTouchText: {
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 2,
+    textAlign: 'center',
+  },
+  miniMicWrapper: {
+    width: 88,
+    height: 88,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginHorizontal: 4,
+  },
+  miniGlowHalo: {
+    position: 'absolute',
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+  },
+  miniMicButton: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.45,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  voiceOrTouchHint: {
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+    marginTop: 2,
   },
 });

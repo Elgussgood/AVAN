@@ -44,8 +44,8 @@ export interface HomeScreenProps {
   steps?: StepInstruction[];
   remainingDistance?: number;
   remainingDuration?: number;
-  onCancelTrip?: () => void;
-  onStopTrip?: () => void;
+  onCancelTrip?: (contextToPass?: ConversationContext) => void;
+  onStopTrip?: (contextToPass?: ConversationContext) => void;
   onToggleView?: () => void;
   onSetThemeMode?: (dark: boolean) => void;
   userName?: string;
@@ -54,6 +54,15 @@ export interface HomeScreenProps {
   context?: ConversationContext;
   onContextChange?: (ctx: ConversationContext) => void;
 }
+
+const cleanSpeech = (t: string): string => {
+  return t
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[.,/#!$%^&*;:{}=\-_`~()¿?¡!]/g, '')
+    .trim();
+};
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
   isDarkMode,
@@ -438,7 +447,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   /**
    * Salida forzada inmediata (doble pulsación o pulsación prolongada)
    */
-  const handleForcedExit = async () => {
+  const handleForcedExit = async (contextToPass?: ConversationContext) => {
     if (finishTimeoutRef.current) {
       clearTimeout(finishTimeoutRef.current);
       finishTimeoutRef.current = null;
@@ -448,14 +457,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
     await VoiceService.stop();
     isFinishingTripRef.current = false;
-    const exitFn = onStopTrip || onCancelTrip || (() => {});
-    exitFn();
+    const exitFn = onStopTrip || onCancelTrip;
+    if (exitFn) {
+      exitFn(contextToPass);
+    }
   };
 
   /**
    * Cierre con despedida amable y transición a MinimalHomeScreen
    */
-  const handleCloseTripWithFarewell = async () => {
+  const handleCloseTripWithFarewell = async (contextToPass?: ConversationContext) => {
     if (finishTimeoutRef.current) {
       clearTimeout(finishTimeoutRef.current);
       finishTimeoutRef.current = null;
@@ -472,8 +483,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       isFinishingTripRef.current = false;
       setVoiceState('idle');
       setStatusMessage('');
-      const exitFn = onStopTrip || onCancelTrip || (() => {});
-      exitFn();
+      const exitFn = onStopTrip || onCancelTrip;
+      if (exitFn) {
+        exitFn(contextToPass);
+      }
     });
   };
 
@@ -588,7 +601,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     setVoiceState('processing');
-    setStatusMessage('Procesando destino...');
+    setStatusMessage('Procesando solicitud...');
 
     try {
       const response = await ConversationService.processUserMessage(
@@ -598,6 +611,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       contextRef.current = response.updatedContext;
       if (onContextChange) {
         onContextChange(response.updatedContext);
+      }
+
+      // Si el NLU detectó que se desea registrar una dirección o alias
+      if (
+        response.updatedContext.pendingAliasRegistration ||
+        response.functionCall?.name === 'guardar_ubicacion'
+      ) {
+        isFinishingTripRef.current = false;
+        const exitFn = onStopTrip || onCancelTrip;
+        if (exitFn) {
+          exitFn(response.updatedContext);
+        }
+        return;
       }
 
       // Si el NLU requiere confirmación (Paso 1 del protocolo en 2 pasos) o devuelve una pregunta
@@ -610,37 +636,32 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
           } catch {}
 
-          const started = await AudioRecorderService.startRecording();
-          if (started) {
-            setVoiceState('listening');
-            setStatusMessage('Diga "Sí" o "No"...');
+          setVoiceState('listening');
+          setStatusMessage('Diga "Sí" o "No"...');
 
-            if (finishTimeoutRef.current) {
-              clearTimeout(finishTimeoutRef.current);
-            }
-            finishTimeoutRef.current = setTimeout(async () => {
-              if (AudioRecorderService.isRecording()) {
-                setVoiceState('processing');
-                setStatusMessage('Pensando...');
-                const trans = await AudioRecorderService.stopAndTranscribe();
-                await handleFinishContinuityResponse(trans?.text || '');
-              } else {
-                await handleCloseTripWithFarewell();
-              }
-            }, 8000);
-          } else {
-            await handleCloseTripWithFarewell();
-          }
+          await AudioRecorderService.startRecording({
+            initialSilenceMs: 8000,
+            trailingSilenceMs: 1800,
+            onInitialSilenceTimeout: async () => {
+              await handleCloseTripWithFarewell();
+            },
+            onSpeechEnded: async (trans) => {
+              setVoiceState('processing');
+              setStatusMessage('Pensando...');
+              await handleFinishContinuityResponse(trans?.text || '');
+            },
+          });
         });
         return;
       }
 
-      // Si ya vino confirmado
-      if (response.functionCall?.name === 'confirmar_viaje') {
+      // Si ya vino confirmado o como navegar_a
+      if (response.functionCall?.name === 'confirmar_viaje' || response.functionCall?.name === 'navegar_a') {
         const confirmedDest =
           response.functionCall.args.destino ||
           response.updatedContext.activeRoute?.destination ||
           clean;
+        isFinishingTripRef.current = false;
         await startNavigationToDestination(confirmedDest);
         return;
       }
@@ -654,6 +675,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       const dest =
         response.updatedContext.activeRoute?.destination ||
         clean;
+      isFinishingTripRef.current = false;
       await startNavigationToDestination(dest);
     } catch (err) {
       console.warn('Error al procesar nuevo destino:', err);
@@ -662,7 +684,44 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   };
 
   /**
-   * Evalúa la respuesta del usuario tras la pregunta de continuidad
+   * Escucha continua con VAD durante el diálogo de continuidad de fin/cancelación de viaje
+   */
+  const startFinishContinuityListen = async () => {
+    isFinishingTripRef.current = true;
+    if (finishTimeoutRef.current) {
+      clearTimeout(finishTimeoutRef.current);
+      finishTimeoutRef.current = null;
+    }
+
+    const started = await AudioRecorderService.startRecording({
+      initialSilenceMs: 8000,
+      trailingSilenceMs: 1800,
+      onSpeechDetected: () => {
+        if (finishTimeoutRef.current) {
+          clearTimeout(finishTimeoutRef.current);
+          finishTimeoutRef.current = null;
+        }
+      },
+      onInitialSilenceTimeout: async () => {
+        await handleFinishContinuityResponse('');
+      },
+      onSpeechEnded: async (transcription) => {
+        setVoiceState('processing');
+        setStatusMessage('Procesando...');
+        await handleFinishContinuityResponse(transcription?.text || '');
+      },
+    });
+
+    if (started) {
+      setVoiceState('listening');
+      setStatusMessage('¿Desea viajar a otro lugar?');
+    } else {
+      await handleCloseTripWithFarewell();
+    }
+  };
+
+  /**
+   * Evalúa la respuesta del usuario tras la pregunta de continuidad o fin de viaje
    */
   const handleFinishContinuityResponse = async (speechText: string) => {
     if (finishTimeoutRef.current) {
@@ -670,21 +729,30 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       finishTimeoutRef.current = null;
     }
 
-    const cleanText = speechText.trim().toLowerCase();
+    const cleanText = speechText.trim();
+    if (!cleanText) {
+      await handleCloseTripWithFarewell();
+      return;
+    }
+
+    const normText = cleanSpeech(cleanText);
+    const lowerText = cleanText.toLowerCase();
 
     // Caso A: Hay una confirmación pendiente en 2 pasos
     if (contextRef.current.pendingConfirmation) {
       const pendingDest = contextRef.current.pendingConfirmation.destination;
 
-      // Si responde cancelando o rechazando
+      // Si responde cancelando o rechazando (tolerante a signos de puntuación de Whisper)
       if (
-        !cleanText ||
-        cleanText === 'no' ||
-        cleanText.includes('cancelar') ||
-        cleanText.includes('detener') ||
-        cleanText.includes('ya no') ||
-        cleanText.includes('ninguno') ||
-        cleanText.includes('nada')
+        normText === 'no' ||
+        normText === 'no gracias' ||
+        normText === 'cancelar' ||
+        normText === 'cancela' ||
+        normText === 'detener' ||
+        normText === 'deten' ||
+        normText === 'ya no' ||
+        normText === 'ninguno' ||
+        normText === 'nada'
       ) {
         contextRef.current = {
           ...contextRef.current,
@@ -694,9 +762,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         return;
       }
 
-      // Procesar respuesta con ConversationService
+      // Procesar respuesta con ConversationService para permitir salto de contexto
       setVoiceState('processing');
-      setStatusMessage('Confirmando destino...');
+      setStatusMessage('Procesando...');
 
       const response = await ConversationService.processUserMessage(
         speechText,
@@ -707,11 +775,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         onContextChange(response.updatedContext);
       }
 
-      if (response.functionCall?.name === 'confirmar_viaje') {
-        const dest =
-          response.functionCall.args.destino ||
-          pendingDest;
+      if (response.functionCall?.name === 'confirmar_viaje' || response.functionCall?.name === 'navegar_a') {
+        const dest = response.functionCall.args.destino || pendingDest;
+        isFinishingTripRef.current = false;
         await startNavigationToDestination(dest);
+        return;
+      }
+
+      // Salto de contexto hacia guardar ubicación
+      if (
+        response.updatedContext.pendingAliasRegistration ||
+        response.functionCall?.name === 'guardar_ubicacion'
+      ) {
+        isFinishingTripRef.current = false;
+        const exitFn = onStopTrip || onCancelTrip;
+        if (exitFn) {
+          exitFn(response.updatedContext);
+        }
         return;
       }
 
@@ -727,36 +807,74 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       }
 
       // Si fue afirmativo genérico
+      isFinishingTripRef.current = false;
       await startNavigationToDestination(pendingDest);
       return;
     }
 
     // Caso B: Pregunta inicial "¿Desea viajar a algún otro lugar?"
-    // Si responde "No", "Ninguno", o guarda silencio (vacío)
-    if (
-      !cleanText ||
-      cleanText.includes('no') ||
-      cleanText.includes('ningun') ||
-      cleanText.includes('nada') ||
-      cleanText.includes('ninguno') ||
-      cleanText.includes('así está bien') ||
-      cleanText.includes('asi esta bien') ||
-      cleanText.includes('gracias') ||
-      cleanText.includes('ya llegué') ||
-      cleanText.includes('ya llegue')
-    ) {
+    const isAddAddress =
+      normText.includes('guardar') ||
+      normText.includes('registrar') ||
+      normText.includes('agregar') ||
+      normText.includes('nueva direcci') ||
+      normText.includes('otra direcci') ||
+      normText.includes('casa de') ||
+      normText.includes('oficina') ||
+      normText.includes('rancho') ||
+      normText.includes('trabajo');
+
+    // Negación pura (tolerante a puntos finales y variaciones)
+    const isPureRejection =
+      normText === 'no' ||
+      normText === 'no gracias' ||
+      normText === 'no ya no' ||
+      normText === 'nada' ||
+      normText === 'ninguno' ||
+      normText === 'ningun lugar' ||
+      normText === 'ningun' ||
+      normText === 'asi esta bien' ||
+      normText === 'gracias' ||
+      normText === 'ya llegue';
+
+    if (isPureRejection && !isAddAddress) {
       await handleCloseTripWithFarewell();
+      return;
+    }
+
+    // Comandos de tema
+    if (lowerText.includes('modo noche') || lowerText.includes('tema oscuro')) {
+      if (onSetThemeMode) onSetThemeMode(true);
+      else if (!isDarkMode) onToggleTheme();
+      const msg = 'Cambiando a modo noche. ¿Desea viajar a algún otro lugar?';
+      setVoiceState('speaking');
+      setStatusMessage(msg);
+      await VoiceService.speak(msg, async () => {
+        await startFinishContinuityListen();
+      });
+      return;
+    }
+
+    if (lowerText.includes('modo día') || lowerText.includes('modo dia') || lowerText.includes('tema claro')) {
+      if (onSetThemeMode) onSetThemeMode(false);
+      else if (isDarkMode) onToggleTheme();
+      const msg = 'Cambiando a modo día. ¿Desea viajar a algún otro lugar?';
+      setVoiceState('speaking');
+      setStatusMessage(msg);
+      await VoiceService.speak(msg, async () => {
+        await startFinishContinuityListen();
+      });
       return;
     }
 
     // Si responde "Sí" genérico (sin destino todavía)
     if (
-      cleanText === 'sí' ||
-      cleanText === 'si' ||
-      cleanText === 'claro' ||
-      cleanText === 'por favor' ||
-      cleanText === 'sí por favor' ||
-      cleanText === 'si por favor'
+      lowerText === 'sí' ||
+      lowerText === 'si' ||
+      lowerText === 'claro' ||
+      lowerText === 'por favor' ||
+      lowerText === 'sí por favor' ||
+      lowerText === 'si por favor'
     ) {
       setVoiceState('speaking');
       const askWhereMsg = '¿A dónde le gustaría ir?';
@@ -767,21 +885,27 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         } catch {}
 
-        const started = await AudioRecorderService.startRecording();
+        if (finishTimeoutRef.current) {
+          clearTimeout(finishTimeoutRef.current);
+          finishTimeoutRef.current = null;
+        }
+
+        const started = await AudioRecorderService.startRecording({
+          initialSilenceMs: 8000,
+          trailingSilenceMs: 1800,
+          onInitialSilenceTimeout: async () => {
+            await handleCloseTripWithFarewell();
+          },
+          onSpeechEnded: async (trans) => {
+            setVoiceState('processing');
+            setStatusMessage('Procesando...');
+            await handleFinishContinuityResponse(trans?.text || '');
+          },
+        });
+
         if (started) {
           setVoiceState('listening');
           setStatusMessage('Diga su destino...');
-
-          finishTimeoutRef.current = setTimeout(async () => {
-            if (AudioRecorderService.isRecording()) {
-              setVoiceState('processing');
-              setStatusMessage('Procesando...');
-              const trans = await AudioRecorderService.stopAndTranscribe();
-              await handleNewDestination(trans?.text || '');
-            } else {
-              await handleCloseTripWithFarewell();
-            }
-          }, 8000);
         } else {
           await handleCloseTripWithFarewell();
         }
@@ -789,17 +913,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    // Si nombra un nuevo destino directamente (ej. "Zócalo" o "Llévame al Zócalo")
+    // NLU transversal para cualquier otra petición (nuevo destino, registrar dirección, etc.)
     await handleNewDestination(speechText);
   };
 
   /**
-   * T-2.5: Inicia el diálogo de continuidad al finalizar viaje
+   * T-2.5: Inicia el diálogo de continuidad al finalizar o detener viaje
    */
-  const startFinishContinuityDialog = async () => {
+  const startFinishContinuityDialog = async (customMsg?: string) => {
     isFinishingTripRef.current = true;
     setVoiceState('speaking');
-    const finishMsg = `Hemos finalizado el viaje a ${targetDestination}. ¿Desea viajar a algún otro lugar?`;
+    const finishMsg =
+      customMsg ||
+      `Hemos finalizado el viaje a ${targetDestination}. ¿Desea viajar a algún otro lugar?`;
     setStatusMessage(finishMsg);
 
     await VoiceService.speak(finishMsg, async () => {
@@ -807,29 +933,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       } catch {}
 
-      const started = await AudioRecorderService.startRecording();
-      if (started) {
-        setVoiceState('listening');
-        setStatusMessage('¿Desea viajar a otro lugar?');
-
-        if (finishTimeoutRef.current) {
-          clearTimeout(finishTimeoutRef.current);
-        }
-        // Temporizador de 8.0 segundos de tolerancia de silencio
-        finishTimeoutRef.current = setTimeout(async () => {
-          if (AudioRecorderService.isRecording()) {
-            setVoiceState('processing');
-            setStatusMessage('Procesando...');
-            const transcription = await AudioRecorderService.stopAndTranscribe();
-            const speechText = transcription?.text || '';
-            await handleFinishContinuityResponse(speechText);
-          } else {
-            await handleFinishContinuityResponse('');
-          }
-        }, 8000);
-      } else {
-        await handleCloseTripWithFarewell();
-      }
+      await startFinishContinuityListen();
     });
   };
 
@@ -924,24 +1028,62 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    // T-2.5: Iniciar diálogo de continuidad por voz si el usuario pide terminar/finalizar
+    // T-2.5: Iniciar diálogo de continuidad por voz si el usuario pide terminar/finalizar/cancelar o dice "no"
+    const normText = cleanSpeech(cleanText);
     if (
-      lowerText.includes('terminar') ||
-      lowerText.includes('finalizar') ||
-      lowerText.includes('llegamos') ||
-      lowerText.includes('ya llegué') ||
-      lowerText.includes('ya llegue')
+      normText === 'no' ||
+      normText === 'no gracias' ||
+      normText === 'ya no' ||
+      normText === 'cancelar' ||
+      normText === 'cancela' ||
+      normText === 'cancelar viaje' ||
+      normText === 'cancela el viaje' ||
+      normText === 'detener' ||
+      normText === 'deten' ||
+      normText === 'detener viaje' ||
+      normText === 'deten el viaje' ||
+      normText === 'detente' ||
+      normText === 'terminar' ||
+      normText === 'terminar viaje' ||
+      normText === 'finalizar' ||
+      normText === 'finalizar viaje' ||
+      normText === 'alto' ||
+      normText === 'para' ||
+      normText === 'parar' ||
+      normText === 'llegamos' ||
+      normText === 'ya llegue'
     ) {
-      startFinishContinuityDialog();
+      if (navigationVoiceTimeoutRef.current) {
+        clearTimeout(navigationVoiceTimeoutRef.current);
+        navigationVoiceTimeoutRef.current = null;
+      }
+      startFinishContinuityDialog(`Hemos detenido el viaje a ${targetDestination}. ¿Desea viajar a algún otro lugar?`);
       return;
     }
 
-    if (lowerText.includes('cancelar') || lowerText.includes('detener')) {
-      const responseText = 'Cancelando viaje. Volviendo al inicio.';
+    // Comandos de cambio de tema durante la marcha
+    if (lowerText.includes('modo noche') || lowerText.includes('tema oscuro')) {
+      if (onSetThemeMode) onSetThemeMode(true);
+      else if (!isDarkMode) onToggleTheme();
+      const responseText = 'Cambiando a modo noche.';
       setVoiceState('speaking');
       setStatusMessage(responseText);
       await VoiceService.speak(responseText, () => {
-        handleForcedExit();
+        setVoiceState('idle');
+        setStatusMessage('');
+      });
+      return;
+    }
+
+    if (lowerText.includes('modo día') || lowerText.includes('modo dia') || lowerText.includes('tema claro')) {
+      if (onSetThemeMode) onSetThemeMode(false);
+      else if (isDarkMode) onToggleTheme();
+      const responseText = 'Cambiando a modo día.';
+      setVoiceState('speaking');
+      setStatusMessage(responseText);
+      await VoiceService.speak(responseText, () => {
+        setVoiceState('idle');
+        setStatusMessage('');
       });
       return;
     }
@@ -968,10 +1110,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           else if (dir === 'alejar') mapRef.current?.zoomOut();
           else if (dir === 'centrar') mapRef.current?.recenter();
         } else if (response.functionCall.name === 'cancelar') {
-          await VoiceService.speak(response.spokenText);
-          handleForcedExit();
+          startFinishContinuityDialog(`Hemos detenido el viaje a ${targetDestination}. ¿Desea viajar a algún otro lugar?`);
           return;
-        } else if (response.functionCall.name === 'confirmar_viaje') {
+        } else if (response.functionCall.name === 'confirmar_viaje' || response.functionCall.name === 'navegar_a') {
           const confirmedDest =
             response.functionCall.args.destino ||
             response.updatedContext.activeRoute?.destination ||
@@ -982,24 +1123,47 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           await VoiceService.speak(response.spokenText);
           await startNavigationToDestination(confirmedDest);
           return;
+        } else if (
+          response.functionCall.name === 'guardar_ubicacion' ||
+          response.updatedContext.pendingAliasRegistration
+        ) {
+          // Salto de contexto hacia registro de dirección
+          const exitFn = onStopTrip || onCancelTrip;
+          if (exitFn) {
+            exitFn(response.updatedContext);
+          }
+          return;
         }
+      }
+
+      // Si el contexto trae pendingAliasRegistration aunque no haya venido como functionCall directo
+      if (response.updatedContext.pendingAliasRegistration) {
+        const exitFn = onStopTrip || onCancelTrip;
+        if (exitFn) {
+          exitFn(response.updatedContext);
+        }
+        return;
       }
 
       setVoiceState('speaking');
       setStatusMessage('Hablando...');
 
       const lowerSpoken = response.spokenText.toLowerCase();
+      const asksQuestion = response.spokenText.includes('?');
       const isFarewell =
-        lowerSpoken.includes('excelente día') ||
-        lowerSpoken.includes('buen día') ||
-        lowerSpoken.includes('hasta luego') ||
-        lowerSpoken.includes('adiós') ||
-        lowerSpoken.includes('cancelando viaje');
+        !response.shouldAutoListen &&
+        !asksQuestion &&
+        (lowerSpoken.includes('excelente día') ||
+          lowerSpoken.includes('hasta luego') ||
+          lowerSpoken.includes('adiós') ||
+          lowerSpoken.includes('que descanse'));
 
       const needsAutoListen =
-        (Boolean(response.updatedContext.pendingConfirmation) ||
-          response.spokenText.includes('?')) &&
-        !isFarewell;
+        response.shouldAutoListen ??
+        ((Boolean(response.updatedContext.pendingConfirmation) ||
+          Boolean(response.updatedContext.pendingAliasRegistration) ||
+          asksQuestion) &&
+          !isFarewell);
 
       await VoiceService.speak(response.spokenText, async () => {
         if (needsAutoListen) {
@@ -1007,7 +1171,36 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
           } catch {}
 
-          const started = await AudioRecorderService.startRecording();
+          if (navigationVoiceTimeoutRef.current) {
+            clearTimeout(navigationVoiceTimeoutRef.current);
+            navigationVoiceTimeoutRef.current = null;
+          }
+
+          const isDictatingAddress =
+            response.updatedContext.pendingAliasRegistration?.step === 'awaiting_address';
+
+          const started = await AudioRecorderService.startRecording({
+            isDictatingAddress,
+            initialSilenceMs: 8000,
+            trailingSilenceMs: isDictatingAddress ? 2500 : 1800,
+            maxDurationMs: isDictatingAddress ? 25000 : 15000,
+            onSpeechDetected: () => {
+              if (navigationVoiceTimeoutRef.current) {
+                clearTimeout(navigationVoiceTimeoutRef.current);
+                navigationVoiceTimeoutRef.current = null;
+              }
+            },
+            onInitialSilenceTimeout: async () => {
+              setVoiceState('idle');
+              setStatusMessage('');
+            },
+            onSpeechEnded: async (transcription) => {
+              setVoiceState('processing');
+              setStatusMessage('Pensando...');
+              await processNavigationSpeech(transcription?.text || '');
+            },
+          });
+
           if (started) {
             setVoiceState('listening');
             setStatusMessage(
@@ -1015,22 +1208,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 ? 'Diga "Sí" o "No"...'
                 : 'Le escucho...'
             );
-
-            if (navigationVoiceTimeoutRef.current) {
-              clearTimeout(navigationVoiceTimeoutRef.current);
-            }
-            navigationVoiceTimeoutRef.current = setTimeout(async () => {
-              if (AudioRecorderService.isRecording()) {
-                setVoiceState('processing');
-                setStatusMessage('Pensando...');
-                const transcription =
-                  await AudioRecorderService.stopAndTranscribe();
-                await processNavigationSpeech(transcription?.text || '');
-              } else {
-                setVoiceState('idle');
-                setStatusMessage('');
-              }
-            }, 8000);
           } else {
             setVoiceState('idle');
             setStatusMessage('');
@@ -1081,30 +1258,44 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     if (voiceState === 'idle') {
-      setVoiceState('listening');
-      setStatusMessage('Le escucho...');
+      if (navigationVoiceTimeoutRef.current) {
+        clearTimeout(navigationVoiceTimeoutRef.current);
+        navigationVoiceTimeoutRef.current = null;
+      }
 
-      const started = await AudioRecorderService.startRecording();
+      const isDictatingAddress =
+        contextRef.current.pendingAliasRegistration?.step === 'awaiting_address';
+
+      const started = await AudioRecorderService.startRecording({
+        isDictatingAddress,
+        initialSilenceMs: 8000,
+        trailingSilenceMs: isDictatingAddress ? 2500 : 1800,
+        maxDurationMs: isDictatingAddress ? 25000 : 15000,
+        onSpeechDetected: () => {
+          if (navigationVoiceTimeoutRef.current) {
+            clearTimeout(navigationVoiceTimeoutRef.current);
+            navigationVoiceTimeoutRef.current = null;
+          }
+        },
+        onInitialSilenceTimeout: async () => {
+          setVoiceState('idle');
+          setStatusMessage('');
+        },
+        onSpeechEnded: async (transcription) => {
+          setVoiceState('processing');
+          setStatusMessage('Pensando...');
+          await processNavigationSpeech(transcription?.text || '');
+        },
+      });
+
       if (!started) {
         setVoiceState('idle');
         setStatusMessage('Error de micrófono');
         return;
       }
 
-      if (navigationVoiceTimeoutRef.current) {
-        clearTimeout(navigationVoiceTimeoutRef.current);
-      }
-
-      // Grabar hasta 6 segundos o hasta que el usuario pulse de nuevo para procesar
-      navigationVoiceTimeoutRef.current = setTimeout(async () => {
-        if (AudioRecorderService.isRecording()) {
-          setVoiceState('processing');
-          setStatusMessage('Pensando...');
-
-          const transcription = await AudioRecorderService.stopAndTranscribe();
-          await processNavigationSpeech(transcription?.text || '');
-        }
-      }, 6000);
+      setVoiceState('listening');
+      setStatusMessage('Le escucho...');
     }
   };
 
@@ -1134,7 +1325,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           <View style={styles.topBar}>
             <TouchableOpacity
               onPress={handleFinalizarPress}
-              onLongPress={handleForcedExit}
+              onLongPress={() => handleForcedExit()}
               delayLongPress={600}
               style={[
                 styles.cancelButton,
