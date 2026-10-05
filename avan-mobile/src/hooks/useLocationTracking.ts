@@ -18,9 +18,11 @@ export function useLocationTracking() {
       if (!isMounted) return;
       setHasPermission(granted);
 
-      const initial = await LocationService.getCurrentLocation();
-      if (!isMounted) return;
-      setUserLocation(initial);
+      // Solo establecer ubicación inicial si ya se cuenta con una posición satelital real verificada
+      if (LocationService.hasRealLocation()) {
+        const initial = await LocationService.getCurrentLocation();
+        if (isMounted) setUserLocation(initial);
+      }
 
       unsubscribe = await LocationService.watchLocationAndHeading((loc) => {
         if (isMounted) {

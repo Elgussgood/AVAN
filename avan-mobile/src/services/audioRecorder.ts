@@ -80,12 +80,16 @@ export class AudioRecorderService {
   private static lastDurationMillis: number = 0;
   private static status: RecordingStatus = 'idle';
 
-  // Monitor VAD (Voice Activity Detection)
+  // Monitor VAD (Voice Activity Detection) adaptativo
   private static vadInterval: ReturnType<typeof setInterval> | null = null;
   private static isSpeechDetected: boolean = false;
   private static speechStartTime: number | null = null;
   private static lastSpeechTime: number | null = null;
   private static recordingStartTime: number = 0;
+  private static noiseFloorDb: number = -45;
+  private static noiseCalibrationSamples: number[] = [];
+  private static consecutiveSpeechFrames: number = 0;
+  private static totalSpeechFrames: number = 0;
 
   /**
    * Detiene el monitor de actividad vocal (VAD).
@@ -95,6 +99,7 @@ export class AudioRecorderService {
       clearInterval(this.vadInterval);
       this.vadInterval = null;
     }
+    this.consecutiveSpeechFrames = 0;
   }
 
   /**
@@ -151,13 +156,22 @@ export class AudioRecorderService {
       this.speechStartTime = null;
       this.lastSpeechTime = null;
       this.recordingStartTime = Date.now();
+      this.noiseFloorDb = -45;
+      this.noiseCalibrationSamples = [];
+      this.consecutiveSpeechFrames = 0;
+      this.totalSpeechFrames = 0;
 
       // Configuración de umbrales y tiempos de VAD
       const isDictating = Boolean(options?.isDictatingAddress);
       const initialSilenceMs = options?.initialSilenceMs ?? 8000;
       const trailingSilenceMs = options?.trailingSilenceMs ?? (isDictating ? 2500 : 1800);
       const maxDurationMs = options?.maxDurationMs ?? (isDictating ? 25000 : 15000);
-      const speechThresholdDb = options?.speechThresholdDb ?? -38;
+
+      // Calibración acústica adaptativa:
+      // - baseSpeechThresholdDb: Mínimo absoluto para considerar voz humana (-32 dB para evitar ruidos de motor o AC a -35 dB)
+      // - snrMarginDb: Margen requerido sobre el piso de ruido ambiental (8 dB)
+      const baseSpeechThresholdDb = options?.speechThresholdDb ?? -32;
+      const snrMarginDb = 8;
 
       this.vadInterval = setInterval(async () => {
         if (!this.recording || !this.isRecordingAudio) {
@@ -176,18 +190,49 @@ export class AudioRecorderService {
           // ignore
         }
 
-        // Si metering está disponible y supera el umbral de voz
+        // Si metering está disponible
         if (typeof metering === 'number') {
-          if (metering >= speechThresholdDb) {
-            if (!this.isSpeechDetected) {
-              this.isSpeechDetected = true;
-              this.speechStartTime = now;
-              console.log(`[AudioRecorderService] VAD: Habla iniciada (nivel: ${metering.toFixed(1)} dB >= ${speechThresholdDb} dB)`);
-              if (options?.onSpeechDetected) {
-                options.onSpeechDetected();
-              }
+          // 1. Calibración continua del piso de ruido ambiental (Noise Floor)
+          if (!this.isSpeechDetected) {
+            if (this.noiseCalibrationSamples.length < 5) {
+              this.noiseCalibrationSamples.push(metering);
+              const sum = this.noiseCalibrationSamples.reduce((a, b) => a + b, 0);
+              this.noiseFloorDb = sum / this.noiseCalibrationSamples.length;
+            } else {
+              // Promedio móvil para seguir variaciones graduales del ruido ambiental (rodadura, ventilación)
+              this.noiseFloorDb = this.noiseFloorDb * 0.92 + metering * 0.08;
             }
-            this.lastSpeechTime = now;
+          }
+
+          // 2. Umbral dinámico adaptado al entorno sonoro actual
+          // La voz debe superar el ruido ambiental por al menos snrMarginDb y no ser menor a baseSpeechThresholdDb
+          const adaptiveThresholdDb = Math.max(
+            baseSpeechThresholdDb,
+            this.noiseFloorDb + snrMarginDb
+          );
+
+          // 3. Verificación de energía con persistencia temporal (Debounce acústico)
+          if (metering >= adaptiveThresholdDb) {
+            this.consecutiveSpeechFrames++;
+            this.totalSpeechFrames++;
+
+            // Requiere al menos 2 frames consecutivos (~200ms) para confirmar habla
+            if (this.consecutiveSpeechFrames >= 2) {
+              if (!this.isSpeechDetected) {
+                this.isSpeechDetected = true;
+                this.speechStartTime = now - (this.consecutiveSpeechFrames * 100);
+                console.log(
+                  `[AudioRecorderService] VAD: Habla confirmada (nivel: ${metering.toFixed(1)} dB >= umbral ${adaptiveThresholdDb.toFixed(1)} dB [ruido base: ${this.noiseFloorDb.toFixed(1)} dB])`
+                );
+                if (options?.onSpeechDetected) {
+                  options.onSpeechDetected();
+                }
+              }
+              this.lastSpeechTime = now;
+            }
+          } else {
+            // El frame actual está por debajo del umbral adaptativo
+            this.consecutiveSpeechFrames = 0;
           }
         }
 
@@ -195,7 +240,27 @@ export class AudioRecorderService {
         if (this.isSpeechDetected && this.lastSpeechTime) {
           const silenceDuration = now - this.lastSpeechTime;
           if (silenceDuration >= trailingSilenceMs) {
-            console.log(`[AudioRecorderService] VAD: Silencio posterior completado (${silenceDuration}ms >= ${trailingSilenceMs}ms). Finalizando captura.`);
+            const speechDuration = (this.lastSpeechTime || now) - (this.speechStartTime || now);
+
+            // Filtro de duración mínima de habla:
+            // Si duró menos de 300ms o menos de 2 frames totales sobre el umbral,
+            // fue un ruido transitorio (bache, roce de ropa, tos lejana, click)
+            if (speechDuration < 300 || this.totalSpeechFrames < 2) {
+              console.log(
+                `[AudioRecorderService] VAD: Ruido transitorio descartado (${speechDuration}ms / ${this.totalSpeechFrames} frames). Reanudando escucha.`
+              );
+              // Resetear estado de habla para que continúe la ventana de escucha normal
+              this.isSpeechDetected = false;
+              this.speechStartTime = null;
+              this.lastSpeechTime = null;
+              this.consecutiveSpeechFrames = 0;
+              this.totalSpeechFrames = 0;
+              return;
+            }
+
+            console.log(
+              `[AudioRecorderService] VAD: Silencio posterior completado (${silenceDuration}ms >= ${trailingSilenceMs}ms, habla acumulada: ${speechDuration}ms). Finalizando captura.`
+            );
             this.stopVADMonitor();
             const transcription = await this.stopAndTranscribe();
             if (options?.onSpeechEnded) {
@@ -245,7 +310,7 @@ export class AudioRecorderService {
    */
   static async stopRecording(): Promise<AudioRecordingResult> {
     try {
-      this.stopVADMonitor();
+      this.resetVADState();
       if (!this.recording) {
         this.isRecordingAudio = false;
         this.status = 'idle';
@@ -412,6 +477,8 @@ export class AudioRecorderService {
             model: resolvedGroqKey ? 'whisper-large-v3-turbo' : 'whisper-1',
             language: 'es',
             response_format: 'json',
+            temperature: '0',
+            prompt: 'Comandos breves de navegación vehicular AVAN en español. Si solo hay silencio, ruido de motor o ambiente de auto, responde exactamente vacío.',
           },
         });
 
@@ -433,6 +500,8 @@ export class AudioRecorderService {
                 model: resolvedGroqKey ? 'whisper-large-v3-turbo' : 'whisper-1',
                 language: 'es',
                 response_format: 'json',
+                temperature: '0',
+                prompt: 'Comandos breves de navegación vehicular AVAN en español. Si solo hay silencio, ruido de motor o ambiente de auto, responde exactamente vacío.',
               },
             });
           }
@@ -443,10 +512,18 @@ export class AudioRecorderService {
 
       if (uploadResult && uploadResult.status >= 200 && uploadResult.status < 300) {
         const data = JSON.parse(uploadResult.body);
-        console.log('[AudioRecorder] Transcripción Whisper:', data.text);
+        const rawText = data.text ? data.text.trim() : '';
+        const sanitizedText = AudioRecorderService.sanitizeWhisperOutput(rawText);
+
+        if (rawText && !sanitizedText) {
+          console.log('[AudioRecorder] Whisper alucinación o ruido filtrado:', rawText);
+        } else {
+          console.log('[AudioRecorder] Transcripción Whisper validada:', sanitizedText);
+        }
+
         this.status = 'idle';
         return {
-          text: data.text ? data.text.trim() : '',
+          text: sanitizedText,
           durationMs,
           isSimulated: false,
         };
@@ -480,7 +557,7 @@ export class AudioRecorderService {
    * Cancela cualquier grabación en curso y libera recursos
    */
   static async cancelRecording(): Promise<void> {
-    this.stopVADMonitor();
+    this.resetVADState();
     let uri: string | null = null;
     try {
       if (this.recording) {
@@ -504,6 +581,84 @@ export class AudioRecorderService {
         await this.deleteAudioFile(uri);
       }
     }
+  }
+
+  /**
+   * Resetea el monitor y contadores de VAD
+   */
+  private static resetVADState(): void {
+    this.stopVADMonitor();
+    this.isSpeechDetected = false;
+    this.speechStartTime = null;
+    this.lastSpeechTime = null;
+    this.consecutiveSpeechFrames = 0;
+    this.totalSpeechFrames = 0;
+    this.noiseCalibrationSamples = [];
+  }
+
+  /**
+   * Filtro anti-alucinaciones para Whisper ante ruido ambiental de cabina / vehículo.
+   * Descarta subtítulos fantasma (Amara, YouTube), emojis musicales y textos sin contenido semántico.
+   */
+  static sanitizeWhisperOutput(text: string): string {
+    if (!text) return '';
+    const trimmed = text.trim();
+
+    // 1. Descartar si solo contiene signos de puntuación, espacios o símbolos
+    const cleanChars = trimmed.replace(/[\s\.,!\?¿¡\-_:;~…\(\)\[\]"'\*`«»“”]/g, '');
+    if (!cleanChars) {
+      return '';
+    }
+
+    const lower = trimmed.toLowerCase();
+
+    // 2. Patrones conocidos de alucinaciones de Whisper sobre ruido de fondo
+    const hallucinationPatterns = [
+      'amara.org',
+      'subtítulos realizados por',
+      'subtitulado por',
+      'subtitulos por',
+      'comunidad de amara',
+      'gracias por ver',
+      'suscríbete',
+      'suscribete',
+      'suscríbanse',
+      'suscribanse',
+      'dale like',
+      'canal de youtube',
+      'transcripción por',
+      'transcripcion por',
+      'continuará',
+      'continuara',
+      '[música]',
+      '[musica]',
+      '(música)',
+      '(musica)',
+      '[silencio]',
+      '(silencio)',
+      '[sonido de fondo]',
+      '[aplausos]',
+      '[risas]',
+      '♪',
+      '♫',
+    ];
+
+    for (const pattern of hallucinationPatterns) {
+      if (lower.includes(pattern)) {
+        return '';
+      }
+    }
+
+    // 3. Descartar repeticiones patológicas (ej. "sí, sí, sí, sí, sí" o "no no no no no") producidas por bucles autoregresivos
+    const words = lower.split(/\s+/).filter((w) => w.length > 0);
+    if (words.length >= 4) {
+      const allSame = words.every((w) => w === words[0]);
+      if (allSame) {
+        return '';
+      }
+    }
+
+    return trimmed;
   }
 
   static isRecording(): boolean {

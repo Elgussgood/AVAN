@@ -98,6 +98,45 @@ export function getMinDistanceToPolyline(
 }
 
 /**
+ * Obtiene la polilínea restante desde la posición actual del vehículo hacia el destino.
+ * Recorta en tiempo real los segmentos ya transitados para que la línea no persista detrás del auto.
+ */
+export function getRemainingPolyline(
+  currentPos: Coordinates,
+  polyline: Coordinates[],
+  currentIndex?: number
+): Coordinates[] {
+  if (!polyline || polyline.length === 0) return [];
+  if (polyline.length === 1) return polyline;
+
+  // Si se provee un índice explícito (ej. simulador cinemático)
+  if (typeof currentIndex === 'number' && currentIndex >= 0) {
+    const validIdx = Math.min(currentIndex, polyline.length - 1);
+    return [
+      { latitude: currentPos.latitude, longitude: currentPos.longitude },
+      ...polyline.slice(validIdx + 1),
+    ];
+  }
+
+  // En navegación GPS real: encontrar el segmento más cercano a la posición del vehículo
+  let closestSegmentIndex = 0;
+  let minDist = Infinity;
+
+  for (let i = 0; i < polyline.length - 1; i++) {
+    const d = distanceToSegmentMeters(currentPos, polyline[i], polyline[i + 1]);
+    if (d < minDist) {
+      minDist = d;
+      closestSegmentIndex = i;
+    }
+  }
+
+  return [
+    { latitude: currentPos.latitude, longitude: currentPos.longitude },
+    ...polyline.slice(closestSegmentIndex + 1),
+  ];
+}
+
+/**
  * Mapea códigos de maniobra de OpenRouteService a iconos comprensibles de Ionicons.
  */
 export function getManeuverIconName(type?: number): keyof typeof Ionicons.glyphMap {
@@ -160,6 +199,7 @@ export class NavigationService {
   static getDistanceMeters = getDistanceMeters;
   static getBearing = getBearing;
   static getMinDistanceToPolyline = getMinDistanceToPolyline;
+  static getRemainingPolyline = getRemainingPolyline;
   static formatDistance = formatDistance;
   static formatDuration = formatDuration;
   static getManeuverIconName = getManeuverIconName;

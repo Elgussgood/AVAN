@@ -37,6 +37,8 @@ export interface RouteResult {
   isFallback?: boolean;
 }
 
+import { CDMX_TRANSPORT_POIS } from '../data/cdmxTransportPois';
+
 // Destinos predefinidos y puntos de interés de referencia en CDMX y área metropolitana
 const FALLBACK_DESTINATIONS: (GeocodeResult & { keywords: string[] })[] = [
   {
@@ -194,6 +196,97 @@ const FALLBACK_DESTINATIONS: (GeocodeResult & { keywords: string[] })[] = [
     keywords: ['angeles pedregal', 'ángeles pedregal', 'hospital angeles', 'hospital ángeles'],
   },
 ];
+
+/**
+ * Traduce maniobras de OSRM a instrucciones en español natural para AVAN.
+ */
+function translateOsrmManeuver(m: any, streetName: string): { instruction: string; type: number } {
+  const typeStr = m?.type || '';
+  const modifier = m?.modifier || '';
+  const targetStreet = streetName ? `"${streetName}"` : 'la vía principal';
+
+  if (typeStr === 'depart') {
+    return {
+      instruction: streetName ? `Inicie su recorrido por ${targetStreet}` : 'Inicie su recorrido por la ruta indicada',
+      type: 11, // Depart
+    };
+  }
+  if (typeStr === 'arrive') {
+    return {
+      instruction: 'Ha llegado a su destino',
+      type: 10, // Arrive
+    };
+  }
+  if (typeStr === 'roundabout' || typeStr === 'rotary') {
+    return {
+      instruction: `En la rotonda, tome la salida hacia ${targetStreet}`,
+      type: 7, // Roundabout
+    };
+  }
+  if (modifier === 'uturn') {
+    return {
+      instruction: `Dé vuelta en U hacia ${targetStreet}`,
+      type: 9, // U-turn
+    };
+  }
+  if (modifier.includes('right')) {
+    const isSlight = modifier.includes('slight');
+    const isSharp = modifier.includes('sharp');
+    return {
+      instruction: isSharp
+        ? `Gire pronunciadamente a la derecha en ${targetStreet}`
+        : isSlight
+        ? `Gire levemente a la derecha hacia ${targetStreet}`
+        : `Gire a la derecha en ${targetStreet}`,
+      type: 1, // Turn right
+    };
+  }
+  if (modifier.includes('left')) {
+    const isSlight = modifier.includes('slight');
+    const isSharp = modifier.includes('sharp');
+    return {
+      instruction: isSharp
+        ? `Gire pronunciadamente a la izquierda en ${targetStreet}`
+        : isSlight
+        ? `Gire levemente a la izquierda hacia ${targetStreet}`
+        : `Gire a la izquierda en ${targetStreet}`,
+      type: 0, // Turn left
+    };
+  }
+  if (modifier === 'straight' || typeStr === 'continue' || typeStr === 'new name') {
+    return {
+      instruction: streetName ? `Continúe recto por ${targetStreet}` : 'Continúe recto por la vía',
+      type: 6, // Straight
+    };
+  }
+  if (typeStr === 'on ramp' || typeStr === 'merge') {
+    return {
+      instruction: `Incorpórese a ${targetStreet}`,
+      type: 6,
+    };
+  }
+  if (typeStr === 'off ramp' || typeStr === 'fork') {
+    return {
+      instruction: modifier.includes('left')
+        ? `Tome la salida a la izquierda hacia ${targetStreet}`
+        : `Tome la salida a la derecha hacia ${targetStreet}`,
+      type: modifier.includes('left') ? 0 : 1,
+    };
+  }
+  if (typeStr === 'end of road') {
+    return {
+      instruction: modifier.includes('left')
+        ? `Al final de la calle, gire a la izquierda en ${targetStreet}`
+        : `Al final de la calle, gire a la derecha en ${targetStreet}`,
+      type: modifier.includes('left') ? 0 : 1,
+    };
+  }
+
+  return {
+    instruction: streetName ? `Continúe hacia ${targetStreet}` : 'Continúe recto por la ruta',
+    type: 6,
+  };
+}
 
 export class OpenRouteService {
   private apiKey: string;
@@ -540,7 +633,7 @@ export class OpenRouteService {
   }
 
   /**
-   * Búsqueda semántica y difusa en el catálogo curado de landmarks de CDMX
+   * Búsqueda semántica y de alta fidelidad en el catálogo curado de transporte y landmarks de CDMX (Tier 0)
    */
   private searchFallbackDestinations(query: string): GeocodeResult[] {
     const normalize = (t: string) =>
@@ -551,6 +644,48 @@ export class OpenRouteService {
         .trim();
 
     const qNorm = normalize(query);
+    if (!qNorm) return [];
+
+    // Limpieza de términos comunes de transporte para match flexible ("metro politécnico" -> "politecnico")
+    const cleanTransportQuery = qNorm
+      .replace(/^(?:el\s+|la\s+)?(?:metro|estacion|estación|paradero|terminal|tren|suburbano|metrobus|metrobús)\s+/i, '')
+      .replace(/\s+(?:linea|línea)\s+\w+$/i, '')
+      .trim();
+
+    // 1. Búsqueda en catálogo exhaustivo de transporte público con puntuación de relevancia
+    const scoredTransportMatches = CDMX_TRANSPORT_POIS.map((poi) => {
+      const nameNorm = normalize(poi.name);
+      const labelNorm = normalize(poi.label);
+      let score = 0;
+
+      // Coincidencia exacta con el nombre o con "metro [consulta]"
+      if (nameNorm === qNorm || nameNorm === `metro ${cleanTransportQuery}`) {
+        score = 100;
+      } else if (poi.aliases.some((alias) => normalize(alias) === qNorm || normalize(alias) === cleanTransportQuery)) {
+        score = 95;
+      } else if (nameNorm.includes(cleanTransportQuery) || (cleanTransportQuery.length > 3 && cleanTransportQuery.includes(nameNorm))) {
+        score = 80;
+      } else if (poi.aliases.some((alias) => normalize(alias).includes(cleanTransportQuery) || (cleanTransportQuery.length > 3 && cleanTransportQuery.includes(normalize(alias))))) {
+        score = 70;
+      } else if (labelNorm.includes(cleanTransportQuery)) {
+        score = 20;
+      }
+
+      return { poi, score };
+    })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    if (scoredTransportMatches.length > 0 && scoredTransportMatches[0].score >= 70) {
+      return scoredTransportMatches.map((item) => ({
+        id: item.poi.id,
+        name: item.poi.name,
+        label: item.poi.label,
+        coordinates: item.poi.coordinates,
+      }));
+    }
+
+    // 2. Búsqueda en catálogo curado de landmarks y puntos de interés emblemáticos
     const qTokens = qNorm.split(/\s+/).filter((t) => t.length > 2);
 
     const matches = FALLBACK_DESTINATIONS.filter((item) => {
@@ -584,15 +719,107 @@ export class OpenRouteService {
   }
 
   /**
-   * Calcula la ruta vehicular entre dos coordenadas usando ORS driving-car.
-   * Retorna las coordenadas GeoJSON para Polyline y las maniobras paso a paso.
+   * Tier 2: Cálculo de ruta con OSRM (Open Source Routing Machine).
+   * 100% gratuito, ultra-rápido (<600ms), sin API key, con geometría de calles reales de OpenStreetMap.
+   */
+  private async getOsrmDirections(
+    start: Coordinates,
+    destination: Coordinates
+  ): Promise<RouteResult | null> {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+
+      const url = `https://router.project-osrm.org/route/v1/driving/${start.longitude},${start.latitude};${destination.longitude},${destination.latitude}?overview=full&geometries=geojson&steps=true`;
+
+      const response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        console.warn('[orsService] OSRM respondió con código:', response.status);
+        return null;
+      }
+
+      const data = await response.json();
+      if (data.code !== 'Ok' || !data.routes || !data.routes[0]) {
+        console.warn('[orsService] OSRM no devolvió rutas válidas:', data.code);
+        return null;
+      }
+
+      const route = data.routes[0];
+      const rawCoords: [number, number][] = route.geometry?.coordinates || [];
+      if (rawCoords.length < 2) {
+        return null;
+      }
+
+      const coordinates: Coordinates[] = rawCoords.map(([lng, lat]) => ({
+        latitude: lat,
+        longitude: lng,
+      }));
+
+      const osrmSteps = route.legs?.[0]?.steps || [];
+      const steps: StepInstruction[] = [];
+
+      let currentCoordIndex = 0;
+      for (let i = 0; i < osrmSteps.length; i++) {
+        const s = osrmSteps[i];
+        const stepCoordsCount = s.geometry?.coordinates?.length || 2;
+        const startIndex = currentCoordIndex;
+        const endIndex = Math.min(coordinates.length - 1, startIndex + Math.max(0, stepCoordsCount - 1));
+        currentCoordIndex = endIndex;
+
+        const streetName = s.name ? s.name.trim() : '';
+        const { instruction, type } = translateOsrmManeuver(s.maneuver, streetName);
+
+        steps.push({
+          instruction,
+          distance: Math.round(s.distance || 0),
+          duration: Math.round(s.duration || 0),
+          type,
+          name: streetName,
+          wayPoints: [startIndex, endIndex],
+        });
+      }
+
+      console.log(
+        `[orsService] Ruta vehicular calculada con Tier 2 OSRM: ${(route.distance / 1000).toFixed(2)} km, ${Math.round(route.duration / 60)} min, ${coordinates.length} puntos de calle.`
+      );
+
+      return {
+        coordinates,
+        distance: Math.round(route.distance || 0),
+        duration: Math.round(route.duration || 0),
+        steps,
+        bbox: [
+          Math.min(start.longitude, destination.longitude),
+          Math.min(start.latitude, destination.latitude),
+          Math.max(start.longitude, destination.longitude),
+          Math.max(start.latitude, destination.latitude),
+        ],
+        isFallback: false,
+      };
+    } catch (err: any) {
+      console.warn('[orsService] Error al consultar Tier 2 OSRM:', err.message || err);
+      return null;
+    }
+  }
+
+  /**
+   * Calcula la ruta vehicular entre dos coordenadas usando arquitectura Multi-Tier:
+   * 1. Tier 1: OpenRouteService oficial (con timeout de 3.5s).
+   * 2. Tier 2: OSRM (Open Source Routing Machine, gratuito, rápido, con geometría de calles reales).
+   * 3. Tier 3: Fallback de emergencia local si no hay conexión a internet.
    */
   public async getDirections(
     start: Coordinates,
     destination: Coordinates
   ): Promise<RouteResult> {
+    // Tier 1: OpenRouteService (si hay API key configurada)
     if (this.apiKey) {
       try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3500);
+
         const body = {
           coordinates: [
             [start.longitude, start.latitude],
@@ -614,8 +841,10 @@ export class OpenRouteService {
               Accept: 'application/json, application/geo+json',
             },
             body: JSON.stringify(body),
+            signal: controller.signal,
           }
         );
+        clearTimeout(timeout);
 
         if (response.ok) {
           const data = await response.json();
@@ -649,6 +878,10 @@ export class OpenRouteService {
               }
             });
 
+            console.log(
+              `[orsService] Ruta vehicular calculada con Tier 1 ORS: ${(summary.distance / 1000).toFixed(2)} km, ${coordinates.length} puntos.`
+            );
+
             return {
               coordinates,
               distance: summary.distance || 0,
@@ -658,13 +891,23 @@ export class OpenRouteService {
               isFallback: false,
             };
           }
+        } else {
+          console.warn('[orsService] Tier 1 ORS devolvió status:', response.status, response.statusText);
         }
-      } catch (error) {
-        console.warn('OpenRouteService directions error, recurriendo a fallback:', error);
+      } catch (error: any) {
+        console.warn('[orsService] Tier 1 ORS falló o excedió timeout de 3.5s:', error.message || error);
       }
     }
 
-    // Fallback realista para desarrollo
+    // Tier 2: OSRM (Open Source Routing Machine con calles reales de OSM)
+    console.log('[orsService] Consultando Tier 2 (OSRM con geometría de calles reales)...');
+    const osrmResult = await this.getOsrmDirections(start, destination);
+    if (osrmResult) {
+      return osrmResult;
+    }
+
+    // Tier 3: Fallback de emergencia local si no hay conexión a internet
+    console.warn('[orsService] Recurriendo a Tier 3 (Ruta de emergencia local)');
     return this.generateFallbackRoute(start, destination);
   }
 

@@ -44,9 +44,10 @@ export interface UserLocation {
 }
 
 export interface InteractiveMapRef {
-  zoomIn: () => void;
-  zoomOut: () => void;
-  recenter: () => void;
+  zoomIn: (intensity?: 'normal' | 'mucho' | 'poco') => void;
+  zoomOut: (intensity?: 'normal' | 'mucho' | 'poco') => void;
+  setZoom: (zoom: number) => void;
+  recenter: (zoom?: number) => void;
   animateToRegion: (region: Region, duration?: number) => void;
   fitToCoordinates: (
     coordinates: LatLng[],
@@ -67,6 +68,8 @@ export interface InteractiveMapProps {
   initialRegion?: Region;
   initialZoom?: number;
   followUser?: boolean;
+  autoFitRoute?: boolean;
+  onUserInteraction?: () => void;
   onRegionChangeComplete?: (region: Region) => void;
   onMapPress?: () => void;
   style?: StyleProp<ViewStyle>;
@@ -80,16 +83,22 @@ const DEFAULT_REGION: Region = {
 };
 
 /**
- * Genera el documento HTML que ejecuta Leaflet.js con:
- * 1. OpenStreetMap 100% libre sin marca de agua por defecto (con filtro dark mode nocturno).
- * 2. Si el usuario cuenta con EXPO_PUBLIC_CARTO_API_KEY, usa las capas oficiales de CartoDB sin marcas de agua.
+ * Genera el documento HTML que ejecuta MapLibre GL JS v4 con aceleración WebGL:
+ * 1. Estilo vectorial libre sin clave (OpenFreeMap Positron para Día y Dark para Noche).
+ * 2. Paleta cromática adaptada a los mockups de AVAN:
+ *    - Día: fondo #F1F4F7, calles #FFFFFF con contorno limpio, parques verdes #D5ECD5.
+ *    - Noche: fondo #0B111D, vías #172238 con sutil borde #20334C, áreas verdes oscuras #0E232E.
+ * 3. Rotación nativa con bearing de cámara en aceleración GPU de 60 FPS (POV conductor).
+ * 4. Inclinación pitch a 45° en navegación activa estilo Google Maps.
+ * 5. Fallback automático a teselas ráster de CartoDB si hay interrupción en la carga vectorial.
  */
-function generateLeafletHtml(
+function generateMapLibreHtml(
   initialLat: number,
   initialLng: number,
   isDarkMode: boolean,
   cartoApiKey: string,
-  initialZoom: number = 14
+  initialZoom: number = 14,
+  autoFitRoute: boolean = false
 ): string {
   const bgColor = isDarkMode ? '#0B111D' : '#F1F4F7';
 
@@ -98,7 +107,7 @@ function generateLeafletHtml(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
   <style>
     * {
       margin: 0;
@@ -113,38 +122,51 @@ function generateLeafletHtml(
       background-color: ${bgColor};
       overflow: hidden;
     }
-    .leaflet-container {
+    .maplibregl-map {
       background-color: ${bgColor} !important;
     }
-    .custom-div-icon {
+    .maplibregl-canvas {
+      outline: none;
+    }
+    .custom-marker {
       background: transparent !important;
       border: none !important;
+      cursor: pointer;
     }
-    /* Filtro nocturno de alto contraste para teselas libres de OpenStreetMap */
-    .dark-tiles .leaflet-tile {
-      filter: brightness(0.65) invert(1) contrast(1.35) hue-rotate(195deg) saturate(0.35) !important;
+    /* Ocultar atribuciones intrusivas para mantener la pantalla 100% despejada para adultos mayores */
+    .maplibregl-ctrl-attrib {
+      display: none !important;
     }
   </style>
 </head>
 <body>
   <div id="map"></div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script>
     (function() {
       var map = null;
-      var tileLayer = null;
       var userMarker = null;
-      var routeGlowPolyline = null;
-      var routeMainPolyline = null;
       var destinationMarker = null;
+      var isMapLoaded = false;
+      var styleFallbackActive = false;
       var currentThemeDark = ${isDarkMode ? 'true' : 'false'};
+      var activeLoadedTheme = ${isDarkMode ? "'dark'" : "'light'"};
 
       var hasCartoKey = ${cartoApiKey ? 'true' : 'false'};
       var CARTO_KEY = ${JSON.stringify(cartoApiKey)};
 
-      var DARK_CARTO = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png' + (CARTO_KEY ? '?api_key=' + encodeURIComponent(CARTO_KEY) : '');
-      var LIGHT_CARTO = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png' + (CARTO_KEY ? '?api_key=' + encodeURIComponent(CARTO_KEY) : '');
-      var OSM_TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+      // Estilos vectoriales ultra-limpios de OpenFreeMap (sin claves ni límites)
+      var LIGHT_VECTOR_STYLE = 'https://tiles.openfreemap.org/styles/positron';
+      var DARK_VECTOR_STYLE = 'https://tiles.openfreemap.org/styles/dark';
+
+      // Fallback ráster de CartoDB
+      var DARK_CARTO = 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png' + (CARTO_KEY ? '?api_key=' + encodeURIComponent(CARTO_KEY) : '');
+      var LIGHT_CARTO = 'https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png' + (CARTO_KEY ? '?api_key=' + encodeURIComponent(CARTO_KEY) : '');
+
+      var pendingRouteCoords = null;
+      var pendingDestination = null;
+      var pendingUserLocation = null;
+      var currentSmoothedBearing = null;
 
       function getArrowSvg(heading, isDark) {
         var fill = isDark ? 'transparent' : '#2B5B84';
@@ -154,7 +176,7 @@ function generateLeafletHtml(
           ? 'filter: drop-shadow(0px 0px 8px #00E5FF);'
           : 'filter: drop-shadow(0px 3px 6px rgba(0,0,0,0.35));';
 
-        return '<div id="arrow-rotator" style="width: 56px; height: 56px; display: flex; align-items: center; justify-content: center; transform: rotate(' + heading + 'deg); transform-origin: center center; transition: transform 0.2s ease-out;">'
+        return '<div id="arrow-rotator" style="width: 56px; height: 56px; display: flex; align-items: center; justify-content: center; transform: rotate(' + heading + 'deg); transform-origin: center center; transition: transform 0.35s cubic-bezier(0.25, 0.1, 0.25, 1);">'
           + '<svg width="48" height="48" viewBox="0 0 100 100" style="overflow: visible;">'
           + '<path d="M50 8 L88 88 L50 68 L12 88 Z" fill="' + fill + '" stroke="' + stroke + '" stroke-width="' + strokeW + '" stroke-linejoin="round" stroke-linecap="round" style="' + shadow + '" />'
           + '</svg>'
@@ -176,268 +198,439 @@ function generateLeafletHtml(
           + '</div>';
       }
 
+      function getRasterFallbackStyle(isDark) {
+        var tileUrl = isDark ? DARK_CARTO : LIGHT_CARTO;
+        return {
+          version: 8,
+          sources: {
+            'raster-tiles': {
+              type: 'raster',
+              tiles: [tileUrl],
+              tileSize: 256,
+              attribution: '© CARTO, © OpenStreetMap'
+            }
+          },
+          layers: [
+            {
+              id: 'raster-layer',
+              type: 'raster',
+              source: 'raster-tiles',
+              minzoom: 0,
+              maxzoom: 20
+            }
+          ]
+        };
+      }
+
+      function setupRouteLayers() {
+        if (!map) return;
+
+        var lineCoords = (pendingRouteCoords && pendingRouteCoords.length >= 2)
+          ? pendingRouteCoords.map(function(c) { return [c.longitude, c.latitude]; })
+          : [];
+
+        if (!map.getSource('route-source')) {
+          map.addSource('route-source', {
+            type: 'geojson',
+            data: {
+              type: 'Feature',
+              geometry: {
+                type: 'LineString',
+                coordinates: lineCoords
+              }
+            }
+          });
+        } else {
+          var src = map.getSource('route-source');
+          if (src && lineCoords.length >= 2) {
+            src.setData({
+              type: 'Feature',
+              geometry: {
+                type: 'LineString',
+                coordinates: lineCoords
+              }
+            });
+          }
+        }
+
+        if (!map.getLayer('route-glow')) {
+          map.addLayer({
+            id: 'route-glow',
+            type: 'line',
+            source: 'route-source',
+            layout: {
+              'line-cap': 'round',
+              'line-join': 'round'
+            },
+            paint: {
+              'line-color': currentThemeDark ? '#00E5FF' : '#16324A',
+              'line-width': currentThemeDark ? 14 : 10,
+              'line-opacity': currentThemeDark ? 0.38 : 0.25,
+              'line-blur': currentThemeDark ? 4 : 0
+            }
+          });
+        }
+
+        if (!map.getLayer('route-main')) {
+          map.addLayer({
+            id: 'route-main',
+            type: 'line',
+            source: 'route-source',
+            layout: {
+              'line-cap': 'round',
+              'line-join': 'round'
+            },
+            paint: {
+              'line-color': currentThemeDark ? '#00E5FF' : '#2B5B84',
+              'line-width': 6.5,
+              'line-opacity': 1.0
+            }
+          });
+        }
+      }
+
       function init() {
-        if (typeof L === 'undefined') {
+        if (typeof maplibregl === 'undefined') {
           setTimeout(init, 50);
           return;
         }
 
-        map = L.map('map', {
-          zoomControl: false,
-          attributionControl: false,
-          fadeAnimation: true,
-          zoomAnimation: true,
-        }).setView([${initialLat}, ${initialLng}], ${initialZoom});
+        try {
+          map = new maplibregl.Map({
+            container: 'map',
+            style: currentThemeDark ? DARK_VECTOR_STYLE : LIGHT_VECTOR_STYLE,
+            center: [${initialLng}, ${initialLat}],
+            zoom: ${initialZoom},
+            bearing: 0,
+            pitch: 0,
+            attributionControl: false,
+            fadeDuration: 150
+          });
 
-        var initialTilesUrl = hasCartoKey
-          ? (currentThemeDark ? DARK_CARTO : LIGHT_CARTO)
-          : OSM_TILES;
+          map.on('load', function() {
+            isMapLoaded = true;
+            setupRouteLayers();
 
-        var subdomains = hasCartoKey ? 'abcd' : 'abc';
+            if (pendingRouteCoords) {
+              applyRouteData(pendingRouteCoords, pendingDestination);
+            }
+            if (pendingUserLocation) {
+              updateLocation(
+                pendingUserLocation.lat,
+                pendingUserLocation.lng,
+                pendingUserLocation.heading,
+                pendingUserLocation.followUser,
+                pendingUserLocation.speed
+              );
+            }
 
-        tileLayer = L.tileLayer(initialTilesUrl, {
-          subdomains: subdomains,
-          maxZoom: 19
-        }).addTo(map);
+            if (window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'MAP_READY' }));
+            }
+          });
 
-        var mapEl = document.getElementById('map');
-        if (currentThemeDark && !hasCartoKey && mapEl) {
-          mapEl.classList.add('dark-tiles');
-        }
+          map.on('style.load', function() {
+            setupRouteLayers();
+            if (pendingRouteCoords) {
+              applyRouteData(pendingRouteCoords, pendingDestination);
+            }
+          });
 
-        map.on('click', function() {
-          if (window.ReactNativeWebView) {
-            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'MAP_PRESS' }));
-          }
-        });
+          map.on('error', function(e) {
+            if (e && e.error && e.error.message && e.error.message.includes('style') && !styleFallbackActive) {
+              console.warn('[MapLibre] Fallback a teselas ráster por incidencia de red:', e.error);
+              styleFallbackActive = true;
+              map.setStyle(getRasterFallbackStyle(currentThemeDark));
+            }
+          });
 
-        map.on('moveend', function() {
-          var center = map.getCenter();
-          var bounds = map.getBounds();
-          var latDelta = Math.abs(bounds.getNorth() - bounds.getSouth());
-          var lngDelta = Math.abs(bounds.getEast() - bounds.getWest());
-          if (window.ReactNativeWebView) {
-            window.ReactNativeWebView.postMessage(JSON.stringify({
-              type: 'REGION_CHANGE',
-              region: {
-                latitude: center.lat,
-                longitude: center.lng,
-                latitudeDelta: latDelta,
-                longitudeDelta: lngDelta
-              }
-            }));
-          }
-        });
+          map.on('click', function() {
+            if (window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'MAP_PRESS' }));
+            }
+          });
 
-        if (window.ReactNativeWebView) {
-          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'MAP_READY' }));
+          // Detección de gestos táctiles de exploración del usuario (solo interacción real, ignorando animaciones automáticas)
+          map.on('dragstart', function(e) {
+            if (e && e.originalEvent && window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'USER_INTERACTION' }));
+            }
+          });
+          map.on('rotatestart', function(e) {
+            if (e && e.originalEvent && window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'USER_INTERACTION' }));
+            }
+          });
+          map.on('pitchstart', function(e) {
+            if (e && e.originalEvent && window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'USER_INTERACTION' }));
+            }
+          });
+          map.on('zoomstart', function(e) {
+            if (e && e.originalEvent && window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'USER_INTERACTION' }));
+            }
+          });
+
+          map.on('moveend', function() {
+            var center = map.getCenter();
+            var bounds = map.getBounds();
+            if (window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({
+                type: 'REGION_CHANGE',
+                region: {
+                  latitude: center.lat,
+                  longitude: center.lng,
+                  latitudeDelta: Math.abs(bounds.getNorth() - bounds.getSouth()),
+                  longitudeDelta: Math.abs(bounds.getEast() - bounds.getWest())
+                }
+              }));
+            }
+          });
+
+        } catch (initErr) {
+          console.error('[MapLibre] Error de inicialización WebGL:', initErr);
         }
       }
 
-      function updateLocation(lat, lng, heading, followUser) {
+      function updateLocation(lat, lng, heading, followUser, speed) {
         if (!map) return;
-        var rot = heading || 0;
+        if (!isMapLoaded) {
+          pendingUserLocation = { lat: lat, lng: lng, heading: heading, followUser: followUser, speed: speed };
+          return;
+        }
+
+        var rawHeading = (typeof heading === 'number' && !isNaN(heading)) ? heading : 0;
+        var currentSpeed = (typeof speed === 'number' && !isNaN(speed)) ? speed : 0;
+
+        if (currentSmoothedBearing === null) {
+          currentSmoothedBearing = rawHeading;
+        }
+
+        // 1. Diferencia angular más corta (-180 a +180) para evitar giros de 350° al cruzar el norte
+        var angleDiff = ((rawHeading - currentSmoothedBearing + 540) % 360) - 180;
+
+        // 2. Filtro de vehículo detenido / marcha mínima (< 1.2 m/s / ~4 km/h):
+        var isStationary = currentSpeed < 1.2;
+        if (isStationary && Math.abs(angleDiff) < 22) {
+          angleDiff = 0;
+        }
+
+        // 3. Umbral de banda muerta (Deadband Threshold):
+        if (Math.abs(angleDiff) >= 3.5) {
+          var alpha = 0.28;
+          currentSmoothedBearing = (currentSmoothedBearing + (angleDiff * alpha) + 360) % 360;
+        }
+
+        // Perspectiva POV 3D del conductor (Google Maps):
+        // En MapLibre GL JS, bearing: theta orienta el rumbo theta hacia arriba en pantalla.
+        // Inclinación pitch: 45° aporta la perspectiva de carretera del parabrisas.
+        if (followUser) {
+          map.easeTo({
+            center: [lng, lat],
+            bearing: currentSmoothedBearing,
+            pitch: 45,
+            duration: 450,
+            easing: function(t) { return t; }
+          });
+        }
+
+        // Si el mapa rota con el rumbo (followUser: true), la flecha vehicular en pantalla apunta hacia arriba (0deg).
+        // Si el usuario explora libremente, la flecha indica el rumbo relativo respecto a la rotación actual del mapa:
+        var mapBearing = map.getBearing ? map.getBearing() : 0;
+        var arrowRot = followUser ? 0 : (((currentSmoothedBearing - mapBearing) % 360 + 360) % 360);
 
         if (!userMarker) {
-          var icon = L.divIcon({
-            className: 'custom-div-icon',
-            html: getArrowSvg(rot, currentThemeDark),
-            iconSize: [56, 56],
-            iconAnchor: [28, 28]
-          });
-          userMarker = L.marker([lat, lng], { icon: icon, zIndexOffset: 1000 }).addTo(map);
+          var markerDiv = document.createElement('div');
+          markerDiv.className = 'custom-marker';
+          markerDiv.innerHTML = getArrowSvg(arrowRot, currentThemeDark);
+          userMarker = new maplibregl.Marker({
+            element: markerDiv,
+            anchor: 'center',
+            rotationAlignment: 'viewport',
+            pitchAlignment: 'viewport'
+          }).setLngLat([lng, lat]).addTo(map);
         } else {
-          userMarker.setLatLng([lat, lng]);
+          userMarker.setLngLat([lng, lat]);
           var elem = document.getElementById('arrow-rotator');
           if (elem) {
-            elem.style.transform = 'rotate(' + rot + 'deg)';
+            elem.style.transform = 'rotate(' + arrowRot + 'deg)';
           } else {
-            userMarker.setIcon(L.divIcon({
-              className: 'custom-div-icon',
-              html: getArrowSvg(rot, currentThemeDark),
-              iconSize: [56, 56],
-              iconAnchor: [28, 28]
-            }));
+            var container = userMarker.getElement();
+            if (container) {
+              container.innerHTML = getArrowSvg(arrowRot, currentThemeDark);
+            }
           }
-        }
-
-        if (followUser) {
-          map.panTo([lat, lng], { animate: true, duration: 0.6 });
         }
       }
 
-      function setRoute(coords, destination) {
-        if (!map) return;
+      function applyRouteData(coords, destination) {
+        pendingRouteCoords = coords;
+        pendingDestination = destination;
 
-        if (routeGlowPolyline) {
-          map.removeLayer(routeGlowPolyline);
-          routeGlowPolyline = null;
-        }
-        if (routeMainPolyline) {
-          map.removeLayer(routeMainPolyline);
-          routeMainPolyline = null;
-        }
-        if (destinationMarker) {
-          map.removeLayer(destinationMarker);
-          destinationMarker = null;
-        }
+        if (!map || !isMapLoaded) return;
 
-        if (coords && coords.length >= 2) {
-          var latlngs = coords.map(function(c) { return [c.latitude, c.longitude]; });
+        setupRouteLayers();
 
-          if (currentThemeDark) {
-            routeGlowPolyline = L.polyline(latlngs, {
-              color: 'rgba(0, 229, 255, 0.3)',
-              weight: 14,
-              lineCap: 'round',
-              lineJoin: 'round'
-            }).addTo(map);
+        var source = map.getSource('route-source');
+        if (source) {
+          var lineCoords = (coords && coords.length >= 2)
+            ? coords.map(function(c) { return [c.longitude, c.latitude]; })
+            : [];
 
-            routeMainPolyline = L.polyline(latlngs, {
-              color: '#00E5FF',
-              weight: 6,
-              lineCap: 'round',
-              lineJoin: 'round'
-            }).addTo(map);
-          } else {
-            routeMainPolyline = L.polyline(latlngs, {
-              color: '#2B5B84',
-              weight: 6,
-              lineCap: 'round',
-              lineJoin: 'round'
-            }).addTo(map);
+          source.setData({
+            type: 'Feature',
+            geometry: {
+              type: 'LineString',
+              coordinates: lineCoords
+            }
+          });
+
+          if (lineCoords.length >= 2 && ${autoFitRoute ? 'true' : 'false'}) {
+            try {
+              var bounds = new maplibregl.LngLatBounds();
+              lineCoords.forEach(function(pt) { bounds.extend(pt); });
+              map.fitBounds(bounds, {
+                padding: { top: 90, bottom: 160, left: 40, right: 40 },
+                maxZoom: 16,
+                duration: 600
+              });
+            } catch(e) {}
           }
         }
 
         if (destination) {
-          var pinIcon = L.divIcon({
-            className: 'custom-div-icon',
-            html: getPinSvg(currentThemeDark),
-            iconSize: [36, 44],
-            iconAnchor: [18, 44]
-          });
-          destinationMarker = L.marker([destination.latitude, destination.longitude], {
-            icon: pinIcon,
-            zIndexOffset: 900
-          }).addTo(map);
+          if (!destinationMarker) {
+            var pinDiv = document.createElement('div');
+            pinDiv.className = 'custom-marker';
+            pinDiv.innerHTML = getPinSvg(currentThemeDark);
+            destinationMarker = new maplibregl.Marker({
+              element: pinDiv,
+              anchor: 'bottom'
+            }).setLngLat([destination.longitude, destination.latitude]).addTo(map);
+          } else {
+            destinationMarker.setLngLat([destination.longitude, destination.latitude]);
+          }
 
           if (!coords || coords.length < 2) {
-            map.setView([destination.latitude, destination.longitude], ${initialZoom}, { animate: true });
+            map.easeTo({
+              center: [destination.longitude, destination.latitude],
+              zoom: ${initialZoom},
+              duration: 500
+            });
           }
+        } else if (destinationMarker) {
+          destinationMarker.remove();
+          destinationMarker = null;
         }
       }
 
       function setTheme(isDark) {
+        var requestedTheme = isDark ? 'dark' : 'light';
+        var themeChanged = requestedTheme !== activeLoadedTheme;
         currentThemeDark = isDark;
         var bg = isDark ? '#0B111D' : '#F1F4F7';
         document.body.style.backgroundColor = bg;
         var mapEl = document.getElementById('map');
-        if (mapEl) {
-          mapEl.style.backgroundColor = bg;
-          if (isDark && !hasCartoKey) {
-            mapEl.classList.add('dark-tiles');
-          } else {
-            mapEl.classList.remove('dark-tiles');
-          }
-        }
+        if (mapEl) mapEl.style.backgroundColor = bg;
 
-        if (tileLayer) {
-          if (hasCartoKey) {
-            tileLayer.setUrl(isDark ? DARK_CARTO : LIGHT_CARTO);
-          } else {
-            tileLayer.setUrl(OSM_TILES);
+        if (map && themeChanged) {
+          activeLoadedTheme = requestedTheme;
+          var targetStyle = styleFallbackActive
+            ? getRasterFallbackStyle(isDark)
+            : (isDark ? DARK_VECTOR_STYLE : LIGHT_VECTOR_STYLE);
+          map.setStyle(targetStyle);
+        } else if (map) {
+          if (map.getLayer('route-glow')) {
+            map.setPaintProperty('route-glow', 'line-color', isDark ? '#00E5FF' : '#16324A');
+            map.setPaintProperty('route-glow', 'line-width', isDark ? 14 : 10);
+            map.setPaintProperty('route-glow', 'line-opacity', isDark ? 0.38 : 0.25);
+            map.setPaintProperty('route-glow', 'line-blur', isDark ? 4 : 0);
+          }
+          if (map.getLayer('route-main')) {
+            map.setPaintProperty('route-main', 'line-color', isDark ? '#00E5FF' : '#2B5B84');
           }
         }
 
         if (userMarker) {
-          var elem = document.getElementById('arrow-rotator');
-          var curRot = 0;
-          if (elem && elem.style.transform) {
-            var match = elem.style.transform.match(/rotate\\(([-\\d.]+)deg\\)/);
-            if (match) curRot = parseFloat(match[1]);
+          var container = userMarker.getElement();
+          if (container) {
+            var elem = document.getElementById('arrow-rotator');
+            var curRot = 0;
+            if (elem && elem.style.transform) {
+              var match = elem.style.transform.match(/rotate\(([-\d.]+)deg\)/);
+              if (match) curRot = parseFloat(match[1]);
+            }
+            container.innerHTML = getArrowSvg(curRot, isDark);
           }
-          userMarker.setIcon(L.divIcon({
-            className: 'custom-div-icon',
-            html: getArrowSvg(curRot, isDark),
-            iconSize: [56, 56],
-            iconAnchor: [28, 28]
-          }));
         }
 
         if (destinationMarker) {
-          destinationMarker.setIcon(L.divIcon({
-            className: 'custom-div-icon',
-            html: getPinSvg(isDark),
-            iconSize: [36, 44],
-            iconAnchor: [18, 44]
-          }));
-        }
-
-        if (routeMainPolyline) {
-          var latlngs = routeMainPolyline.getLatLngs();
-          if (routeGlowPolyline) {
-            map.removeLayer(routeGlowPolyline);
-            routeGlowPolyline = null;
-          }
-          map.removeLayer(routeMainPolyline);
-          routeMainPolyline = null;
-
-          if (isDark) {
-            routeGlowPolyline = L.polyline(latlngs, {
-              color: 'rgba(0, 229, 255, 0.3)',
-              weight: 14,
-              lineCap: 'round',
-              lineJoin: 'round'
-            }).addTo(map);
-            routeMainPolyline = L.polyline(latlngs, {
-              color: '#00E5FF',
-              weight: 6,
-              lineCap: 'round',
-              lineJoin: 'round'
-            }).addTo(map);
-          } else {
-            routeMainPolyline = L.polyline(latlngs, {
-              color: '#2B5B84',
-              weight: 6,
-              lineCap: 'round',
-              lineJoin: 'round'
-            }).addTo(map);
+          var pContainer = destinationMarker.getElement();
+          if (pContainer) {
+            pContainer.innerHTML = getPinSvg(isDark);
           }
         }
       }
 
       function handleMessage(data) {
-        if (!data || !map) return;
+        if (!data) return;
         switch (data.type) {
           case 'SET_THEME':
             setTheme(data.isDarkMode);
             break;
           case 'UPDATE_LOCATION':
-            updateLocation(data.lat, data.lng, data.heading, data.followUser);
+            updateLocation(data.lat, data.lng, data.heading, data.followUser, data.speed);
             break;
           case 'SET_ROUTE':
-            setRoute(data.coordinates, data.destination);
+            applyRouteData(data.coordinates, data.destination);
             break;
           case 'ZOOM_IN':
-            map.zoomIn();
+            if (!map) return;
+            var inDelta = 1.0;
+            if (data && data.intensity === 'mucho') inDelta = 2.0;
+            else if (data && data.intensity === 'poco') inDelta = 0.5;
+            map.easeTo({ zoom: Math.min(19, map.getZoom() + inDelta), duration: 300 });
             break;
           case 'ZOOM_OUT':
-            map.zoomOut();
+            if (!map) return;
+            var outDelta = 1.5;
+            if (data && data.intensity === 'mucho') outDelta = 3.5;
+            else if (data && data.intensity === 'poco') outDelta = 0.7;
+            map.easeTo({ zoom: Math.max(10, map.getZoom() - outDelta), duration: 300 });
+            break;
+          case 'SET_ZOOM':
+            if (map && data && typeof data.zoom === 'number') {
+              map.easeTo({ zoom: Math.max(10, Math.min(19, data.zoom)), duration: 300 });
+            }
             break;
           case 'RECENTER':
-            if (data.lat !== undefined && data.lng !== undefined) {
-              map.panTo([data.lat, data.lng], { animate: true, duration: 0.6 });
+            if (map && data.lat !== undefined && data.lng !== undefined) {
+              var targetZoom = (data && typeof data.zoom === 'number') ? data.zoom : map.getZoom();
+              if (typeof data.heading === 'number') {
+                currentSmoothedBearing = data.heading;
+              }
+              map.easeTo({
+                center: [data.lng, data.lat],
+                zoom: targetZoom,
+                bearing: currentSmoothedBearing || 0,
+                pitch: 45,
+                duration: 600
+              });
             }
             break;
           case 'FIT_BOUNDS':
-            if (data.coordinates && data.coordinates.length > 0) {
-              var bounds = data.coordinates.map(function(c) { return [c.latitude, c.longitude]; });
-              map.fitBounds(bounds, { padding: [60, 60], animate: true });
+            if (map && data.coordinates && data.coordinates.length > 0) {
+              var bounds = new maplibregl.LngLatBounds();
+              data.coordinates.forEach(function(c) {
+                bounds.extend([c.longitude, c.latitude]);
+              });
+              map.fitBounds(bounds, { padding: 60, duration: 600 });
             }
             break;
           case 'PAN_TO':
-            if (data.lat !== undefined && data.lng !== undefined) {
-              map.panTo([data.lat, data.lng], { animate: true, duration: 0.6 });
+            if (map && data.lat !== undefined && data.lng !== undefined) {
+              map.panTo([data.lng, data.lat], { duration: 500 });
             }
             break;
         }
@@ -474,6 +667,8 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
       initialRegion,
       initialZoom = 14,
       followUser = false,
+      autoFitRoute = false,
+      onUserInteraction,
       onRegionChangeComplete,
       onMapPress,
       style,
@@ -489,8 +684,16 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
         ? process.env.EXPO_PUBLIC_CARTO_API_KEY.trim()
         : '';
 
-    const initialLat = initialRegion?.latitude ?? DEFAULT_REGION.latitude;
-    const initialLng = initialRegion?.longitude ?? DEFAULT_REGION.longitude;
+    const initialLat =
+      initialRegion?.latitude ??
+      userLocation?.latitude ??
+      (routeCoordinates && routeCoordinates[0]?.latitude) ??
+      DEFAULT_REGION.latitude;
+    const initialLng =
+      initialRegion?.longitude ??
+      userLocation?.longitude ??
+      (routeCoordinates && routeCoordinates[0]?.longitude) ??
+      DEFAULT_REGION.longitude;
 
     const sendMessage = useCallback((msg: object) => {
       const json = JSON.stringify(msg);
@@ -504,18 +707,23 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
 
     // Expone la API imperativa de control para botones y comandos de voz
     useImperativeHandle(ref, () => ({
-      zoomIn: () => {
-        sendMessage({ type: 'ZOOM_IN' });
+      zoomIn: (intensity?: 'normal' | 'mucho' | 'poco') => {
+        sendMessage({ type: 'ZOOM_IN', intensity: intensity || 'normal' });
       },
-      zoomOut: () => {
-        sendMessage({ type: 'ZOOM_OUT' });
+      zoomOut: (intensity?: 'normal' | 'mucho' | 'poco') => {
+        sendMessage({ type: 'ZOOM_OUT', intensity: intensity || 'normal' });
       },
-      recenter: () => {
+      setZoom: (zoom: number) => {
+        sendMessage({ type: 'SET_ZOOM', zoom });
+      },
+      recenter: (zoom?: number) => {
         if (userLocation) {
           sendMessage({
             type: 'RECENTER',
             lat: userLocation.latitude,
             lng: userLocation.longitude,
+            heading: userLocation.heading ?? 0,
+            zoom: zoom || 17,
           });
         }
       },
@@ -552,6 +760,7 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
           lat: userLocation.latitude,
           lng: userLocation.longitude,
           heading: userLocation.heading ?? 0,
+          speed: userLocation.speed ?? 0,
           followUser,
         });
       }
@@ -560,6 +769,7 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
       userLocation?.latitude,
       userLocation?.longitude,
       userLocation?.heading,
+      userLocation?.speed,
       followUser,
       sendMessage,
     ]);
@@ -587,6 +797,7 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
               lat: userLocation.latitude,
               lng: userLocation.longitude,
               heading: userLocation.heading ?? 0,
+              speed: userLocation.speed ?? 0,
               followUser,
             });
           }
@@ -597,17 +808,26 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
               destination: destinationMarker || null,
             });
           }
+        } else if (data.type === 'USER_INTERACTION' && onUserInteraction) {
+          onUserInteraction();
         } else if (data.type === 'REGION_CHANGE' && onRegionChangeComplete) {
           onRegionChangeComplete(data.region);
         } else if (data.type === 'MAP_PRESS' && onMapPress) {
           onMapPress();
         }
       } catch (err) {
-        console.warn('Error al procesar mensaje de Leaflet:', err);
+        console.warn('Error al procesar mensaje de MapLibre:', err);
       }
     };
 
-    const htmlContent = generateLeafletHtml(initialLat, initialLng, isDarkMode, cartoApiKey, initialZoom);
+    const htmlContent = generateMapLibreHtml(
+      initialLat,
+      initialLng,
+      isDarkMode,
+      cartoApiKey,
+      initialZoom,
+      autoFitRoute
+    );
 
     return (
       <View

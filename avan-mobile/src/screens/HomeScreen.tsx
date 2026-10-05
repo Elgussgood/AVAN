@@ -1,10 +1,12 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   StyleSheet,
   View,
   StatusBar,
   Text,
   TouchableOpacity,
+  Animated,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -135,10 +137,77 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const offRouteCountRef = useRef<number>(0);
   const isRecalculatingRef = useRef<boolean>(false);
 
+  // Modo de exploración manual del mapa (cuando el usuario interactúa táctilmente)
+  const [isUserExploringMap, setIsUserExploringMap] = useState<boolean>(false);
+  const recenterTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleUserMapInteraction = () => {
+    setIsUserExploringMap(true);
+    if (recenterTimeoutRef.current) {
+      clearTimeout(recenterTimeoutRef.current);
+    }
+    // Auto-recentrar después de 10 segundos de inactividad táctil
+    recenterTimeoutRef.current = setTimeout(() => {
+      handleRecenter();
+    }, 10000);
+  };
+
+  const handleRecenter = () => {
+    if (recenterTimeoutRef.current) {
+      clearTimeout(recenterTimeoutRef.current);
+      recenterTimeoutRef.current = null;
+    }
+    // Preservar el zoom actual del usuario sin forzar zoom 17 arbitrario
+    mapRef.current?.recenter();
+    setIsUserExploringMap(false);
+    try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    } catch {}
+  };
+
+  const effectiveLocation: UserLocation | null = isSimulating
+    ? simulatedLocation
+    : (userLocation || (activeRouteCoords && activeRouteCoords.length > 0 ? {
+        latitude: activeRouteCoords[0].latitude,
+        longitude: activeRouteCoords[0].longitude,
+        heading: activeRouteCoords.length > 1
+          ? NavigationService.getBearing(activeRouteCoords[0], activeRouteCoords[1])
+          : 0,
+        speed: 0,
+      } : null));
+
+  const initialMapRegion = useMemo(() => {
+    const lat = (activeRouteCoords && activeRouteCoords[0]?.latitude) ||
+      effectiveLocation?.latitude ||
+      19.427025;
+    const lng = (activeRouteCoords && activeRouteCoords[0]?.longitude) ||
+      effectiveLocation?.longitude ||
+      -99.167665;
+    return {
+      latitude: lat,
+      longitude: lng,
+      latitudeDelta: 0.008,
+      longitudeDelta: 0.008,
+    };
+  }, [activeRouteCoords, effectiveLocation]);
+
+  // Recorte dinámico en tiempo real de los tramos ya transitados (simulación o GPS)
+  const remainingRouteCoords = useMemo(() => {
+    if (!activeRouteCoords || activeRouteCoords.length === 0) return [];
+    if (!effectiveLocation) return activeRouteCoords;
+    return NavigationService.getRemainingPolyline(
+      effectiveLocation,
+      activeRouteCoords,
+      isSimulating ? simIndexRef.current : undefined
+    );
+  }, [activeRouteCoords, effectiveLocation, isSimulating]);
+
   const [navProgress, setNavProgress] = useState<NavigationProgress>(() => {
     const initialLoc = userLocation
       ? { latitude: userLocation.latitude, longitude: userLocation.longitude }
-      : { latitude: 19.427025, longitude: -99.167665 };
+      : (activeRouteCoords && activeRouteCoords.length > 0
+          ? { latitude: activeRouteCoords[0].latitude, longitude: activeRouteCoords[0].longitude }
+          : { latitude: 19.427025, longitude: -99.167665 });
     return NavigationService.evaluateProgress(
       initialLoc,
       activeRouteCoords,
@@ -147,10 +216,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       0
     );
   });
-
-  const effectiveLocation: UserLocation | null = isSimulating
-    ? simulatedLocation
-    : userLocation;
 
   const contextRef = useRef<ConversationContext>(
     context ||
@@ -161,6 +226,41 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   );
 
   const currentTheme = isDarkMode ? darkTheme : lightTheme;
+
+  // Detección de tramos rectos largos (>450m) para auto-ocultar la tarjeta de instrucciones y evitar ruido visual
+  const isStraightManeuver =
+    navProgress.currentStep?.type === 6 ||
+    navProgress.currentStep?.type === 11 ||
+    /contin[uú]e recto|siga derecho|contin[uú]a recto/i.test(instruction);
+
+  const isLongStraightStretch =
+    isStraightManeuver && navProgress.distanceToNextManeuver > 450;
+
+  const [justChangedManeuver, setJustChangedManeuver] = useState<boolean>(false);
+  const maneuverChangeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setJustChangedManeuver(true);
+    if (maneuverChangeTimerRef.current) clearTimeout(maneuverChangeTimerRef.current);
+    maneuverChangeTimerRef.current = setTimeout(() => {
+      setJustChangedManeuver(false);
+    }, 7000);
+  }, [currentStepIndex]);
+
+  const shouldShowInstruction =
+    !isLongStraightStretch ||
+    navProgress.remainingDistance <= 450 ||
+    justChangedManeuver;
+
+  const cardOpacityAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    Animated.timing(cardOpacityAnim, {
+      toValue: shouldShowInstruction ? 1 : 0,
+      duration: 350,
+      useNativeDriver: true,
+    }).start();
+  }, [shouldShowInstruction, cardOpacityAnim]);
 
   // Limpiar temporizadores al desmontar
   useEffect(() => {
@@ -173,6 +273,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       }
       if (navigationVoiceTimeoutRef.current) {
         clearTimeout(navigationVoiceTimeoutRef.current);
+      }
+      if (recenterTimeoutRef.current) {
+        clearTimeout(recenterTimeoutRef.current);
+      }
+      if (maneuverChangeTimerRef.current) {
+        clearTimeout(maneuverChangeTimerRef.current);
       }
     };
   }, []);
@@ -213,22 +319,30 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   }, [propInstruction]);
 
-  // Al montar la pantalla o recibir nueva ruta, encuadrar la polilínea en el mapa
+  // Al iniciar la navegación activa o actualizar ruta, fijar la cámara en el vehículo a zoom de conducción cercano (17)
   useEffect(() => {
-    if (activeRouteCoords && activeRouteCoords.length > 0 && mapRef.current) {
+    if (mapRef.current) {
       setTimeout(() => {
-        mapRef.current?.fitToCoordinates(activeRouteCoords, {
-          edgePadding: { top: 160, right: 60, bottom: 220, left: 60 },
-          animated: true,
-        });
-      }, 700);
+        mapRef.current?.recenter(17);
+      }, 500);
     }
   }, [activeRouteCoords]);
 
   // Al montar la pantalla de navegación activa, dar la bienvenida de inicio de ruta
   useEffect(() => {
+    let isCancelled = false;
     const welcomeMsg = `Iniciando ruta hacia ${targetDestination}. ${instruction}.`;
-    VoiceService.speak(welcomeMsg);
+
+    // Detener de forma estricta cualquier audio residual previo para evitar colisión de voces
+    VoiceService.stop().then(() => {
+      if (!isCancelled) {
+        VoiceService.speak(welcomeMsg);
+      }
+    });
+
+    return () => {
+      isCancelled = true;
+    };
   }, [targetDestination]);
 
   /**
@@ -278,7 +392,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         return;
       }
 
-      simIndexRef.current += 1;
+      // Avance cinemático adaptativo: avanzar a un punto a al menos 18 metros adelante para fluidez demostrativa
+      const currentPos = activeRouteCoords[simIndexRef.current];
+      let nextIndex = simIndexRef.current + 1;
+
+      while (
+        nextIndex < activeRouteCoords.length - 1 &&
+        getDistanceMeters(currentPos, activeRouteCoords[nextIndex]) < 18
+      ) {
+        nextIndex++;
+      }
+
+      simIndexRef.current = nextIndex;
+
       if (simIndexRef.current >= activeRouteCoords.length) {
         if (simulationTimerRef.current) {
           clearInterval(simulationTimerRef.current);
@@ -288,17 +414,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         return;
       }
 
-      const prevPt = activeRouteCoords[Math.max(0, simIndexRef.current - 1)];
       const currPt = activeRouteCoords[simIndexRef.current];
-      const bearing = getBearing(prevPt, currPt);
+      const prevPt = activeRouteCoords[Math.max(0, simIndexRef.current - 1)];
+      const futurePt = activeRouteCoords[Math.min(activeRouteCoords.length - 1, simIndexRef.current + 1)];
+
+      // Cálculo de rumbo anticipado hacia la siguiente curva o calle
+      let bearing = getBearing(currPt, futurePt);
+      if (!bearing || (currPt.latitude === futurePt.latitude && currPt.longitude === futurePt.longitude)) {
+        bearing = getBearing(prevPt, currPt);
+      }
 
       setSimulatedLocation({
         latitude: currPt.latitude,
         longitude: currPt.longitude,
         heading: bearing,
-        speed: 9.7, // ~35 km/h
+        speed: 11.2, // ~40 km/h: velocidad de avance vehicular que ignora sensores estacionarios y rota el mapa
       });
-    }, 1200);
+    }, 900);
   };
 
   /**
@@ -342,9 +474,25 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     const targetCoord =
       activeDestinationCoords || activeRouteCoords[activeRouteCoords.length - 1];
 
-    // 1. Detección automática de llegada a destino (<45 metros)
+    // 1. Evaluación del estado y distancias del turn-by-turn a lo largo de la ruta
+    const progress = NavigationService.evaluateProgress(
+      currentCoords,
+      activeRouteCoords,
+      activeDestinationCoords,
+      activeSteps,
+      currentStepIndex
+    );
+    setNavProgress(progress);
+
+    // 2. Detección automática de llegada a destino con validación estricta de ruta:
+    // Evita finalizar prematuramente si el vehículo pasa a la altura del destino pero del otro lado
+    // de la avenida antes de dar el retorno en U. Requiere proximidad física Y que la distancia restante de ruta sea mínima.
     const distToTarget = getDistanceMeters(currentCoords, targetCoord);
-    if (distToTarget <= 45 && !hasArrivedRef.current) {
+    const isAtEndOfRoute =
+      progress.remainingDistance <= 75 ||
+      (isSimulating && simIndexRef.current >= activeRouteCoords.length - 2);
+
+    if (distToTarget <= 50 && isAtEndOfRoute && !hasArrivedRef.current) {
       hasArrivedRef.current = true;
       if (simulationTimerRef.current) {
         clearInterval(simulationTimerRef.current);
@@ -365,7 +513,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    // 2. Detección de pérdida de ruta (>100 metros fuera de la polilínea)
+    // 3. Detección de pérdida de ruta (>100 metros fuera de la polilínea)
     const minDist = NavigationService.getMinDistanceToPolyline(
       currentCoords,
       activeRouteCoords
@@ -379,16 +527,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     } else {
       offRouteCountRef.current = 0;
     }
-
-    // 3. Evaluación del estado y distancias del turn-by-turn
-    const progress = NavigationService.evaluateProgress(
-      currentCoords,
-      activeRouteCoords,
-      activeDestinationCoords,
-      activeSteps,
-      currentStepIndex
-    );
-    setNavProgress(progress);
 
     // Actualizar instrucción visible
     if (progress.currentStep?.instruction) {
@@ -561,11 +699,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         onContextChange(contextRef.current);
       }
 
+      setIsUserExploringMap(false);
       setTimeout(() => {
-        mapRef.current?.fitToCoordinates(newRouteCoordinates, {
-          edgePadding: { top: 160, right: 60, bottom: 220, left: 60 },
-          animated: true,
-        });
+        mapRef.current?.recenter(17);
       }, 500);
 
       setVoiceState('speaking');
@@ -626,8 +762,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         return;
       }
 
-      // Si el NLU requiere confirmación (Paso 1 del protocolo en 2 pasos) o devuelve una pregunta
-      if (response.updatedContext.pendingConfirmation || response.spokenText.includes('?')) {
+      // Si el NLU requiere confirmación (Paso 1 del protocolo en 2 pasos):
+      // Mostrar la vista previa de confirmación con el pin en el mapa igual que en el resto de la app
+      if (response.updatedContext.pendingConfirmation) {
+        isFinishingTripRef.current = false;
+        const exitFn = onStopTrip || onCancelTrip;
+        if (exitFn) {
+          exitFn(response.updatedContext);
+        }
+        return;
+      }
+
+      // Si devuelve una pregunta sin confirmación directa
+      if (response.spokenText.includes('?')) {
         setVoiceState('speaking');
         setStatusMessage(response.spokenText);
 
@@ -775,10 +922,24 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         onContextChange(response.updatedContext);
       }
 
-      if (response.functionCall?.name === 'confirmar_viaje' || response.functionCall?.name === 'navegar_a') {
+      if (response.functionCall?.name === 'confirmar_viaje') {
         const dest = response.functionCall.args.destino || pendingDest;
         isFinishingTripRef.current = false;
         await startNavigationToDestination(dest);
+        return;
+      }
+
+      // Si solicitó o cambió a un nuevo destino (navegar_a o confirmación pendiente en 2 pasos):
+      // Salir a MinimalHomeScreen para desplegar la vista previa de confirmación con el pin en el mapa
+      if (
+        response.functionCall?.name === 'navegar_a' ||
+        response.updatedContext.pendingConfirmation
+      ) {
+        isFinishingTripRef.current = false;
+        const exitFn = onStopTrip || onCancelTrip;
+        if (exitFn) {
+          exitFn(response.updatedContext);
+        }
         return;
       }
 
@@ -990,7 +1151,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       lowerText.includes('dónde estoy') ||
       lowerText.includes('donde estoy')
     ) {
-      mapRef.current?.recenter();
+      handleRecenter();
       const responseText = 'Centrando el mapa en su posición.';
       setVoiceState('speaking');
       setStatusMessage(responseText);
@@ -1106,13 +1267,24 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       if (response.functionCall) {
         if (response.functionCall.name === 'ajustar_zoom') {
           const dir = response.functionCall.args.direccion;
-          if (dir === 'acercar') mapRef.current?.zoomIn();
-          else if (dir === 'alejar') mapRef.current?.zoomOut();
-          else if (dir === 'centrar') mapRef.current?.recenter();
+          const intensidad = response.functionCall.args.intensidad || 'normal';
+          if (dir === 'acercar') mapRef.current?.zoomIn(intensidad);
+          else if (dir === 'alejar') mapRef.current?.zoomOut(intensidad);
+          else if (dir === 'centrar') handleRecenter();
         } else if (response.functionCall.name === 'cancelar') {
           startFinishContinuityDialog(`Hemos detenido el viaje a ${targetDestination}. ¿Desea viajar a algún otro lugar?`);
           return;
         } else if (response.functionCall.name === 'confirmar_viaje' || response.functionCall.name === 'navegar_a') {
+          // Si el NLU requiere confirmación (Paso 1 del protocolo en 2 pasos):
+          // Mostrar la confirmación visual con el pin en el mapa igual que en el resto de la app
+          if (response.updatedContext.pendingConfirmation) {
+            const exitFn = onStopTrip || onCancelTrip;
+            if (exitFn) {
+              exitFn(response.updatedContext);
+            }
+            return;
+          }
+
           const confirmedDest =
             response.functionCall.args.destino ||
             response.updatedContext.activeRoute?.destination ||
@@ -1136,8 +1308,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         }
       }
 
-      // Si el contexto trae pendingAliasRegistration aunque no haya venido como functionCall directo
-      if (response.updatedContext.pendingAliasRegistration) {
+      // Si el contexto trae pendingConfirmation o pendingAliasRegistration
+      if (
+        response.updatedContext.pendingConfirmation ||
+        response.updatedContext.pendingAliasRegistration
+      ) {
         const exitFn = onStopTrip || onCancelTrip;
         if (exitFn) {
           exitFn(response.updatedContext);
@@ -1224,11 +1399,60 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   };
 
-  const handleVoicePress = async () => {
-    if (voiceState === 'speaking') {
-      await VoiceService.stop();
+  const startListeningInNavigation = async () => {
+    if (navigationVoiceTimeoutRef.current) {
+      clearTimeout(navigationVoiceTimeoutRef.current);
+      navigationVoiceTimeoutRef.current = null;
+    }
+
+    const isDictatingAddress =
+      contextRef.current.pendingAliasRegistration?.step === 'awaiting_address';
+
+    const started = await AudioRecorderService.startRecording({
+      isDictatingAddress,
+      initialSilenceMs: 8000,
+      trailingSilenceMs: isDictatingAddress ? 2500 : 1800,
+      maxDurationMs: isDictatingAddress ? 25000 : 15000,
+      onSpeechDetected: () => {
+        if (navigationVoiceTimeoutRef.current) {
+          clearTimeout(navigationVoiceTimeoutRef.current);
+          navigationVoiceTimeoutRef.current = null;
+        }
+      },
+      onInitialSilenceTimeout: async () => {
+        setVoiceState('idle');
+        setStatusMessage('');
+      },
+      onSpeechEnded: async (transcription) => {
+        setVoiceState('processing');
+        setStatusMessage('Pensando...');
+        await processNavigationSpeech(transcription?.text || '');
+      },
+    });
+
+    if (!started) {
       setVoiceState('idle');
-      setStatusMessage('');
+      setStatusMessage('Error de micrófono');
+      return;
+    }
+
+    setVoiceState('listening');
+    setStatusMessage('Le escucho...');
+  };
+
+  const handleVoicePress = async () => {
+    // Interrupción Inmediata (Barge-in): Si el sistema está hablando una maniobra o instrucción,
+    // silenciar inmediatamente la voz y comenzar a escuchar al usuario sin esperas
+    if (voiceState === 'speaking' || VoiceService.isSpeaking()) {
+      await VoiceService.stop();
+      if (navigationVoiceTimeoutRef.current) {
+        clearTimeout(navigationVoiceTimeoutRef.current);
+        navigationVoiceTimeoutRef.current = null;
+      }
+      try {
+        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      } catch {}
+      await startListeningInNavigation();
       return;
     }
 
@@ -1258,46 +1482,36 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     if (voiceState === 'idle') {
-      if (navigationVoiceTimeoutRef.current) {
-        clearTimeout(navigationVoiceTimeoutRef.current);
-        navigationVoiceTimeoutRef.current = null;
-      }
-
-      const isDictatingAddress =
-        contextRef.current.pendingAliasRegistration?.step === 'awaiting_address';
-
-      const started = await AudioRecorderService.startRecording({
-        isDictatingAddress,
-        initialSilenceMs: 8000,
-        trailingSilenceMs: isDictatingAddress ? 2500 : 1800,
-        maxDurationMs: isDictatingAddress ? 25000 : 15000,
-        onSpeechDetected: () => {
-          if (navigationVoiceTimeoutRef.current) {
-            clearTimeout(navigationVoiceTimeoutRef.current);
-            navigationVoiceTimeoutRef.current = null;
-          }
-        },
-        onInitialSilenceTimeout: async () => {
-          setVoiceState('idle');
-          setStatusMessage('');
-        },
-        onSpeechEnded: async (transcription) => {
-          setVoiceState('processing');
-          setStatusMessage('Pensando...');
-          await processNavigationSpeech(transcription?.text || '');
-        },
-      });
-
-      if (!started) {
-        setVoiceState('idle');
-        setStatusMessage('Error de micrófono');
-        return;
-      }
-
-      setVoiceState('listening');
-      setStatusMessage('Le escucho...');
+      try {
+        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      } catch {}
+      await startListeningInNavigation();
     }
   };
+
+  // Pantalla de carga activa mientras se obtiene señal GPS real (evita renderizar mapa en Reforma)
+  if (!effectiveLocation && (!activeRouteCoords || activeRouteCoords.length === 0)) {
+    return (
+      <View style={[styles.container, styles.loadingScreenContainer, { backgroundColor: currentTheme.background }]}>
+        <StatusBar
+          barStyle={isDarkMode ? 'light-content' : 'dark-content'}
+          backgroundColor="transparent"
+          translucent
+        />
+        <ActivityIndicator
+          size="large"
+          color={currentTheme.buttonOrange}
+          style={{ transform: [{ scale: 1.6 }], marginBottom: 28 }}
+        />
+        <Text style={[styles.loadingScreenTitle, { color: currentTheme.textPrimary }]}>
+          Obteniendo su ubicación actual...
+        </Text>
+        <Text style={[styles.loadingScreenSubtitle, { color: currentTheme.textSecondary }]}>
+          Conectando con el satélite GPS para iniciar su navegación.{'\n'}Por favor espere un momento.
+        </Text>
+      </View>
+    );
+  }
 
   return (
     <View style={[styles.container, { backgroundColor: currentTheme.background }]}>
@@ -1312,15 +1526,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         ref={mapRef}
         isDarkMode={isDarkMode}
         userLocation={effectiveLocation}
-        routeCoordinates={activeRouteCoords}
+        routeCoordinates={remainingRouteCoords}
         destinationMarker={activeDestinationCoords}
         destinationTitle={targetDestination}
-        followUser={true}
+        initialRegion={initialMapRegion}
+        initialZoom={17}
+        followUser={!isUserExploringMap}
+        autoFitRoute={false}
+        onUserInteraction={handleUserMapInteraction}
       />
 
       {/* 2. Capa Superior: Tarjeta de Navegación Activa y Selector de Modo */}
-      <SafeAreaView style={styles.safeArea}>
-        <View style={styles.topContainer}>
+      <SafeAreaView style={styles.safeArea} pointerEvents="box-none">
+        <View style={styles.topContainer} pointerEvents="box-none">
           {/* Barra superior con botón de finalizar viaje y botón de simulación */}
           <View style={styles.topBar}>
             <TouchableOpacity
@@ -1370,87 +1588,120 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             </TouchableOpacity>
           </View>
 
-          {/* Tarjeta Flotante con Próxima Instrucción Turn-by-Turn y Métricas de Ruta */}
-          <View
-            style={[
-              styles.instructionCard,
-              {
-                backgroundColor: currentTheme.cardBackground,
-                borderColor: currentTheme.cardBorder,
-              },
-              isDarkMode ? styles.darkCardGlow : styles.lightCardShadow,
-            ]}
-          >
-            <View style={styles.instructionTopRow}>
-              <View style={styles.instructionIconContainer}>
-                <Ionicons
-                  name={(navProgress.maneuverIcon as any) || "arrow-up-circle"}
-                  size={38}
-                  color={currentTheme.routeColor}
-                />
-              </View>
+          {/* Tarjeta Flotante Minimalista Turn-by-Turn con Auto-Ocultamiento Inteligente en Avenidas Rectas */}
+          {shouldShowInstruction && (
+            <Animated.View
+              style={[
+                styles.instructionCard,
+                {
+                  backgroundColor: currentTheme.cardBackground,
+                  borderColor: currentTheme.cardBorder,
+                  opacity: cardOpacityAnim,
+                  transform: [
+                    {
+                      translateY: cardOpacityAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [-14, 0],
+                      }),
+                    },
+                  ],
+                },
+                isDarkMode ? styles.darkCardGlow : styles.lightCardShadow,
+              ]}
+              pointerEvents={shouldShowInstruction ? 'auto' : 'none'}
+            >
+              <View style={styles.instructionSimpleRow}>
+                {/* Icono de Giro Prominente */}
+                <View
+                  style={[
+                    styles.maneuverIconCircle,
+                    {
+                      backgroundColor: isDarkMode ? '#1E293B' : '#E2E8F0',
+                    },
+                  ]}
+                >
+                  <Ionicons
+                    name={(navProgress.maneuverIcon as any) || 'arrow-up-circle'}
+                    size={32}
+                    color={currentTheme.routeColor}
+                  />
+                </View>
 
-              <View style={styles.instructionTextContainer}>
-                <View style={styles.badgeRow}>
+                {/* Texto Esencial Sin Ruido Visual: Distancia y Maniobra */}
+                <View style={styles.instructionSimpleTextCol}>
                   <Text
                     style={[
-                      styles.destinationBadge,
+                      styles.maneuverDistanceText,
+                      { color: currentTheme.textPrimary },
+                    ]}
+                  >
+                    {navProgress.formattedDistanceToManeuver
+                      ? `En ${navProgress.formattedDistanceToManeuver}`
+                      : 'Continúe'}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.maneuverActionText,
+                      { color: currentTheme.textSecondary },
+                    ]}
+                    numberOfLines={1}
+                  >
+                    {instruction.replace(/^En \d+ metros?,?\s*/i, '')}
+                  </Text>
+                </View>
+
+                {/* Pastilla Compacta de Tiempo y Distancia Restante */}
+                <View
+                  style={[
+                    styles.etaBadge,
+                    {
+                      backgroundColor: isDarkMode ? 'rgba(0, 229, 255, 0.12)' : 'rgba(43, 91, 132, 0.1)',
+                      borderColor: currentTheme.routeColor,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.etaBadgeTime,
+                      { color: isDarkMode ? '#00E5FF' : currentTheme.routeColor },
+                    ]}
+                  >
+                    {navProgress.formattedRemainingDuration || '—'}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.etaBadgeDist,
                       { color: currentTheme.textSecondary },
                     ]}
                   >
-                    {navProgress.formattedDistanceToManeuver ? `${navProgress.formattedDistanceToManeuver.toUpperCase()} • ` : ''}RUMBO A: {targetDestination.toUpperCase()}
+                    {navProgress.formattedRemainingDistance || '—'}
                   </Text>
-                  {isSimulating && (
-                    <View style={styles.simulatingPill}>
-                      <Text style={styles.simulatingPillText}>SIMULANDO</Text>
-                    </View>
-                  )}
                 </View>
-                <Text
-                  style={[
-                    styles.instructionMainText,
-                    { color: currentTheme.textPrimary },
-                  ]}
-                  numberOfLines={2}
-                >
-                  {instruction}
-                </Text>
               </View>
-            </View>
-
-            {/* Fila de Métricas del Viaje (Distancia y Tiempo Restantes) */}
-            <View
-              style={[
-                styles.instructionMetricsRow,
-                { borderTopColor: isDarkMode ? '#1E293B' : '#E2E8F0' },
-              ]}
-            >
-              <View style={styles.metricItem}>
-                <Ionicons name="time-outline" size={16} color={currentTheme.textSecondary} />
-                <Text style={[styles.metricText, { color: currentTheme.textSecondary }]}>
-                  {navProgress.formattedRemainingDuration || 'Calculando...'}
-                </Text>
-              </View>
-              <View style={[styles.metricDivider, { backgroundColor: isDarkMode ? '#334155' : '#E2E8F0' }]} />
-              <View style={styles.metricItem}>
-                <Ionicons name="navigate-outline" size={16} color={currentTheme.textSecondary} />
-                <Text style={[styles.metricText, { color: currentTheme.textSecondary }]}>
-                  {navProgress.formattedRemainingDistance || 'Calculando...'}
-                </Text>
-              </View>
-              <View style={[styles.metricDivider, { backgroundColor: isDarkMode ? '#334155' : '#E2E8F0' }]} />
-              <View style={styles.metricItem}>
-                <Ionicons name="flag-outline" size={16} color={currentTheme.textSecondary} />
-                <Text
-                  style={[styles.metricText, { color: currentTheme.textSecondary, maxWidth: 120 }]}
-                  numberOfLines={1}
-                >
-                  {targetDestination}
-                </Text>
-              </View>
-            </View>
-          </View>
+            </Animated.View>
+          )}
         </View>
+
+        {/* Botón flotante minimalista circular de recentrado (sin texto, ubicado a la derecha, sin encimarse con el micrófono) */}
+        {isUserExploringMap && (
+          <TouchableOpacity
+            style={[
+              styles.recenterFab,
+              {
+                backgroundColor: currentTheme.cardBackground,
+                borderColor: currentTheme.routeColor,
+              },
+              isDarkMode ? styles.darkCardGlow : styles.lightCardShadow,
+            ]}
+            onPress={handleRecenter}
+            activeOpacity={0.85}
+            accessibilityRole="button"
+            accessibilityLabel="Recentrar mapa"
+            accessibilityHint="Centra la vista en su vehículo y reanuda el seguimiento en perspectiva de conducción"
+          >
+            <Ionicons name="locate" size={28} color={currentTheme.routeColor} />
+          </TouchableOpacity>
+        )}
 
         {/* 3. Botón Central Dominante de Voz en la Parte Inferior */}
         <VoiceActionButton
@@ -1511,72 +1762,55 @@ const styles = StyleSheet.create({
     marginLeft: 5,
   },
   instructionCard: {
-    borderRadius: 20,
-    borderWidth: 1,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
+    borderRadius: 18,
+    borderWidth: 1.5,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
   },
-  instructionTopRow: {
+  instructionSimpleRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 6,
   },
-  instructionIconContainer: {
+  maneuverIconCircle: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    alignItems: 'center',
+    justifyContent: 'center',
     marginRight: 12,
   },
-  instructionTextContainer: {
+  instructionSimpleTextCol: {
     flex: 1,
+    justifyContent: 'center',
   },
-  badgeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 4,
-  },
-  destinationBadge: {
-    fontSize: 13,
+  maneuverDistanceText: {
+    fontSize: 20,
     fontWeight: '800',
-    letterSpacing: 1.1,
+    lineHeight: 24,
   },
-  simulatingPill: {
-    backgroundColor: '#FF9800',
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 10,
-    marginLeft: 6,
-  },
-  simulatingPillText: {
-    color: '#FFFFFF',
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 0.8,
-  },
-  instructionMainText: {
-    fontSize: 19,
-    fontWeight: '700',
-    lineHeight: 25,
-  },
-  instructionMetricsRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    borderTopWidth: 1,
-    paddingTop: 8,
-    marginTop: 6,
-  },
-  metricItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-  },
-  metricText: {
-    fontSize: 13,
+  maneuverActionText: {
+    fontSize: 15,
     fontWeight: '600',
+    lineHeight: 20,
+    marginTop: 2,
   },
-  metricDivider: {
-    width: 1,
-    height: 12,
-    opacity: 0.6,
+  etaBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 12,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 10,
+  },
+  etaBadgeTime: {
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  etaBadgeDist: {
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 1,
   },
   lightCardShadow: {
     shadowColor: '#000',
@@ -1591,5 +1825,36 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 12,
     elevation: 6,
+  },
+  recenterFab: {
+    position: 'absolute',
+    right: 20,
+    bottom: 145,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    borderWidth: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 30,
+    elevation: 8,
+  },
+  loadingScreenContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+  },
+  loadingScreenTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginBottom: 12,
+  },
+  loadingScreenSubtitle: {
+    fontSize: 16,
+    fontWeight: '500',
+    textAlign: 'center',
+    lineHeight: 24,
   },
 });

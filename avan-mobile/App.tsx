@@ -61,6 +61,17 @@ export default function App() {
       setRemainingDuration(routeData.duration);
       setRouteSteps(routeData.steps || []);
     }
+    // Purgar de forma estricta registros o confirmaciones pendientes para que HomeScreen inicie 100% limpia
+    setConversationContext((prev) => ({
+      ...prev,
+      pendingAliasRegistration: null,
+      pendingConfirmation: null,
+      activeRoute: {
+        destination,
+        inProgress: true,
+        startTime: Date.now(),
+      },
+    }));
     setZoomLevel(1.0);
     setViewMode('map');
   };

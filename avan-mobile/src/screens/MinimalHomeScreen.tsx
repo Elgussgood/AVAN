@@ -21,6 +21,7 @@ import {
 } from '../services/conversationService';
 import { orsService, StepInstruction } from '../services/orsService';
 import { LocationService } from '../services/locationService';
+import { AliasService } from '../services/aliasService';
 import { InteractiveMap } from '../components/InteractiveMap';
 
 export type VoiceState = 'idle' | 'listening' | 'processing' | 'speaking';
@@ -87,15 +88,25 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   // T-2.6: Saludo y guía auditiva al iniciar la app (reproducido solo una vez con retardo de 800ms)
   const hasAnnouncedWelcomeRef = useRef<boolean>(false);
   const lastProcessedRegistrationRef = useRef<any>(null);
+  const lastProcessedConfirmationRef = useRef<any>(null);
+  const addressPromptTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Sincronizar contexto entrante (incluyendo salto de contexto desde el mapa para registro de direcciones)
+  // Sincronizar contexto entrante (incluyendo salto de contexto desde el mapa para registro o confirmación de viaje)
   useEffect(() => {
     if (propContext) {
       setCurrentContext(propContext);
       contextRef.current = propContext;
 
+      if (addressPromptTimeoutRef.current) {
+        clearTimeout(addressPromptTimeoutRef.current);
+        addressPromptTimeoutRef.current = null;
+      }
+
+      // Caso 1: Salto de contexto para registro de direcciones
       const reg = propContext.pendingAliasRegistration;
-      if (reg && reg !== lastProcessedRegistrationRef.current) {
+      if (!reg) {
+        lastProcessedRegistrationRef.current = null;
+      } else if (reg !== lastProcessedRegistrationRef.current) {
         lastProcessedRegistrationRef.current = reg;
         hasAnnouncedWelcomeRef.current = true; // Suprimir bienvenida genérica para no encimar
 
@@ -103,7 +114,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           const prompt = `Con gusto. ¿Cuál es la dirección o colonia que desea guardar para ${reg.aliasName}?`;
           setSpokenMessage(prompt);
           setVoiceState('speaking');
-          setTimeout(() => {
+          addressPromptTimeoutRef.current = setTimeout(() => {
             VoiceService.speak(prompt, async () => {
               await startListeningWithVAD();
             });
@@ -112,14 +123,44 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           const prompt = `Entendí: ${reg.addressCandidate}. ¿Es correcta esta ubicación para ${reg.aliasName}?`;
           setSpokenMessage(prompt);
           setVoiceState('speaking');
-          setTimeout(() => {
+          addressPromptTimeoutRef.current = setTimeout(() => {
             VoiceService.speak(prompt, async () => {
               await startListeningWithVAD();
             });
           }, 350);
         }
+        return;
+      }
+
+      // Caso 2: Confirmación de nuevo viaje con mapa y pin (continuidad desde HomeScreen)
+      const conf = propContext.pendingConfirmation;
+      if (!conf) {
+        lastProcessedConfirmationRef.current = null;
+      } else if (conf !== lastProcessedConfirmationRef.current) {
+        lastProcessedConfirmationRef.current = conf;
+        hasAnnouncedWelcomeRef.current = true; // Suprimir bienvenida genérica para no encimar
+
+        const dest = conf.destination;
+        const prompt = conf.isForaneo
+          ? `Atención, este es un viaje foráneo en carretera hacia ${dest}. ¿Está seguro de iniciar el viaje ahora?`
+          : `He localizado ${dest}. ¿Desea que iniciemos el viaje hacia allá?`;
+
+        setSpokenMessage(prompt);
+        setVoiceState('speaking');
+        addressPromptTimeoutRef.current = setTimeout(() => {
+          VoiceService.speak(prompt, async () => {
+            await startListeningWithVAD();
+          });
+        }, 350);
       }
     }
+
+    return () => {
+      if (addressPromptTimeoutRef.current) {
+        clearTimeout(addressPromptTimeoutRef.current);
+        addressPromptTimeoutRef.current = null;
+      }
+    };
   }, [propContext]);
 
   // T-1.1: Saludo temporal autodesvanecible tras 4 segundos
@@ -159,7 +200,11 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   }, []);
 
   useEffect(() => {
-    if (!hasAnnouncedWelcomeRef.current && !contextRef.current.pendingAliasRegistration) {
+    if (
+      !hasAnnouncedWelcomeRef.current &&
+      !contextRef.current.pendingAliasRegistration &&
+      !contextRef.current.pendingConfirmation
+    ) {
       hasAnnouncedWelcomeRef.current = true;
       const timer = setTimeout(async () => {
         setVoiceState('speaking');
@@ -596,6 +641,15 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       // Actualizar contexto
       contextRef.current = response.updatedContext;
       setCurrentContext(response.updatedContext);
+
+      // Sincronizar referencias para evitar que el useEffect de propContext duplique el audio
+      if (response.updatedContext.pendingConfirmation) {
+        lastProcessedConfirmationRef.current = response.updatedContext.pendingConfirmation;
+      }
+      if (response.updatedContext.pendingAliasRegistration) {
+        lastProcessedRegistrationRef.current = response.updatedContext.pendingAliasRegistration;
+      }
+
       if (onContextChange) {
         onContextChange(response.updatedContext);
       }
@@ -622,11 +676,15 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         });
 
         try {
-          const userLocation = await LocationService.getCurrentLocation();
+          setSpokenMessage('Localizando su vehículo...');
+          const userLocation = await LocationService.getRealLocationOrWait((status) => {
+            setSpokenMessage(status);
+          });
           const startCoords = {
             latitude: userLocation.latitude,
             longitude: userLocation.longitude,
           };
+          setSpokenMessage(`Calculando la mejor ruta hacia ${dest}...`);
 
           // 1. Obtener coordenadas destino (aprovechando las ya geocodificadas si están disponibles)
           const args = response.functionCall.args as any;
@@ -672,12 +730,28 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           };
 
           setIsLoadingTrip(false);
+          if (addressPromptTimeoutRef.current) {
+            clearTimeout(addressPromptTimeoutRef.current);
+            addressPromptTimeoutRef.current = null;
+          }
+          contextRef.current.pendingAliasRegistration = null;
+          contextRef.current.pendingConfirmation = null;
+          await VoiceService.stop();
+
           if (onStartTrip) {
             onStartTrip(dest, routeData);
           }
         } catch (error) {
           console.warn('Error al calcular ruta vehicular:', error);
           setIsLoadingTrip(false);
+          if (addressPromptTimeoutRef.current) {
+            clearTimeout(addressPromptTimeoutRef.current);
+            addressPromptTimeoutRef.current = null;
+          }
+          contextRef.current.pendingAliasRegistration = null;
+          contextRef.current.pendingConfirmation = null;
+          await VoiceService.stop();
+
           if (onStartTrip) {
             onStartTrip(dest);
           }
@@ -728,8 +802,15 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
                 `¿Desea iniciar el viaje a ${response.updatedContext.pendingConfirmation.destination}?`
               );
             } else if (response.updatedContext.pendingAliasRegistration?.step === 'confirming_address') {
+              const isUpdating = Boolean(
+                response.updatedContext.pendingAliasRegistration.isUpdating ||
+                (response.updatedContext.pendingAliasRegistration.aliasName &&
+                  AliasService.getAlias(response.updatedContext.pendingAliasRegistration.aliasName))
+              );
               setSpokenMessage(
-                `¿Es correcta la ubicación para ${response.updatedContext.pendingAliasRegistration.aliasName}?`
+                isUpdating
+                  ? `¿Actualizar dirección para ${response.updatedContext.pendingAliasRegistration.aliasName}?`
+                  : `¿Es correcta la ubicación para ${response.updatedContext.pendingAliasRegistration.aliasName}?`
               );
             } else if (response.updatedContext.pendingAliasRegistration?.step === 'awaiting_address') {
               setSpokenMessage(
@@ -795,8 +876,15 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           `¿Desea iniciar el viaje a ${contextRef.current.pendingConfirmation.destination}?`
         );
       } else if (contextRef.current.pendingAliasRegistration?.step === 'confirming_address') {
+        const isUpdating = Boolean(
+          contextRef.current.pendingAliasRegistration.isUpdating ||
+          (contextRef.current.pendingAliasRegistration.aliasName &&
+            AliasService.getAlias(contextRef.current.pendingAliasRegistration.aliasName))
+        );
         setSpokenMessage(
-          `¿Es correcta la ubicación para ${contextRef.current.pendingAliasRegistration.aliasName}?`
+          isUpdating
+            ? `¿Actualizar dirección para ${contextRef.current.pendingAliasRegistration.aliasName}?`
+            : `¿Es correcta la ubicación para ${contextRef.current.pendingAliasRegistration.aliasName}?`
         );
       } else if (contextRef.current.pendingAliasRegistration?.step === 'awaiting_address') {
         setSpokenMessage(
@@ -821,7 +909,14 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     }
 
     if (currentContext.pendingAliasRegistration?.step === 'confirming_address') {
-      return `¿Guardar "${currentContext.pendingAliasRegistration.aliasName}"?`;
+      const isUpdating = Boolean(
+        currentContext.pendingAliasRegistration.isUpdating ||
+        (currentContext.pendingAliasRegistration.aliasName &&
+          AliasService.getAlias(currentContext.pendingAliasRegistration.aliasName))
+      );
+      return isUpdating
+        ? `¿Actualizar "${currentContext.pendingAliasRegistration.aliasName}"?`
+        : `¿Guardar "${currentContext.pendingAliasRegistration.aliasName}"?`;
     }
 
     if (currentContext.pendingAliasRegistration?.step === 'awaiting_address') {
@@ -907,19 +1002,46 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         : 'Destino seleccionado')
     : currentContext.pendingAliasRegistration?.addressCandidate || 'Dirección seleccionada';
 
-  const headerTitle = isConfirmingTrip ? 'CONFIRMAR VIAJE' : 'CONFIRMAR UBICACIÓN';
-  const headerIcon = isConfirmingTrip ? 'navigate-circle' : 'location';
+  const isUpdatingAlias = Boolean(
+    !isConfirmingTrip &&
+    (currentContext.pendingAliasRegistration?.isUpdating ||
+      (currentContext.pendingAliasRegistration?.aliasName &&
+        AliasService.getAlias(currentContext.pendingAliasRegistration.aliasName)))
+  );
+
+  const headerTitle = isConfirmingTrip
+    ? 'CONFIRMAR VIAJE'
+    : isUpdatingAlias
+    ? 'ACTUALIZAR UBICACIÓN'
+    : 'CONFIRMAR UBICACIÓN';
+  const headerIcon = isConfirmingTrip
+    ? 'navigate-circle'
+    : isUpdatingAlias
+    ? 'sync-circle'
+    : 'location';
 
   const confirmQuestion = isConfirmingTrip
     ? (currentContext.pendingConfirmation!.isForaneo
         ? '¿Iniciar viaje foráneo hacia allá?'
         : '¿Desea iniciar el viaje hacia allá?')
+    : isUpdatingAlias
+    ? `¿Actualizar dirección de ${currentContext.pendingAliasRegistration?.aliasName}?`
     : '¿Es correcta esta ubicación?';
 
-  const confirmButtonLabel = isConfirmingTrip ? 'SÍ, INICIAR VIAJE' : 'SÍ, GUARDAR';
-  const confirmButtonIcon = isConfirmingTrip ? 'navigate' : 'checkmark-circle';
+  const confirmButtonLabel = isConfirmingTrip
+    ? 'SÍ, INICIAR VIAJE'
+    : isUpdatingAlias
+    ? 'SÍ, ACTUALIZAR'
+    : 'SÍ, GUARDAR';
+  const confirmButtonIcon = isConfirmingTrip
+    ? 'navigate'
+    : isUpdatingAlias
+    ? 'sync'
+    : 'checkmark-circle';
   const confirmButtonHint = isConfirmingTrip
     ? 'Inicia el cálculo de ruta y navegación guiada'
+    : isUpdatingAlias
+    ? 'Actualiza la dirección guardada para este contacto o lugar'
     : 'Guarda esta ubicación con el nombre asignado';
 
   const rejectButtonLabel = isConfirmingTrip ? 'CANCELAR' : 'NO, CORREGIR';
@@ -1246,7 +1368,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
                 { color: currentTheme.textSecondary },
               ]}
             >
-              {`Calculando la mejor ruta hacia ${loadingDestination}...\nPor favor espere un momento.`}
+              {spokenMessage || `Calculando la mejor ruta hacia ${loadingDestination}...\nPor favor espere un momento.`}
             </Text>
           </View>
         </View>

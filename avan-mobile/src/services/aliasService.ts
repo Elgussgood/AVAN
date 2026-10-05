@@ -43,6 +43,22 @@ function normalizeForSearch(text: string): string {
 }
 
 /**
+ * Extrae tokens esenciales eliminando preposiciones, artículos y posesivos comunes.
+ * Permite emparejar variaciones como "la casa de mi primo" con "casa primo".
+ */
+function extractCoreTokens(text: string): string[] {
+  const stopWords = new Set([
+    'a', 'al', 'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas',
+    'de', 'del', 'con', 'en', 'para', 'por', 'hacia', 'donde',
+    'mi', 'mis', 'tu', 'tus', 'su', 'sus', 'nuestro', 'nuestra',
+    'ir', 'vamos', 'llevame', 'llevarme', 'viajar', 'navegar', 'quiero'
+  ]);
+  return normalizeForSearch(text)
+    .split(/\s+/)
+    .filter((token) => token.length > 1 && !stopWords.has(token));
+}
+
+/**
  * Alias predeterminados realistas para adultos mayores en la Ciudad de México
  */
 const DEFAULT_ALIASES: SavedAlias[] = [
@@ -264,17 +280,30 @@ export class AliasService {
 
     // 2. Coincidencia eliminando partículas conversacionales comunes
     // ("ir con", "a casa de", "con", "donde", "a lo de", "a", "al", "mi", "el", "la")
-    const cleanQuery = normalizedQuery
-      .replace(/^(?:ir\s+con|ir\s+a|llevarme\s+con|llevame\s+con|llevame\s+a|vamos\s+con|vamos\s+a)\s+/g, '')
-      .replace(/^(?:a\s+casa\s+de|casa\s+de|donde|a\s+lo\s+de)\s+/g, '')
-      .replace(/^(?:a|al|en|con|de)\s+/g, '')
-      .replace(/^(?:mi|mis|el|la|los|las)\s+/g, '')
-      .trim();
+    let cleanQuery = normalizedQuery;
+    let prevClean = '';
+    while (cleanQuery !== prevClean) {
+      prevClean = cleanQuery;
+      cleanQuery = cleanQuery
+        .replace(/^(?:quiero\s+ir|quisiera\s+ir|deseo\s+ir|voy\s+a|ir\s+con|ir\s+a|llevarme\s+con|llevame\s+con|llevame\s+a|vamos\s+con|vamos\s+a|navegar\s+a|llegar\s+a)\s+/g, '')
+        .replace(/^(?:a\s+la\s+casa\s+de|a\s+casa\s+de|la\s+casa\s+de|el\s+departamento\s+de|casa\s+de|a\s+lo\s+de|lo\s+de|donde)\s+/g, '')
+        .replace(/^(?:a|al|en|con|de|hacia|para|por)\s+/g, '')
+        .replace(/^(?:mi|mis|el|la|los|las|un|una)\s+/g, '')
+        .trim();
+    }
+
+    // Comprobación de seguridad: Si la consulta se refiere explícitamente a la casa de otra persona
+    // (ej. "casa de mi hermano", "casa de mi primo", "casa de mariana", "con mi compadre"),
+    // NUNCA debe coincidir por error con 'alias-casa' ("mi casa").
+    const isOtherHouseQuery =
+      /(?:casa\s+de|a\s+lo\s+de|donde|depto\s+de)\s+(?!mi\s+casa\b|hijo\b)/i.test(normalizedQuery) ||
+      /(?:con\s+mi|con\s+el|con\s+la)\s+(?!hijo\b|doctor\b|medico\b)/i.test(normalizedQuery);
 
     // Mapeos léxicos semánticos frecuentes para adultos mayores
     const synonymMap: Record<string, string> = {
       hijo: 'alias-hijo',
       'mi hijo': 'alias-hijo',
+      'con mi hijo': 'alias-hijo',
       'casa de mi hijo': 'alias-hijo',
       'casa de hijo': 'alias-hijo',
       doctor: 'alias-doctor',
@@ -294,18 +323,42 @@ export class AliasService {
 
     if (synonymMap[cleanQuery]) {
       const found = this.aliases.get(synonymMap[cleanQuery]);
-      if (found) return found;
+      if (found) {
+        if (found.id === 'alias-casa' && isOtherHouseQuery) {
+          // No asignar 'mi casa' si la consulta es sobre la casa de otra persona
+        } else {
+          return found;
+        }
+      }
     }
 
     if (synonymMap[normalizedQuery]) {
       const found = this.aliases.get(synonymMap[normalizedQuery]);
-      if (found) return found;
+      if (found) {
+        if (found.id === 'alias-casa' && isOtherHouseQuery) {
+          // No asignar 'mi casa'
+        } else {
+          return found;
+        }
+      }
     }
 
     // 3. Coincidencia parcial o por contención
     for (const item of this.aliases.values()) {
+      if (item.id === 'alias-casa' && isOtherHouseQuery) {
+        continue;
+      }
+
       const normalizedItemAlias = normalizeForSearch(item.alias);
       const normalizedName = normalizeForSearch(item.name);
+
+      // Si el alias es 'mi casa', solo coincide si la consulta es específicamente 'mi casa' o 'casa'
+      if (item.id === 'alias-casa') {
+        if (normalizedQuery === 'mi casa' || normalizedQuery === 'casa' || cleanQuery === 'casa') {
+          return item;
+        }
+        continue;
+      }
 
       if (
         normalizedQuery.includes(normalizedItemAlias) ||
@@ -313,6 +366,37 @@ export class AliasService {
         (cleanQuery.length > 2 && (normalizedItemAlias.includes(cleanQuery) || normalizedName.includes(cleanQuery)))
       ) {
         return item;
+      }
+    }
+
+    // 4. Coincidencia por conjunto de tokens clave (Token Overlap / Bag of Words)
+    // Permite que variaciones coloquiales como "la casa de mi primo" coincidan con "casa primo"
+    const queryTokens = extractCoreTokens(normalizedQuery);
+    if (queryTokens.length > 0) {
+      for (const item of this.aliases.values()) {
+        if (item.id === 'alias-casa' && isOtherHouseQuery) {
+          continue;
+        }
+
+        const itemTokens = extractCoreTokens(item.alias);
+        if (itemTokens.length > 0) {
+          // Si el alias es 'mi casa', solo coincide si los tokens de la consulta son exclusivamente ['casa'] u ['hogar']
+          if (item.id === 'alias-casa' || item.alias === 'mi casa') {
+            if (queryTokens.length === 1 && (queryTokens[0] === 'casa' || queryTokens[0] === 'hogar')) {
+              return item;
+            }
+            continue;
+          }
+
+          // Para otros alias: los conjuntos de tokens deben coincidir exactamente
+          const areSetsEqual =
+            itemTokens.length === queryTokens.length &&
+            itemTokens.every((t) => queryTokens.includes(t));
+
+          if (areSetsEqual) {
+            return item;
+          }
+        }
       }
     }
 

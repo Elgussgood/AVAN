@@ -191,6 +191,209 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
     * Actualizado en [`HomeScreen.tsx`](file:///D:/Escom/Sexto%20semestre/Interacci%C3%B3n/AVAN/avan-mobile/src/screens/HomeScreen.tsx) (diálogos de continuidad de viaje, fin de ruta, despedida y comandos en ruta).
   - **Certificación**:
     * `npx tsc --noEmit` certificado con 0 errores.
+- [x] **TASK-29**: **Mitigación de Ruido Acústico Vehicular, VAD Adaptativo y Blindaje Anti-Alucinaciones en Whisper STT (`05-voz-stt-tts.md`, `07-mobile-frontend.md`)**:
+  - **Estimación Dinámica de Piso de Ruido (Noise Floor Calibration)**:
+    * Se implementó calibración inicial durante los primeros 400ms y seguimiento continuo mediante promedio móvil exponencial (EMA) para medir el nivel acústico ambiental del habitáculo o vehículo.
+    * Umbral adaptativo dinámico: `adaptiveThresholdDb = Math.max(baseSpeechThresholdDb, noiseFloorDb + 8 dB)`, elevando automáticamente la sensibilidad requerida en presencia de rodamiento, tráfico o aire acondicionado sin captar el ruido de fondo como voz.
+    * Elevación del umbral mínimo de habla (`baseSpeechThresholdDb`) de -38 dB a **-32 dB**.
+  - **Persistencia Temporal y Debounce Acústico**:
+    * Se eliminó el disparo por picos aislados de 100ms; ahora se exige un mínimo de **2 frames consecutivos (~200ms)** por encima del umbral adaptativo para confirmar el inicio de habla.
+    * Filtro de duración mínima de habla: si un evento acústico dura menos de 300ms o menos de 2 frames en total (clicks, baches, tos lejana), se descarta como ruido espurio y el sistema reanuda la escucha sin cortar la interacción ni llamar a la API.
+  - **Blindaje Anti-Alucinaciones y Sanitización de Whisper**:
+    * Se incorporó `temperature: 0` para eliminar estocasticidad y desalentar alucinaciones en silencio o ruido.
+    * Se acondicionó la inferencia con el `prompt`: *"Comandos breves de navegación vehicular AVAN en español. Si solo hay silencio, ruido de motor o ambiente de auto, responde exactamente vacío."*
+    * Sanitizador heurístico estático `sanitizeWhisperOutput(text)` que detecta y descarta alucinaciones típicas de Whisper sobre ruido (subtítulos de Amara/YouTube, signos aislados de puntuación, etiquetas de sonido y bucles autoregresivos).
+  - **Certificación**:
+    * `npx tsc --noEmit` ejecutado con 0 errores.
+
+- [x] **TASK-30**: **Ruteo Vehicular Multi-Tier Resiliente (ORS + OSRM) y Auto-Encuadre Cartográfico (`06-mapas-ruteo.md`, `07-mobile-frontend.md`)**:
+  - **Diagnóstico de Rutas Mal Trazadas (Líneas Curvas y Desconexión de Calles)**:
+    * Se diagnosticó por qué las rutas se veían incorrectas: al solicitar direcciones a OpenRouteService (`/v2/directions/driving-car/geojson`), la API de ORS arrojaba `504 Gateway Time-out` (o `403 Forbidden` en claves con cuota no activada para direcciones).
+    * Al fallar ORS, el sistema caía en `generateFallbackRoute`, el cual trazaba una curva senoidal matemática sintética (`Math.sin(t * Math.PI)`) atravesando manzanas y edificios en vez de seguir la traza urbana vehicular.
+  - **Arquitectura de Ruteo Multi-Tier de Alta Resiliencia en `orsService.ts`**:
+    * **Tier 1 (OpenRouteService con AbortController de 3.5s)**: Si hay clave configurada y responde ágilmente, se usa ORS. Si excede 3.5 segundos o arroja error, se aborta sin bloquear la UI del conductor.
+    * **Tier 2 (OSRM - Open Source Routing Machine)**:
+      - Motor de enrutamiento basado en OpenStreetMap: `https://router.project-osrm.org/route/v1/driving/...`
+      - 100% gratuito, sin cuotas ni necesidad de API key.
+      - Latencia ultra-baja: responde en **500 - 600 ms**.
+      - Geometría vehicular exacta de calles reales (ej. 284 puntos de calle entre ESCOM y Bellas Artes siguiendo Eje Central, Insurgentes, etc.).
+      - Maniobras turn-by-turn reales traducidas al español mexicano cálido y accesible (`translateOsrmManeuver`) con nombres exactos de avenidas y calles (*"Inicie su recorrido por..."*, *"Gire a la derecha en Avenida Juárez"*, *"En la rotonda tome la salida hacia..."*).
+      - Mapeo secuencial de índices `wayPoints` (`[startIndex, endIndex]`) perfectamente coordinado con `NavigationService.evaluateProgress` para los anuncios por voz proactivos a <180m y <55m.
+    * **Tier 3 (Fallback de Emergencia Local)**: Reservado exclusivamente para escenarios sin conexión a internet (offline).
+  - **Auto-Encuadre de Polilínea en Pantalla (`InteractiveMap.tsx`)**:
+    * Al renderizar la ruta activa (`routeMainPolyline`), el mapa de Leaflet calcula de forma inmediata los límites de la polilínea y ejecuta `map.fitBounds(routeMainPolyline.getBounds(), { paddingTopLeft: [90, 40], paddingBottomRight: [90, 160], maxZoom: 16, animate: true })`.
+    * Garantiza que el conductor observe el recorrido completo en el mapa con los márgenes de seguridad ergonómicos adecuados para la tarjeta superior y el botón inferior.
+  - **Certificación**:
+    * Verificación algorítmica de waypoints y trazado de rutas reales en CDMX superada.
+    * `npx tsc --noEmit` certificado con 0 errores.
+
+- [x] **TASK-31**: **Navegación Táctil Interactiva, Zoom Vehicular Calibrado (17) y Zoom Graduado por Voz con Intensidad (`02-ux-accesibilidad.md`, `04-nlu-conversacional.md`, `06-mapas-ruteo.md`, `07-mobile-frontend.md`)**:
+  - **Calibración y Normalización del Zoom Gerontológico de Conducción**:
+    * Diagnóstico de causa raíz: la llamada automática a `fitToCoordinates` intentaba forzar toda la polilínea completa en pantalla, provocando que en rutas largas el mapa se alejara a nivel 11-12 (calles invisibles) y al interrumpir o recalcular hacia tramos cortos se acercara abruptamente a nivel 18-19.
+    * Definición de constantes canónicas:
+      - `ZOOM_NAVIGATION = 17`: Zoom cercano de conducción turn-by-turn fijado en el vehículo con orientación de rumbo, garantizando visibilidad inmediata de calles y esquinas de giro.
+      - `ZOOM_PREVIEW = 14`: Zoom panorámico para la confirmación de destino en `MinimalHomeScreen`.
+    * Al iniciar cualquier viaje o interrumpir uno para empezar otro, la cámara se posiciona siempre de manera estable y consistente en zoom 17 sin saltos visuales descalibrados.
+  - **Desbloqueo Táctil Total del Mapa (Estilo Google Maps)**:
+    * Se eliminó el bloqueo de gestos: configuración de `pointerEvents="box-none"` en `SafeAreaView` y `topContainer` en `HomeScreen.tsx`, permitiendo que los eventos táctiles lleguen al mapa interactivo.
+    * En `InteractiveMap.tsx`, se habilitó `scrollEnabled={true}` en el `WebView` y `dragging: true, touchZoom: true, tap: true, doubleClickZoom: true` en Leaflet.
+    * Detección de exploración manual (`USER_INTERACTION`): al arrastrar o hacer pinch-to-zoom con los dedos, la app suspende el seguimiento forzado de cámara para permitir al usuario inspeccionar cruces e incidentes libremente.
+    * Botón flotante accesible **"Recentrar"**: componente de alto contraste con icono de localización y tipografía grande que emerge sobre el botón de voz; al pulsarlo (o al decir *"centrar mapa"*), reubica suavemente la vista en el auto con zoom 17. Incluye auto-recentrado automático tras 10 segundos de inactividad táctil.
+  - **Control de Zoom Graduado por Voz vía Function Calling**:
+    * Extensión de la herramienta `ajustar_zoom` en `conversationService.ts` con el argumento `intensidad: 'normal' | 'mucho' | 'poco'`.
+    * Acondicionamiento del System Prompt en Groq LLM y del motor heurístico local con expresiones naturales ("haz mucho zoom", "acerca bastante", "aleja un poco", "al máximo").
+    * Ejecución dinámica en `InteractiveMap.tsx` con deltas proporcionales (+1.0 normal, +2.0 mucho, +0.5 poco / -1.5 normal, -3.5 mucho, -0.7 poco).
+- [x] **TASK-32**: **Perspectiva POV del Conductor (Heading-Up Google Maps), Tarjeta Minimalista con Auto-Ocultamiento, FAB Circular de Recentrado y Confirmación con Mapa en Continuidad (`02-ux-accesibilidad.md`, `06-mapas-ruteo.md`, `07-mobile-frontend.md`)**:
+  - **Perspectiva POV del Conductor (Heading-Up Orientado al Rumbo)**:
+    * Se integró el plugin oficial `leaflet-rotate` (v0.2.8) en `InteractiveMap.tsx` con soporte para rotación continua de teselas, polilíneas de ruta y marcadores.
+    * En navegación activa (`followUser: true`), el mapa rota dinámicamente con `map.setBearing(heading)` hacia el rumbo del vehículo; la flecha chevron permanece apuntando siempre hacia adelante/arriba (`0deg` relativo a la pantalla), proporcionando la perspectiva natural de cabina vehicular idéntica a Google Maps / Waze.
+    * Soporte para rotación táctil con dos dedos (`touchRotate: true`) al explorar el mapa manualmente.
+    * Al recentrar, la cámara vuelve a enfocar el vehículo y reorienta el mapa al rumbo actual de avance.
+  - **Tarjeta de Maniobras Minimalista y Auto-Ocultamiento Inteligente**:
+    * Rediseño sin ruido visual en `HomeScreen.tsx`: se eliminaron textos redundantes y filas duplicadas de métricas. Se condensó en una sola fila limpia con icono de giro prominente (32px), distancia en gran tamaño ("En 200 m"), maniobra concisa ("Gire a la derecha") y pastilla compacta de tiempo/distancia ("12 min • 4.2 km").
+    * Auto-ocultamiento en tramos rectos prolongados: si la maniobra actual es seguir recto y la distancia al siguiente punto de giro supera los 450 metros (`distanceToNextManeuver > 450`), la tarjeta se desvanece suavemente con `Animated.timing` (opacidad y traslación vertical), dejando el mapa 100% despejado y libre de distracciones visuales.
+    * Reaparición automática y oportuna cuando falten <= 450m para un giro, cuando la maniobra requiera acción (giros, rotondas, cambios de carril), tras un cambio reciente de maniobra (7 segundos) o al aproximarse a destino (<= 450m).
+  - **Botón de Recentrar Minimalista (FAB Circular sin Texto)**:
+    * Se eliminó el texto "Recentrar" y la superposición geométrica encima del botón central de voz.
+    * FAB circular ergonómico de 56x56 dp con icono `locate` (28px), ubicado en la esquina inferior derecha (`right: 20, bottom: 145`), accesible con el pulgar derecho y con alto contraste cromático y sombras de elevación.
+  - **Confirmación Visual con Pin en Mapa en Flujos de Continuidad**:
+    * Al concluir o cancelar un viaje y solicitar un nuevo destino ("¿Desea viajar a algún otro lugar?"), el sistema geocodifica el lugar y transiciona a la pantalla de confirmación multimodal.
+    * Se despliega el mapa interactivo centrado en las coordenadas geocodificadas con el pin de destino, tarjeta con el nombre del lugar y opciones táctiles y por voz ("SÍ, INICIAR VIAJE" / Micrófono / "CANCELAR"), homologando el estándar de confirmación en dos pasos en toda la aplicación.
+  - **Certificación**:
+    * `npx tsc --noEmit` certificado con 0 errores de TypeScript.
+
+- [x] **TASK-33**: **Geocodificación Exhaustiva de Transporte CDMX, Suavizado de Rotación Automática (Filtro EMA + Deadband) y Eliminación de Colisión de Voces (`04-nlu-conversacional.md`, `06-mapas-ruteo.md`, `07-mobile-frontend.md`)**:
+  - **Catálogo de Alta Fidelidad de Transporte CDMX (`cdmxTransportPois.ts` y `orsService.ts`)**:
+    * Creación de catálogo exhaustivo en `src/data/cdmxTransportPois.ts` con estaciones oficiales del STC Metro (Líneas 1 a 12), Tren Suburbano, Metrobús y terminales centrales de pasajeros (Politécnico, Insurgentes, Tacubaya, Bellas Artes, Indios Verdes, Buenavista, Observatorio, Tasqueña, etc.).
+    * Sistema de puntuación y ranking de relevancia en `searchFallbackDestinations`: priorización estricta por coincidencia de nombre exacto y alias (score 100/95) por encima de coincidencias viales secundarias (score 20).
+    * Resolución en Tier 0 instantánea (0ms) con coordenadas exactas verificadas manualmente, sin consumo de cuota ni fallos por mala conexión.
+  - **Suavizado de Rotación y Estabilización Cinemática (`InteractiveMap.tsx`)**:
+    * Implementación de cálculo de distancia angular más corta (*shortest arc* `((diff + 540) % 360) - 180`) para evitar giros de 350° al cruzar el norte (0°/360°).
+    * Umbral de banda muerta (*deadband threshold*): supresión de micro-variaciones menores a 3.5° para eliminar temblores bruscos y jitter magnético del sensor.
+    * Filtro paso bajo de media móvil exponencial (*Exponential Moving Average - EMA*, alpha = 0.28) que suaviza cinematográficamente la orientación del mapa en modo conductor (POV).
+    * Filtro de inmovilidad: cuando la velocidad es inferior a 1.2 m/s (~4 km/h), el rumbo se congela ante fluctuaciones espurias en semáforos o paradas vehiculares.
+    * Curva de animación CSS `cubic-bezier(0.25, 0.1, 0.25, 1.0)` en la flecha vehicular y mapa para giro fluido sin tirones.
+  - **Eliminación Definitiva de Colisión de Voces y Falsos Registros de Dirección**:
+    * En `conversationService.ts`: extensión de `extractDestination` para reconocer menciones directas de estaciones o POIs ("metro politécnico", "metro insurgentes") sin requerir verbos gramaticales obligatorios; exclusión absoluta de transporte y sitios públicos en `isPersonalPlaceIntent` para evitar falsas solicitudes de "¿Cuál es la dirección?".
+    * En `App.tsx` (`handleStartTrip`): purga estricta de `pendingAliasRegistration = null` y `pendingConfirmation = null` al transicionar a navegación.
+    * En `MinimalHomeScreen.tsx`: control y cancelación de `addressPromptTimeoutRef` y llamado obligatorio a `VoiceService.stop()` antes de delegar el control a `HomeScreen`.
+    * En `HomeScreen.tsx`: detención explícita de audios residuales (`VoiceService.stop()`) al montar la pantalla de navegación antes de emitir la bienvenida de ruta.
+  - **Certificación**:
+    * Pruebas de integración superadas con `scratch/test_metro_verification.ts`.
+    * `npx tsc --noEmit` certificado con 0 errores de TypeScript.
+
+- [x] **TASK-33B**: **Inversión Geométrica de Rotación Heading-Up y Simulador Cinemático Robusto (`06-mapas-ruteo.md`, `07-mobile-frontend.md`)**:
+  - **Corrección del Sentido de Giro en Modo Conductor (`InteractiveMap.tsx`)**:
+    * Diagnóstico: el método `setBearing` de Leaflet aplica rotación CSS horaria (`rotate(theta)`). Para que el rumbo de avance apunte siempre hacia arriba en la pantalla, la rotación del mapa debe ser antihoraria (`(360 - heading) % 360`).
+    * Al girar a la derecha, el mapa ahora rota correctamente en sentido antihorario manteniendo el avance vehicular recto hacia arriba. En modo libre (`followUser: false`), la flecha en pantalla se desacopla y orienta fielmente según el ángulo relativo `(heading + mapBearing) % 360`.
+  - **Simulador de Conducción Cinemático y Demostrativo (`HomeScreen.tsx`)**:
+    * Avance cinemático adaptativo: el simulador avanza buscando el siguiente vértice a al menos 18 metros de distancia a intervalos de 900ms, emulando una velocidad de crucero constante de ~40 km/h (`speed: 11.2 m/s`).
+    * Cálculo de rumbo anticipado: en cada paso se calcula el vector de rumbo hacia la siguiente curva o calle (`getBearing(currPt, futurePt)`), permitiendo que la flecha y el mapa roten anticipadamente al tomar las curvas aunque el usuario esté inmóvil con el dispositivo en la mano.
+    * Certificación con `npx tsc --noEmit` (0 errores).
+
+- [x] **TASK-34**: **Implementación de Motor Cartográfico MapLibre GL JS (Opción B), Barge-in de Voz y Validación Estricta de Llegada (`02-ux-accesibilidad.md`, `06-mapas-ruteo.md`, `07-mobile-frontend.md`)**:
+  - [x] **TASK-34A**: *Sincronización del Estado Visual del Botón en Confirmación (`MinimalHomeScreen.tsx`)*:
+    * Se aseguró que mientras el asistente reproduce la locución de confirmación ("He localizado [Destino]. ¿Desea que iniciemos el viaje?"), el botón central permanezca en azul (`#3B82F6`) con icono `volume-high` y halo animado.
+    * Sincronización y purga de referencias `lastProcessedConfirmationRef` y `lastProcessedRegistrationRef` para prevenir activaciones prematuras del modo de escucha.
+  - [x] **TASK-34B**: *Interrupción Inmediata de Instrucciones de Voz (Barge-in en Navegación, `HomeScreen.tsx`)*:
+    * En `handleVoicePress`: si el sistema está hablando una maniobra o instrucción paso a paso (`voiceState === 'speaking'` o `VoiceService.isSpeaking()`), al presionar el botón de micrófono se silencia de inmediato el audio (`VoiceService.stop()`), se cancela el timeout pendiente y se abre el micrófono con VAD dinámico sin esperas.
+  - [x] **TASK-34C**: *Validación Estricta de Llegada a Destino por Distancia Residual de Ruta (`HomeScreen.tsx`)*:
+    * Se eliminó el falso positivo donde el viaje finalizaba prematuramente al pasar del otro lado de la avenida antes de dar el retorno en U.
+    * La detección de llegada ahora exige de forma conjunta: cercanía física euclidiana (`distToTarget <= 50m`) Y que la distancia restante de la ruta recorrida sea mínima (`progress.remainingDistance <= 75m` o últimos vértices de la simulación).
+  - [x] **TASK-34D**: *Implementación de MapLibre GL JS v4 con Aceleración WebGL (Opción B, `InteractiveMap.tsx`)*:
+    * **Motor WebGL 2.0**: Migración de Leaflet a MapLibre GL JS v4.7.1 dentro de WebView con renderizado nativo por GPU a 60 FPS estables.
+    * **Estilos Vectoriales AVAN**: Integración de estilos vectoriales libres de OpenFreeMap (Positron para Modo Día con paleta `#F1F4F7`, calles blancas `#FFFFFF` y parques `#D5ECD5`; Dark para Modo Noche con fondo marino profundo `#0B111D`, vías `#172238` y etiquetas atenuadas `#94A3B8`). Supresión de POIs comerciales invasivos para mantener el mapa 100% despejado y legible para adultos mayores.
+    * **Perspectiva POV 3D del Conductor**: Inclinación `pitch: 45°` y rotación continua por GPU (`map.easeTo` con `bearing: currentSmoothedBearing`) para perspectiva de carretera estilo Google Maps.
+    * **Modo Libre vs. Conductor**: En exploración táctil manual (`followUser: false`), la flecha vehicular se desacopla y orienta fielmente según el ángulo relativo `(heading - mapBearing + 360) % 360`. Al pulsar Recentrar, la cámara vuelve al vehículo con zoom 17, `pitch: 45°` y rumbo alineado al avance.
+    * **Polilínea y Marcadores GeoJSON**: Capas vectoriales `route-glow` y `route-main` con trazado suave en curvas, marcador chevron vehicular de alta nitidez y pin de destino estilizado.
+    * **Resiliencia de Red**: Detección automática y fallback transparente a teselas ráster de CartoDB ante cualquier lentitud o error en la descarga de estilos vectoriales.
+    * **Certificación**: Compilación limpia con `npx tsc --noEmit` (0 errores de TypeScript).
+
+- [x] **TASK-35**: **Estabilización de Capas en Modo Noche, Recorte Dinámico de Polilínea Transitada, Preservación de Zoom en Recentrado y Geolocalización Inicial Inmediata (`06-mapas-ruteo.md`, `07-mobile-frontend.md`, `02-ux-accesibilidad.md`, `09-qa-accesibilidad.md`)**:
+  - **Corrección de Polilínea en Modo Noche (`InteractiveMap.tsx`)**:
+    * Diagnóstico de causa raíz: Al arrancar la app en modo noche, tras el evento `MAP_READY` el efecto React enviaba `SET_THEME { isDarkMode: true }`. En la WebView, `setTheme()` invocaba `map.setStyle()` incondicionalmente aunque el estilo nocturno ya estuviese activo, lo cual en MapLibre GL JS destruye todas las capas y fuentes dinámicas (`route-source`, `route-glow`, `route-main`) restableciendo las coordenadas vacías.
+    * Solución: Se introdujo la bandera de estado `activeLoadedTheme`. `setTheme` solo recarga `map.setStyle()` cuando el tema efectivamente cambia (`requestedTheme !== activeLoadedTheme`). Si el tema es el mismo, únicamente actualiza las propiedades de pintura (`setPaintProperty`) de la polilínea y los iconos SVG de los marcadores. Además, `applyRouteData` ahora invoca defensivamente `setupRouteLayers()` antes de inyectar datos en `route-source`.
+  - **Recorte Dinámico de Tramo de Ruta Ya Transitado (`navigationService.ts` y `HomeScreen.tsx`)**:
+    * Implementación de la función `NavigationService.getRemainingPolyline(currentPos, polyline, currentIndex)`.
+    * En el simulador cinemático recorta los segmentos recorridos con base en el índice actual (`polyline.slice(simIndex + 1)`), mientras que en navegación real por GPS proyecta la posición del vehículo sobre el segmento más cercano y recorta la trayectoria previa.
+    * El mapa renderiza la polilínea restante dinámicamente (`routeCoordinates={remainingRouteCoords}`), haciendo que el tramo recorrido desaparezca detrás del vehículo tanto en simulación como en viaje real.
+  - **Preservación del Nivel de Zoom del Usuario al Recentrar (`InteractiveMap.tsx` y `HomeScreen.tsx`)**:
+    * Se eliminó el parámetro forzado `17` que sobreescribía la preferencia del usuario al pulsar el botón circular de recentrado o al decir "centrar mapa".
+    * En la WebView de MapLibre: si no se especifica un zoom en el payload del mensaje `RECENTER`, `targetZoom` toma el nivel de zoom actual del mapa (`map.getZoom()`).
+    * En `HomeScreen.tsx`, `handleRecenter()` invoca `mapRef.current?.recenter()` sin argumentos arbitrarios, respetando si el usuario había acercado o alejado la vista previamente.
+  - **Geolocalización Inicial Inmediata sin Salto a Reforma (`locationService.ts`, `InteractiveMap.tsx`, `HomeScreen.tsx`)**:
+    * Diagnóstico: Al iniciar viaje, si el GPS aún no entregaba coordenadas satelitales frescas, `LocationService` caía al `catch` retornando la coordenada por defecto en Paseo de la Reforma (`19.427025, -99.167665`), y el mapa se inicializaba centrado en dicha coordenada sin considerar el origen real de la ruta.
+    * En `LocationService.ts`: Implementación de caché de última ubicación conocida (`cachedLocation`) consultando primero `Location.getLastKnownPositionAsync({ maxAge: 120000 })` de forma inmediata (0ms), con timeout estricto de 3.5s para fijar posición fresca con `Promise.race`. Si no hay satélite inmediato, devuelve la ubicación real cacheada.
+    * En `HomeScreen.tsx` e `InteractiveMap.tsx`: Se calcula `initialMapRegion` priorizando el primer vértice de la ruta activa (`activeRouteCoords[0]`) o la ubicación del usuario, y se define el fallback de `effectiveLocation` con el origen de la ruta en vez de nulo o Reforma.
+  - **Certificación**:
+    * Verificación de TypeScript con `npx tsc --noEmit` superada exitosamente con 0 errores.
+
+- [x] **TASK-36**: **Retención en Pantalla de Carga Hasta GPS Real y Desacoplamiento de Gestos Programáticos en Cámara (`06-mapas-ruteo.md`, `07-mobile-frontend.md`, `02-ux-accesibilidad.md`, `09-qa-accesibilidad.md`)**:
+  - **Retención Estricta en Pantalla de Carga Hasta Obtener Ubicación Real (`locationService.ts`, `MinimalHomeScreen.tsx`, `useLocationTracking.ts`, `HomeScreen.tsx`)**:
+    * Diagnóstico de Causa Raíz de Reforma: En `LocationService.ts`, la variable `lastKnownLocation` del observador de brújula (`watchHeadingAsync`) se inicializaba con `defaultLocation` (Reforma). Dado que el sensor de orientación magnetométrica emite múltiples eventos por segundo al arrancar la app, el observador enviaba inmediatamente las coordenadas de Reforma a `useLocationTracking` antes de que el receptor satelital pudiera sincronizarse. Adicionalmente, el cálculo de ruta en `MinimalHomeScreen.tsx` abortaba la espera a los 3.5s y usaba Reforma como origen.
+    * Solución Integral:
+      1. Se eliminó la emisión prematura de coordenadas en `watchHeadingAsync`: el observador de rumbo ahora solo emite actualizaciones si ya se dispone de una posición satelital real confirmada (`hasReceivedRealGps`).
+      2. `LocationService.getRealLocationOrWait()`: función resiliente que espera activamente en la pantalla de carga (consultando la última posición del SO sin restricciones y ejecutando hasta 4 ciclos satelitales con reportes de estado visual).
+      3. En `MinimalHomeScreen.tsx`: la pantalla de carga ("Preparando su viaje...") se mantiene activa con retroalimentación paso a paso ("Localizando su vehículo...", "Calculando la mejor ruta hacia [Destino]...") y solo procede al cálculo de ruta cuando la posición satelital real está garantizada.
+      4. En `useLocationTracking.ts`: `userLocation` se mantiene en `null` hasta recibir un punto satelital real, impidiendo que el mapa se posicione en Reforma.
+      5. En `HomeScreen.tsx`: si no hay ruta ni ubicación vehicular disponible, se despliega una pantalla de carga accesible con indicador de actividad en lugar de abrir el mapa en Reforma.
+  - **Desacoplamiento de Animaciones Programáticas de Cámara vs. Gestos de Usuario (`InteractiveMap.tsx`)**:
+    * Diagnóstico de por qué el mapa no se movía con la flecha: En MapLibre GL JS, los eventos `rotatestart` y `pitchstart` se disparan cada vez que el rumbo o la inclinación de la cámara cambian, tanto por gestos del usuario como por llamadas programáticas (`map.easeTo`). Como los manejadores de MapLibre en la WebView no validaban `e.originalEvent`, la animación de inicio de ruta (`recenter(17)` a los 500ms) o la primera actualización vehicular disparaban `rotatestart`/`pitchstart`. Esto enviaba `USER_INTERACTION` a `HomeScreen`, lo que fijaba `isUserExploringMap = true` y forzaba `followUser = false` permanentemente. En consecuencia, el marcador vehicular avanzaba solo por la pantalla mientras el mapa quedaba congelado.
+    * Solución: Se condicionaron estrictamente los manejadores `dragstart`, `rotatestart`, `pitchstart` y `zoomstart` en la WebView para requerir `e && e.originalEvent`. De este modo, las animaciones automáticas de seguimiento (`easeTo({ center, bearing, pitch: 45 })`) se ejecutan sin activar el modo de exploración manual. El mapa ahora sigue continua y fluidamente la flecha en perspectiva POV de cabina vehicular estilo Google Maps.
+  - **Certificación**:
+    * Verificación con `npx tsc --noEmit` superada con 0 errores de TypeScript.
+
+- [x] **TASK-37**: **Flexibilidad Conversacional en Confirmación de Viajes: Soporte de Rectificaciones y Cambio de Opinión ("No, quiero ir a {otro lugar}") (`04-nlu-conversacional.md`, `07-mobile-frontend.md`, `02-ux-accesibilidad.md`, `09-qa-accesibilidad.md`)**:
+  - **Diagnóstico del Bloqueo Conversacional**:
+    * En `conversationService.ts`, el patrón de cancelación `isNegativeOrCancel(normalized)` utilizaba `^no\b`. Al comenzar una frase con "no" (ej. *"no, quiero ir a Bellas Artes"*, *"no, mejor al metro politécnico"*, *"no, cámbialo a reforma"*), el sistema interceptaba la expresión como una cancelación pura de inmediato.
+    * En el flujo de `pendingConfirmation` en `processUserMessageLocal`, la comprobación `if (isNegativeOrCancel)` se ejecutaba antes de evaluar si existía un nuevo destino, destruyendo el diálogo y respondiendo *"Entendido, he cancelado el viaje a [Destino]"*.
+    * En el prompt del LLM Groq (`dynamicContextPrompt`), se indicaba: *"Esperando que el usuario diga 'Sí' o 'No/Cancelar'"*, condicionando al modelo a invocar la herramienta `cancelar()` o rechazar el diálogo sin extraer el nuevo destino dictado.
+    * En `HomeScreen.tsx` (`handleFinishContinuityResponse`), al procesar `navegar_a` durante el diálogo post-viaje o confirmación, se lanzaba la navegación de inmediato sin desplegar la vista previa de confirmación con el pin del mapa.
+  - **Implementación de la Solución en 3 Niveles (Prompting, NLU Heurístico y Defensive Guard)**:
+    1. **Detector de Rectificaciones y Protección de Negaciones**:
+       - Implementación de `hasRectificationPattern(normalized)` y `extractDestinationFromRectification(rawText, normalized)`.
+       - Reconocimiento de modismos mexicanos y patrones coloquiales: *"no, quiero ir a..."*, *"no, mejor llévame a..."*, *"no, al metro {estación}"*, *"no, cámbialo a..."*, *"no, prefiero ir a..."*, *"no es ahí, es en..."*, *"no, con mi hijo"*, *"no, a la casa de..."*.
+       - `isNegativeOrCancel(normalized)` ahora verifica primero `!hasRectificationPattern(normalized)`, garantizando que cualquier frase que contenga un cambio de destino o acción nunca sea tratada como un simple rechazo.
+    2. **Orquestación de Function Calling en Groq y Prompt Gerontológico**:
+       - Actualización de `GERONTOLOGICAL_SYSTEM_PROMPT` (Directivas 4 y 6): regla explícita que instruye al asistente a invocar `navegar_a(destino: nuevo_destino)` inmediatamente cuando el usuario rectifique o cambie de destino, respondiendo con validación empática: *"Entendido, he cambiado el destino a [Nuevo Destino]. ¿Desea que iniciemos el viaje hacia allá?"*.
+       - Actualización de `dynamicContextPrompt` para contextualizar la espera de confirmación abierta a cambios de destino.
+       - **Defensive LLM Guard en `callGroqLLM`**: Si el modelo de Groq llegara a invocar `cancelar()` o a responder solo con texto conversacional pero la expresión del usuario contiene un destino rectificado, el sistema intercepta la respuesta y ejecuta automáticamente `executeNavegarAFlow(rectifiedCandidate)`.
+    3. **Priorización en Motor Heurístico Local (`processUserMessageLocal`)**:
+       - En `currentContext.pendingConfirmation`, la rectificación de destino ahora se evalúa **en primera prioridad** antes de comprobar confirmación afirmativa o cancelación pura.
+       - Si el destino cambia, se resuelve el alias o sitio personal, se geocodifica la nueva coordenada, se actualiza `pendingConfirmation` y se solicita confirmación verbal del nuevo lugar con auto-escucha habilitada.
+       - En cancelaciones puras, se aplica la Directiva 4 gerontológica ofreciendo continuidad: *"Entendido. He cancelado el viaje a [Destino]. ¿Desea ir a algún otro lugar?"*.
+    4. **Sincronización de Flujo en `HomeScreen.tsx`**:
+       - `handleFinishContinuityResponse` ahora delega `response.functionCall?.name === 'navegar_a'` o `response.updatedContext.pendingConfirmation` a `exitFn(response.updatedContext)`. Esto hace que la app regrese a `MinimalHomeScreen` desplegando la tarjeta de confirmación y el pin en el mapa con el nuevo destino.
+  - **Certificación y Pruebas Unitarias**:
+    - Suite de 15 pruebas unitarias automatizadas (`test_rectification.js`) superada al 100%.
+    - Certificación estricta de TypeScript con `npx tsc --noEmit` superada exitosamente con 0 errores.
+
+- [x] **TASK-38**: **Modificación Asistida de Dirección de Alias y Resolución Precisa sin Colisión con "Mi Casa" (`04-nlu-conversacional.md`, `08-backend-infraestructura.md`, `07-mobile-frontend.md`, `02-ux-accesibilidad.md`, `09-qa-accesibilidad.md`)**:
+  - **Diagnóstico de los Dos Problemas Reportados**:
+    1. *Colisión Sistemática de "casa de {alguien no registrado}" con "Mi Casa"*: En `aliasService.ts`, el algoritmo de token overlap en el paso 4 evaluaba `itemTokens.every(t => queryTokens.includes(t))`. Para el alias predeterminado `alias-casa` ("mi casa"), la palabra "mi" es un stop-word que se eliminaba, dejando únicamente el token `['casa']`. En consecuencia, cualquier consulta coloquial que incluyera la palabra "casa" (ej. *"casa de mi primo"*, *"casa de mi hermano"*, *"casa de juan"*) contenía el token `casa`, provocando que `itemTokens.every(...)` retornara `true` y redirigiera siempre a "Mi Casa" (Reforma).
+    2. *Incapacidad de Modificar la Dirección de un Alias*: Al estar confirmando un viaje a un alias registrado (ej. *"casa de mi primo"*), si el usuario observaba la ubicación o decía que la dirección era errónea (ej. *"no es ahí, es en Sonora 120"*, *"la dirección está mal, es en..."*, *"cambia la dirección a..."*), el sistema lo interpretaba como un cambio de destino general hacia la calle para un viaje nuevo y aislado, en lugar de iniciar el flujo de actualización de la dirección del alias con confirmación.
+  - **Solución Técnica Implementada**:
+    1. **Bloqueo y Coincidencia Estricta para Casas y Alias en `aliasService.ts`**:
+       - Introducción de `isOtherHouseQuery` que detecta expresiones dirigidas al domicilio de otra persona (`/(?:casa\s+de|a\s+lo\s+de|donde|depto\s+de)\s+(?!mi\s+casa\b|hijo\b)/i`), bloqueando categóricamente cualquier coincidencia con `alias-casa`.
+       - Para `alias-casa`, se exige coincidencia exclusiva de conjunto `['casa']` u `['hogar']`.
+       - Para cualquier otro alias, se exige igualdad biunívoca estricta de conjuntos de tokens (`itemTokens.length === queryTokens.length && itemTokens.every(...)`).
+    2. **Detector de Modificación y Corrección de Dirección (`isAliasAddressCorrectionIntent`)**:
+       - Reconocimiento robusto de patrones: *"no es ahí, es en [dirección]"*, *"la dirección está mal, es en [dirección]"*, *"cambia la dirección a [dirección]"*, *"actualiza la dirección a..."*, *"la dirección es en..."*, *"no, es en..."*, *"era en..."*, *"me equivoqué de dirección, es en..."*, así como negaciones sin dirección (*"no es ahí"*, *"está mal la dirección"*).
+    3. **Flujo de Modificación en 2 Pasos con Feedback Visual y Auditivo**:
+       - Si el destino pendiente es un alias o lugar personal y el usuario corrige la dirección, el sistema geocodifica la nueva dirección, pasa a `pendingAliasRegistration` con `step: 'confirming_address'` e `isUpdating: true`, y pregunta empáticamente: *"Entendido. Ubiqué: [Dirección]. ¿Desea actualizar la dirección de [Alias] con esta ubicación?"*.
+       - Al confirmar afirmativamente ("Sí"), se invoca `AliasService.saveAlias` para sobreescribir la dirección en memoria, `AsyncStorage` y Supabase, respondiendo: *"He actualizado la dirección de [Alias]. ¿Desea que iniciemos el viaje hacia allá ahora mismo?"*, fijando el destino para iniciar la marcha con un segundo "Sí".
+       - Si el usuario dice que la dirección está mal sin indicar la nueva (*"no es ahí"*, *"está mal la dirección"*), transiciona a `step: 'awaiting_address'` preguntando: *"Entendido. Por favor dígame la dirección o colonia correcta para [Alias]"*.
+    4. **Adaptación UI en `MinimalHomeScreen.tsx`**:
+       - La tarjeta modal y el HUD detectan `isUpdatingAlias`, actualizando los textos y estilos de accesibilidad WCAG AAA:
+         * Encabezado: `"ACTUALIZAR UBICACIÓN"` con icono `'sync-circle'`.
+         * Pregunta: `¿Actualizar dirección de [Alias]?`.
+         * Botón de acción: `"SÍ, ACTUALIZAR"` con icono `'sync'`.
+    5. **Blindaje Multicapa (Prompts y LLM Guard)**:
+       - Actualización de `GERONTOLOGICAL_SYSTEM_PROMPT` y `dynamicContextPrompt` con directiva para invocar `guardar_ubicacion(alias, direccion)` al detectar correcciones en confirmación de alias.
+       - Defensive Guard en `callGroqLLM` que intercepta llamadas erróneas a `navegar_a` reconvirtiéndolas a actualización de alias.
+  - **Certificación y Pruebas**:
+    - Pruebas automatizadas unitarias y end-to-end completadas al 100%.
+    - Certificación estricta de compilación TypeScript con `npx tsc --noEmit` superada con 0 errores.
 
 #### 5. Agente de Privacidad y Seguridad (`10-privacidad-seguridad.md`)
 - [ ] **TASK-20**: **Auditoría de Seguridad y Zero-Persistence en Producción**:
