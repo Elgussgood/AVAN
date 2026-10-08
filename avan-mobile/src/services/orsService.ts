@@ -10,12 +10,43 @@ export interface Coordinates {
   longitude: number;
 }
 
+export type GeocodePrecision = 'exact' | 'street' | 'interpolated' | 'approximate';
+
+export interface StructuredAddressQuery {
+  street: string;
+  houseNumber?: string;
+  colonia?: string;
+  alcaldia?: string;
+  crossStreet?: string;
+  city?: string;
+  state?: string;
+  rawQuery?: string;
+}
+
 export interface GeocodeResult {
   id: string;
   name: string;
   label: string;
   coordinates: Coordinates;
   distanceMeters?: number;
+  precision?: GeocodePrecision;
+}
+
+export interface DisambiguationCandidate {
+  id: string;
+  name: string;
+  label: string;
+  colonia_o_alcaldia: string;
+  landmarkRef?: string;
+  landmarkType?: 'metro' | 'metrobus' | 'parque' | 'hospital' | 'museo' | 'monumento' | 'lugar';
+  coordinates: Coordinates;
+  distanceMeters?: number;
+  precision?: GeocodePrecision;
+}
+
+export interface DisambiguationResult {
+  isAmbiguous: boolean;
+  candidates: DisambiguationCandidate[];
 }
 
 export interface StepInstruction {
@@ -288,6 +319,235 @@ function translateOsrmManeuver(m: any, streetName: string): { instruction: strin
   };
 }
 
+export function computeDistanceMeters(coord1: Coordinates, coord2: Coordinates): number {
+  const R = 6371e3;
+  const φ1 = (coord1.latitude * Math.PI) / 180;
+  const φ2 = (coord2.latitude * Math.PI) / 180;
+  const Δφ = ((coord2.latitude - coord1.latitude) * Math.PI) / 180;
+  const Δλ = ((coord2.longitude - coord1.longitude) * Math.PI) / 180;
+
+  const a =
+    Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return Math.round(R * c);
+}
+
+export function findNearestLandmark(coords: Coordinates): {
+  name: string;
+  type: 'metro' | 'metrobus' | 'parque' | 'hospital' | 'museo' | 'monumento' | 'lugar';
+  distanceMeters: number;
+} | null {
+  let nearest: { name: string; type: any; distanceMeters: number } | null = null;
+  let minDistance = 2500; // Máximo 2.5 km
+
+  // 1. Revisar estaciones de transporte masivo (Metro / Metrobús)
+  for (const poi of CDMX_TRANSPORT_POIS) {
+    const dist = computeDistanceMeters(coords, poi.coordinates);
+    if (dist < minDistance) {
+      minDistance = dist;
+      nearest = {
+        name: poi.name,
+        type: poi.type === 'metro' ? 'metro' : poi.type === 'metrobus' ? 'metrobus' : 'lugar',
+        distanceMeters: dist,
+      };
+    }
+  }
+
+  // 2. Revisar POIs emblemáticos y culturales
+  for (const poi of FALLBACK_DESTINATIONS) {
+    const dist = computeDistanceMeters(coords, poi.coordinates);
+    if (dist < minDistance) {
+      minDistance = dist;
+      let landmarkType: any = 'lugar';
+      const lower = poi.name.toLowerCase();
+      if (lower.includes('parque') || lower.includes('alameda') || lower.includes('bosque')) {
+        landmarkType = 'parque';
+      } else if (lower.includes('hospital') || lower.includes('médico') || lower.includes('medico')) {
+        landmarkType = 'hospital';
+      } else if (lower.includes('museo') || lower.includes('bellas artes')) {
+        landmarkType = 'museo';
+      } else if (lower.includes('ángel') || lower.includes('angel') || lower.includes('monumento')) {
+        landmarkType = 'monumento';
+      }
+      nearest = {
+        name: poi.name,
+        type: landmarkType,
+        distanceMeters: dist,
+      };
+    }
+  }
+
+  return nearest;
+}
+
+export function extractZoneFromLabel(label: string): string {
+  const parts = label.split(',').map((s) => s.trim()).filter(Boolean);
+  if (parts.length <= 1) return parts[0] || 'Ciudad de México';
+
+  const conocidas = [
+    'Coyoacán', 'Cuauhtémoc', 'Benito Juárez', 'Miguel Hidalgo', 'Tlalpan',
+    'Gustavo A. Madero', 'Álvaro Obregón', 'Iztapalapa', 'Venustiano Carranza',
+    'Azcapotzalco', 'Iztacalco', 'Xochimilco', 'Cuajimalpa', 'Tláhuac',
+    'Magdalena Contreras', 'Milpa Alta', 'Naucalpan', 'Tlalnepantla', 'Ecatepec',
+    'Huixquilucan', 'Nezahualcóyotl', 'Centro Histórico', 'Roma Norte', 'Condesa',
+    'Polanco', 'Del Valle', 'Narvarte', 'Nápoles', 'Lindavista', 'Santa Fe'
+  ];
+
+  for (const p of parts) {
+    for (const c of conocidas) {
+      if (p.toLowerCase().includes(c.toLowerCase())) {
+        return c;
+      }
+    }
+  }
+
+  if (parts.length >= 3) {
+    return parts[1] || parts[parts.length - 2] || parts[0];
+  }
+  return parts[1] || parts[0];
+}
+
+/**
+ * Parsea una consulta en lenguaje natural o estandariza un objeto estructurado,
+ * identificando calle, número predial, colonia, alcaldía, ciudad y cruce vial.
+ */
+export function parseStructuredAddress(
+  input: string | StructuredAddressQuery
+): StructuredAddressQuery {
+  if (typeof input === 'object' && input !== null) {
+    return {
+      street: input.street || '',
+      houseNumber: input.houseNumber,
+      colonia: input.colonia,
+      alcaldia: input.alcaldia,
+      crossStreet: input.crossStreet,
+      city: input.city || 'Ciudad de México',
+      state: input.state,
+      rawQuery: input.rawQuery || input.street,
+    };
+  }
+
+  const raw = (input || '').trim();
+  let street = '';
+  let houseNumber: string | undefined;
+  let colonia: string | undefined;
+  let alcaldia: string | undefined;
+  let crossStreet: string | undefined;
+
+  // 1. Extraer cruce vial o intersección (ej. "esquina con Monterrey", "casi esquina con Ámsterdam", "cruce con Insurgentes")
+  const crossMatch = raw.match(
+    /(?:casi\s+esquina\s+con|esquina\s+con|cruce\s+con|esq\.?\s+con|esq\.?)\s+([^,]+)/i
+  );
+  if (crossMatch) {
+    crossStreet = crossMatch[1].trim();
+  }
+
+  let textWithoutCross = raw.replace(
+    /(?:casi\s+esquina\s+con|esquina\s+con|cruce\s+con|esq\.?\s+con|esq\.?)\s+[^,]+/gi,
+    ''
+  );
+
+  // 2. Extraer número exterior (ej. "120", "número 1422", "# 10")
+  // Priorizar indicador explícito ("número 10", "no. 1422", "# 150")
+  const explicitNumMatch = textWithoutCross.match(
+    /(?:n[uú]mero|no\.?|num\.?|#)\s*(\b\d{1,5}[a-zA-Z]?\b)/i
+  );
+  if (explicitNumMatch) {
+    houseNumber = explicitNumMatch[1];
+  } else {
+    // Si no hay prefijo explícito, proteger nombres de calles que contienen números o fechas
+    // (ej: "5 de Mayo", "16 de Septiembre", "20 de Noviembre", "Eje 1 Norte")
+    const protectedDateStreetsRegex = /\b(?:\d{1,2}\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)|eje\s+\d+)\b/i;
+    let textToFindNum = textWithoutCross;
+    if (protectedDateStreetsRegex.test(textWithoutCross)) {
+      textToFindNum = textWithoutCross.replace(protectedDateStreetsRegex, '');
+    }
+    const numMatch = textToFindNum.match(/\b(\d{1,5}[a-zA-Z]?)\b/);
+    if (numMatch) {
+      houseNumber = numMatch[1];
+    }
+  }
+
+  // 3. Extraer colonia
+  const colMatch = textWithoutCross.match(/(?:colonia|col\.?)\s+([^,]+)/i);
+  if (colMatch) {
+    colonia = colMatch[1].trim();
+  } else {
+    const knownColonias = [
+      'Roma Norte', 'Roma Sur', 'Roma', 'Condesa', 'Hipódromo Condesa', 'Hipódromo',
+      'Del Valle', 'Del Valle Norte', 'Del Valle Sur', 'Narvarte', 'Narvarte Poniente',
+      'Polanco', 'Juárez', 'Cuauhtémoc', 'Centro Histórico', 'Centro', 'Coyoacán',
+      'San Ángel', 'Nápoles', 'Santa Fe', 'Doctores', 'Anzures', 'San Rafael',
+      'Portales', 'Álamos', 'Lindavista', 'Industrial', 'Escandón', 'Tabacalera',
+      'Granada', 'Irrigación', 'Tacubaya', 'Mixcoac'
+    ];
+    for (const c of knownColonias) {
+      const regex = new RegExp(`\\b${c}\\b`, 'i');
+      if (regex.test(textWithoutCross)) {
+        colonia = c;
+        break;
+      }
+    }
+  }
+
+  // 4. Extraer alcaldía si se menciona explícitamente
+  const knownAlcaldias = [
+    'Cuauhtémoc', 'Benito Juárez', 'Miguel Hidalgo', 'Coyoacán', 'Tlalpan',
+    'Gustavo A. Madero', 'Álvaro Obregón', 'Iztapalapa', 'Venustiano Carranza',
+    'Azcapotzalco', 'Iztacalco', 'Xochimilco', 'Cuajimalpa', 'Tláhuac',
+    'Magdalena Contreras', 'Milpa Alta', 'Naucalpan', 'Tlalnepantla'
+  ];
+  for (const alc of knownAlcaldias) {
+    const regex = new RegExp(`\\b${alc}\\b`, 'i');
+    if (regex.test(textWithoutCross)) {
+      alcaldia = alc;
+      break;
+    }
+  }
+
+  // 5. Extraer nombre de la calle
+  let streetCand = textWithoutCross;
+  if (colonia) {
+    streetCand = streetCand.replace(new RegExp(`(?:colonia|col\.?|en la|en el|por la)?\\s*${colonia}`, 'i'), '');
+  }
+  if (alcaldia) {
+    streetCand = streetCand.replace(new RegExp(`(?:alcald[ií]a|municipio)?\\s*${alcaldia}`, 'i'), '');
+  }
+  if (houseNumber) {
+    const isPartOfDate = new RegExp(`\\b${houseNumber}\\s+de\\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\\b`, 'i').test(streetCand);
+    if (!isPartOfDate) {
+      streetCand = streetCand.replace(new RegExp(`(?:(?:n[uú]mero|no\.?|num\.?|#)\\s*)?${houseNumber}\\b`, 'i'), '');
+    } else {
+      streetCand = streetCand.replace(new RegExp(`(?:n[uú]mero|no\.?|num\.?|#)\\s*${houseNumber}\\b`, 'i'), '');
+    }
+  }
+  streetCand = streetCand
+    .replace(/^(?:en\s+|por\s+|calle\s+|avenida\s+|av\.?\s+|calzada\s+)+/i, '')
+    .replace(/(?:,\s*ciudad de m[eé]xico|,\s*cdmx)/i, '')
+    .replace(/[,\.]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (streetCand.length > 1) {
+    street = streetCand;
+  } else {
+    const parts = raw.split(',')[0].trim();
+    street = parts;
+  }
+
+  return {
+    street,
+    houseNumber,
+    colonia,
+    alcaldia,
+    crossStreet,
+    city: 'Ciudad de México',
+    rawQuery: raw,
+  };
+}
+
 export class OpenRouteService {
   private apiKey: string;
   private baseUrl = 'https://api.openrouteservice.org';
@@ -304,43 +564,137 @@ export class OpenRouteService {
   }
 
   /**
-   * Geocodifica un destino en lenguaje natural (ej. "Reforma", "Bellas Artes", "Sonora 120, Roma Norte").
-   * Estrategia Multi-Tier Resiliente:
+   * Obtiene candidatos de geocodificación y detecta si existe ambigüedad multilocación
+   * separada por más de 2.5 km. Enriquece cada candidato con el Landmark o estación de transporte más cercana
+   * y conserva la precisión obtenida.
+   */
+  public async getDisambiguationCandidates(
+    query: string | StructuredAddressQuery,
+    userLocation?: Coordinates,
+    maxCandidates = 3
+  ): Promise<DisambiguationResult> {
+    const rawResults = await this.geocodeDestination(query, userLocation);
+    if (!rawResults || rawResults.length === 0) {
+      return { isAmbiguous: false, candidates: [] };
+    }
+
+    // Filtrar duplicados geográficos muy cercanos (<1000m)
+    const uniqueCandidates: GeocodeResult[] = [];
+    for (const r of rawResults) {
+      const isDuplicate = uniqueCandidates.some(
+        (existing) => computeDistanceMeters(existing.coordinates, r.coordinates) < 1000
+      );
+      if (!isDuplicate) {
+        uniqueCandidates.push(r);
+      }
+    }
+
+    if (uniqueCandidates.length <= 1) {
+      const single = uniqueCandidates[0] || rawResults[0];
+      const zone = extractZoneFromLabel(single.label);
+      const landmark = findNearestLandmark(single.coordinates);
+      return {
+        isAmbiguous: false,
+        candidates: [
+          {
+            id: single.id,
+            name: single.name,
+            label: single.label,
+            colonia_o_alcaldia: zone,
+            landmarkRef: landmark?.name,
+            landmarkType: landmark?.type,
+            coordinates: single.coordinates,
+            distanceMeters: userLocation ? computeDistanceMeters(userLocation, single.coordinates) : undefined,
+            precision: single.precision,
+          },
+        ],
+      };
+    }
+
+    // Comprobar si hay dispersión geográfica (>2500m entre al menos 2 candidatos)
+    let maxSeparation = 0;
+    for (let i = 0; i < uniqueCandidates.length; i++) {
+      for (let j = i + 1; j < uniqueCandidates.length; j++) {
+        const sep = computeDistanceMeters(uniqueCandidates[i].coordinates, uniqueCandidates[j].coordinates);
+        if (sep > maxSeparation) {
+          maxSeparation = sep;
+        }
+      }
+    }
+
+    const isAmbiguous = maxSeparation > 2500;
+    const candidatesToReturn = uniqueCandidates.slice(0, maxCandidates).map((r) => {
+      const zone = extractZoneFromLabel(r.label);
+      const landmark = findNearestLandmark(r.coordinates);
+      const dist = userLocation ? computeDistanceMeters(userLocation, r.coordinates) : undefined;
+      return {
+        id: r.id,
+        name: r.name,
+        label: r.label,
+        colonia_o_alcaldia: zone,
+        landmarkRef: landmark ? landmark.name : undefined,
+        landmarkType: landmark ? landmark.type : undefined,
+        coordinates: r.coordinates,
+        distanceMeters: dist,
+        precision: r.precision,
+      };
+    });
+
+    return {
+      isAmbiguous,
+      candidates: candidatesToReturn,
+    };
+  }
+
+  /**
+   * Geocodifica un destino en lenguaje natural o estructurado (ej. "Reforma", "Bellas Artes", "Sonora 120, Roma Norte").
+   * Estrategia Multi-Tier Resiliente con Degeneración Progresiva:
    *  Tier 0: Catálogo curado de puntos de interés y landmarks emblemáticos de CDMX (0ms, 100% exacto)
-   *  Tier 1: OpenRouteService con boundary.circle metropolitano (65km)
-   *  Tier 2: OpenStreetMap Nominatim (con viewbox metropolitano y filtrado MX)
+   *  Tier 1: OpenRouteService con boundary.circle metropolitano (65km) y layers=address,street,venue
+   *  Tier 2: OpenStreetMap Nominatim estructurado con relajación progresiva a nivel tramo de calle en colonia
    *  Tier 3: Photon API de Komoot (OSM global, gratis, sin API key, con bias CDMX)
    *  Tier 4: Fallback aproximado
    */
   public async geocodeDestination(
-    query: string,
+    query: string | StructuredAddressQuery,
     userLocation?: Coordinates
   ): Promise<GeocodeResult[]> {
-    const trimmed = query.trim();
-    if (!trimmed) {
+    const structured = parseStructuredAddress(query);
+    const trimmed = (
+      structured.rawQuery ||
+      [structured.street, structured.houseNumber, structured.colonia, structured.city]
+        .filter(Boolean)
+        .join(', ')
+    ).trim();
+
+    if (!trimmed && !structured.street) {
       return [];
     }
 
     // 1. TIER 0: Búsqueda inmediata en el Catálogo Curado de Alta Fidelidad
-    // Resuelve sitios emblemáticos de CDMX con coordenadas exactas verificadas manualmente
     const catalogResults = this.searchFallbackDestinations(trimmed);
     if (catalogResults.length > 0) {
       return catalogResults;
     }
+    if (structured.street && structured.street !== trimmed) {
+      const catalogStreetResults = this.searchFallbackDestinations(structured.street);
+      if (catalogStreetResults.length > 0) {
+        return catalogStreetResults;
+      }
+    }
 
-    // 2. TIER 1: OpenRouteService con delimitación por círculo metropolitano (65km)
+    // 2. TIER 1: OpenRouteService con delimitación por círculo metropolitano (65km) y layers específicos
     if (this.apiKey) {
       try {
-        const orsResults = await this.geocodeWithORS(trimmed, userLocation);
+        const orsResults = await this.geocodeWithORS(structured, userLocation);
         if (orsResults && orsResults.length > 0) {
-          const coloniaMatch = trimmed.match(/\b(roma|condesa|polanco|del valle|narvarte|doctores|juarez|juárez|napoles|nápoles|san angel|san ángel|coyoacan|coyoacán|lindavista|santa fe|centro|anzures|escandon|escandón)\b/i);
-          if (coloniaMatch) {
-            const expectedColonia = coloniaMatch[1].toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+          if (structured.colonia) {
+            const expectedColonia = structured.colonia.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
             const labelNorm = orsResults[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
             if (labelNorm.includes(expectedColonia)) {
               return orsResults;
             }
-            // Si ORS ignoró la colonia (ej. devolvió Tlalnepantla para "Sonora 120, Roma"), continuar a Nominatim
+            // Si ORS ignoró la colonia, continuar a Nominatim
           } else {
             return orsResults;
           }
@@ -350,9 +704,9 @@ export class OpenRouteService {
       }
     }
 
-    // 3. TIER 2: OpenStreetMap Nominatim con delimitación por viewbox
+    // 3. TIER 2: OpenStreetMap Nominatim con delimitación por viewbox y relajación progresiva
     try {
-      const nominatimResults = await this.geocodeWithNominatim(trimmed, userLocation);
+      const nominatimResults = await this.geocodeWithNominatim(structured, userLocation);
       if (nominatimResults && nominatimResults.length > 0) {
         return nominatimResults;
       }
@@ -362,7 +716,7 @@ export class OpenRouteService {
 
     // 4. TIER 3: Photon API de Komoot (libre, rápido, con bias de CDMX)
     try {
-      const photonResults = await this.geocodeWithPhoton(trimmed, userLocation);
+      const photonResults = await this.geocodeWithPhoton(structured, userLocation);
       if (photonResults && photonResults.length > 0) {
         return photonResults;
       }
@@ -383,29 +737,38 @@ export class OpenRouteService {
           latitude: baseLat,
           longitude: baseLng,
         },
+        precision: 'approximate',
       },
     ];
   }
 
   /**
-   * Geocodificación vía OpenRouteService oficial con delimitación geográfica
+   * Geocodificación vía OpenRouteService oficial con delimitación geográfica y filtro de capas
    */
   private async geocodeWithORS(
-    query: string,
+    query: string | StructuredAddressQuery,
     userLocation?: Coordinates
   ): Promise<GeocodeResult[]> {
+    const structured = typeof query === 'string' ? parseStructuredAddress(query) : query;
     const centerLat = userLocation?.latitude ?? 19.4326;
     const centerLon = userLocation?.longitude ?? -99.1332;
 
-    const isForaneoQuery = /(?:acapulco|cuernavaca|puebla|toluca|pachuca|queretaro|guadalajara|monterrey|cancun|veracruz|oaxaca|merida|leon|guanajuato|morelia|san luis|hidalgo|morelos|jalisco|nuevo leon)/i.test(query);
+    const queryString = structured.houseNumber
+      ? `${structured.street} ${structured.houseNumber}, ${structured.colonia ? structured.colonia + ', ' : ''}Ciudad de México`
+      : structured.colonia
+      ? `${structured.street}, ${structured.colonia}, Ciudad de México`
+      : structured.rawQuery || structured.street;
 
-    // Intento 1: Búsqueda con círculo metropolitano (65km) para evitar falsos positivos en otros estados
+    const isForaneoQuery = /(?:acapulco|cuernavaca|puebla|toluca|pachuca|queretaro|guadalajara|monterrey|cancun|veracruz|oaxaca|merida|leon|guanajuato|morelia|san luis|hidalgo|morelos|jalisco|nuevo leon)/i.test(queryString);
+
+    // Intento 1: Búsqueda con círculo metropolitano (65km) y capas address,street,venue
     if (!isForaneoQuery) {
       try {
         const localParams = new URLSearchParams({
           api_key: this.apiKey,
-          text: query,
+          text: queryString,
           size: '5',
+          layers: 'address,street,venue',
           'boundary.country': 'MEX',
           'boundary.circle.lat': centerLat.toString(),
           'boundary.circle.lon': centerLon.toString(),
@@ -429,7 +792,7 @@ export class OpenRouteService {
         if (response.ok) {
           const data = await response.json();
           if (data.features && Array.isArray(data.features) && data.features.length > 0) {
-            return this.parsePeliasFeatures(data.features, query);
+            return this.parsePeliasFeatures(data.features, queryString);
           }
         }
       } catch (err) {
@@ -441,8 +804,9 @@ export class OpenRouteService {
     try {
       const nationalParams = new URLSearchParams({
         api_key: this.apiKey,
-        text: query,
+        text: queryString,
         size: '5',
+        layers: 'address,street,venue',
         'boundary.country': 'MEX',
         'focus.point.lat': centerLat.toString(),
         'focus.point.lon': centerLon.toString(),
@@ -463,7 +827,7 @@ export class OpenRouteService {
       if (response.ok) {
         const data = await response.json();
         if (data.features && Array.isArray(data.features) && data.features.length > 0) {
-          return this.parsePeliasFeatures(data.features, query);
+          return this.parsePeliasFeatures(data.features, queryString);
         }
       }
     } catch (err) {
@@ -474,12 +838,24 @@ export class OpenRouteService {
   }
 
   /**
-   * Parsea las features devueltas por el geocodificador Pelias de ORS
+   * Parsea las features devueltas por el geocodificador Pelias de ORS y clasifica su precisión
    */
   private parsePeliasFeatures(features: any[], query: string): GeocodeResult[] {
     return features.map((feature: any, index: number): GeocodeResult => {
       const coords = feature.geometry?.coordinates || [0, 0];
       const props = feature.properties || {};
+      const layer = props.layer;
+      const hasHouseNumber = Boolean(props.housenumber);
+
+      let precision: GeocodePrecision = 'approximate';
+      if (layer === 'address' || layer === 'venue' || hasHouseNumber) {
+        precision = 'exact';
+      } else if (layer === 'street') {
+        precision = 'street';
+      } else if (layer === 'interpolated') {
+        precision = 'interpolated';
+      }
+
       return {
         id: props.id || `ors-${index}`,
         name: props.name || props.label || query,
@@ -489,23 +865,36 @@ export class OpenRouteService {
           longitude: coords[0],
         },
         distanceMeters: props.distance ? Math.round(props.distance * 1000) : undefined,
+        precision,
       };
     });
   }
 
   /**
    * Geocodificación vía Photon (Komoot / OSM) - Sin costo y sin API Key
+   * Corrección crítica: usa lang='default' para evitar el error HTTP 400 de lang='es'
    */
   private async geocodeWithPhoton(
-    query: string,
+    query: string | StructuredAddressQuery,
     userLocation?: Coordinates
   ): Promise<GeocodeResult[]> {
+    const structured = typeof query === 'string' ? parseStructuredAddress(query) : query;
     const lat = userLocation?.latitude ?? 19.4326;
     const lon = userLocation?.longitude ?? -99.1332;
 
+    const searchParts = [
+      structured.street,
+      structured.houseNumber,
+      structured.crossStreet,
+      structured.colonia,
+      structured.city || 'Ciudad de México',
+    ].filter(Boolean);
+
+    const qStr = searchParts.join(' ');
+
     const params = new URLSearchParams({
-      q: query,
-      lang: 'es',
+      q: qStr,
+      lang: 'default',
       limit: '5',
       lat: lat.toString(),
       lon: lon.toString(),
@@ -532,11 +921,18 @@ export class OpenRouteService {
           const district = p.district || p.suburb;
           const city = p.city || p.county || p.state || 'Ciudad de México';
 
+          let precision: GeocodePrecision = 'approximate';
+          if (num) {
+            precision = 'exact';
+          } else if (street) {
+            precision = 'street';
+          }
+
           let mainName = name;
           if (!mainName && street) {
             mainName = num ? `${street} ${num}` : street;
           }
-          if (!mainName) mainName = query;
+          if (!mainName) mainName = qStr;
 
           const labelParts = [
             street && num ? `${street} ${num}` : (name || street),
@@ -547,11 +943,12 @@ export class OpenRouteService {
           return {
             id: `photon-${p.osm_id || index}`,
             name: mainName,
-            label: labelParts.length > 0 ? labelParts.join(', ') : query,
+            label: labelParts.length > 0 ? labelParts.join(', ') : qStr,
             coordinates: {
               latitude: coords[1],
               longitude: coords[0],
             },
+            precision,
           };
         });
       }
@@ -561,76 +958,169 @@ export class OpenRouteService {
   }
 
   /**
-   * Geocodificación vía OpenStreetMap Nominatim - Gratuito
+   * Geocodificación vía OpenStreetMap Nominatim con degeneración progresiva:
+   * 1. Cruces e intersecciones viales si se especifica crossStreet.
+   * 2. Búsqueda exacta de predio con houseNumber.
+   * 3. Relajación a nivel de tramo de calle en la colonia indicada (Street Segment Fallback)
+   *    evitando degradar a centroides genéricos de alcaldía o ciudad.
    */
   private async geocodeWithNominatim(
-    query: string,
+    query: string | StructuredAddressQuery,
     userLocation?: Coordinates
   ): Promise<GeocodeResult[]> {
-    // Si la consulta no especifica estado o ciudad, anexar Ciudad de México para contexto
-    const isStateSpecified = /(?:cdmx|ciudad de mexico|mexico|edomex|estado de mexico|puebla|toluca|cuernavaca|hidalgo|pachuca|queretaro|jalisco|guadalajara|monterrey)/i.test(query);
-    const searchString = isStateSpecified ? query : `${query}, Ciudad de México`;
+    const structured = typeof query === 'string' ? parseStructuredAddress(query) : query;
 
-    const params = new URLSearchParams({
-      q: searchString,
-      format: 'json',
-      countrycodes: 'mx',
-      addressdetails: '1',
-      limit: '5',
-      // Viewbox metropolitano de CDMX/Valle de México: [minLon, maxLat, maxLon, minLat]
-      viewbox: '-99.38,19.62,-98.92,19.15',
-      bounded: '0',
-    });
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3500);
-
-    const response = await fetch(
-      `https://nominatim.openstreetmap.org/search?${params.toString()}`,
-      {
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'AVAN-Senior-Navigation-App/1.0 (contacto: avan-app@escom.ipn.mx)',
-        },
-        signal: controller.signal,
-      }
-    );
-    clearTimeout(timeoutId);
-
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data) && data.length > 0) {
-        return data.map((item: any, index: number): GeocodeResult => {
-          const lat = parseFloat(item.lat);
-          const lon = parseFloat(item.lon);
-          const addr = item.address || {};
-          const street = addr.road || addr.pedestrian || addr.street;
-          const houseNumber = addr.house_number;
-          const suburb = addr.suburb || addr.neighbourhood || addr.quarter;
-          const city = addr.city || addr.town || addr.municipality || addr.state || 'Ciudad de México';
-
-          const mainName = item.name || (street ? (houseNumber ? `${street} ${houseNumber}` : street) : item.display_name.split(',')[0]);
-          const labelParts = [
-            street && houseNumber ? `${street} ${houseNumber}` : (item.name || street),
-            suburb,
-            city,
-          ].filter(Boolean);
-
-          return {
-            id: `nominatim-${item.place_id || index}`,
-            name: mainName,
-            label: labelParts.length > 0 ? labelParts.join(', ') : item.display_name,
-            coordinates: {
-              latitude: lat,
-              longitude: lon,
-            },
-          };
+    const fetchNominatimQuery = async (searchStr: string): Promise<any[]> => {
+      try {
+        const params = new URLSearchParams({
+          q: searchStr,
+          format: 'json',
+          countrycodes: 'mx',
+          addressdetails: '1',
+          limit: '5',
+          viewbox: '-99.38,19.62,-98.92,19.15',
+          bounded: '0',
         });
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3500);
+
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/search?${params.toString()}`,
+          {
+            headers: {
+              Accept: 'application/json',
+              'User-Agent': 'AVAN-Senior-Navigation-App/1.0 (contacto: avan-app@escom.ipn.mx)',
+            },
+            signal: controller.signal,
+          }
+        );
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const data = await response.json();
+          if (Array.isArray(data)) return data;
+        }
+      } catch (err) {
+        console.warn(`[orsService] Error consultando Nominatim para "${searchStr}":`, err);
+      }
+      return [];
+    };
+
+    const mapNominatimResult = (
+      item: any,
+      index: number,
+      forcedPrecision?: GeocodePrecision,
+      labelOverride?: string
+    ): GeocodeResult => {
+      const lat = parseFloat(item.lat);
+      const lon = parseFloat(item.lon);
+      const addr = item.address || {};
+      const street = addr.road || addr.pedestrian || addr.street;
+      const houseNumber = addr.house_number;
+      const suburb = addr.suburb || addr.neighbourhood || addr.quarter;
+      const city = addr.city || addr.town || addr.municipality || addr.state || 'Ciudad de México';
+
+      let precision: GeocodePrecision = forcedPrecision || 'approximate';
+      if (!forcedPrecision) {
+        if (houseNumber || item.class === 'building') {
+          precision = 'exact';
+        } else if (item.class === 'highway' || street) {
+          precision = 'street';
+        }
+      }
+
+      const mainName =
+        item.name ||
+        (street ? (houseNumber ? `${street} ${houseNumber}` : street) : item.display_name.split(',')[0]);
+
+      const labelParts = [
+        street && houseNumber ? `${street} ${houseNumber}` : (item.name || street),
+        suburb,
+        city,
+      ].filter(Boolean);
+
+      return {
+        id: `nominatim-${item.place_id || index}`,
+        name: mainName,
+        label: labelOverride || (labelParts.length > 0 ? labelParts.join(', ') : item.display_name),
+        coordinates: {
+          latitude: lat,
+          longitude: lon,
+        },
+        precision,
+      };
+    };
+
+    // PASO 1: Si se proporcionó cruce vial (esquina/cruce)
+    if (structured.crossStreet && structured.street) {
+      const intersectionQuery = `${structured.street} ${structured.crossStreet}, ${
+        structured.colonia ? structured.colonia + ', ' : ''
+      }Ciudad de México`;
+      const data = await fetchNominatimQuery(intersectionQuery);
+      if (data.length > 0) {
+        return data.map((item, idx) => mapNominatimResult(item, idx, 'exact'));
+      }
+    }
+
+    // PASO 2: Si se proporcionó número exterior
+    if (structured.houseNumber && structured.street) {
+      // 2A: Intentar dirección completa con número
+      const fullQuery = `${structured.street} ${structured.houseNumber}, ${
+        structured.colonia ? structured.colonia + ', ' : ''
+      }Ciudad de México`;
+      const fullData = await fetchNominatimQuery(fullQuery);
+
+      if (fullData.length > 0) {
+        const hasExactNumber = fullData.some((d) => d.address?.house_number);
+        return fullData.map((item, idx) =>
+          mapNominatimResult(item, idx, hasExactNumber ? 'exact' : 'street')
+        );
+      }
+
+      // 2B: STREET SEGMENT FALLBACK:
+      // Si OSM no tiene catalogado el predio exacto, relajar a la calle en la colonia indicada
+      const streetInColoniaQuery = `${structured.street}, ${
+        structured.colonia ? structured.colonia + ', ' : ''
+      }Ciudad de México`;
+      const streetData = await fetchNominatimQuery(streetInColoniaQuery);
+
+      if (streetData.length > 0) {
+        const labelWithNumber = `${structured.street} ${structured.houseNumber} (aprox.), ${
+          structured.colonia || 'Ciudad de México'
+        }`;
+        return streetData.map((item, idx) =>
+          mapNominatimResult(item, idx, 'street', labelWithNumber)
+        );
+      }
+    }
+
+    // PASO 3: Búsqueda de calle o lugar general
+    if (structured.street) {
+      const queryStr = `${structured.street}, ${
+        structured.colonia ? structured.colonia + ', ' : ''
+      }Ciudad de México`;
+      const streetData = await fetchNominatimQuery(queryStr);
+      if (streetData.length > 0) {
+        return streetData.map((item, idx) => mapNominatimResult(item, idx));
+      }
+    }
+
+    // PASO 4: Consulta plana de respaldo
+    if (structured.rawQuery) {
+      const isStateSpecified = /(?:cdmx|ciudad de mexico|mexico|edomex|estado de mexico|puebla|toluca|cuernavaca)/i.test(
+        structured.rawQuery
+      );
+      const searchString = isStateSpecified ? structured.rawQuery : `${structured.rawQuery}, Ciudad de México`;
+      const rawData = await fetchNominatimQuery(searchString);
+      if (rawData.length > 0) {
+        return rawData.map((item, idx) => mapNominatimResult(item, idx));
       }
     }
 
     return [];
   }
+
 
   /**
    * Búsqueda semántica y de alta fidelidad en el catálogo curado de transporte y landmarks de CDMX (Tier 0)
@@ -682,6 +1172,7 @@ export class OpenRouteService {
         name: item.poi.name,
         label: item.poi.label,
         coordinates: item.poi.coordinates,
+        precision: 'exact' as GeocodePrecision,
       }));
     }
 
@@ -715,6 +1206,7 @@ export class OpenRouteService {
       name: m.name,
       label: m.label,
       coordinates: m.coordinates,
+      precision: 'exact' as GeocodePrecision,
     }));
   }
 

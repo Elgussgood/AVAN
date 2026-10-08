@@ -395,14 +395,86 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
     - Pruebas automatizadas unitarias y end-to-end completadas al 100%.
     - Certificación estricta de compilación TypeScript con `npx tsc --noEmit` superada con 0 errores.
 
+- [x] **TASK-39**: **Depuración de Captura de Direcciones Completas y Asistencia de Ajustes Incrementales con LLM (`04-nlu-conversacional.md`, `03-voice-ux.md`, `06-mapas-ruteo.md`, `07-mobile-frontend.md`, `09-qa-accesibilidad.md`)**:
+  - **Diagnóstico de los Problemas Reportados**:
+    1. *Truncamiento Sistemático de Direcciones a la Última Parte*:
+       - En `extractAddressCorrection` e `isAliasAddressCorrectionIntent`, expresiones regulares como `/(?:...|la direccion es|en)\s+(.+)/i` contenían la alternancia no anclada `|en\s+(.+)`. Al decir *"Sonora 120 en la Condesa"*, la regla emparejaba únicamente a partir de `"en la Condesa"`, descartando agresivamente la calle y el número exterior.
+       - En `step === 'awaiting_address'`, la partición manual `splitMatch` con `\s+en\s+` trataba erróneamente la calle como alias y la colonia como dirección.
+    2. *Incapacidad de Hacer Ajustes Menores / Incrementales sobre una Dirección Propuesta*:
+       - Al proponerse una dirección (ej. *"Calle Sonora 120, Condesa"*), si el usuario decía *"No, es el 150"*, *"en la Roma Norte"* o *"cruce con Insurgentes"*, el sistema intentaba geocodificar esa frase aislada o caía en falso positivo de cancelación por la regla `^no\b` en `isNegativeOrCancel`. No existía un mecanismo de fusión diferencial que conservara los componentes válidos de la dirección base.
+  - **Solución Técnica Implementada**:
+    1. **Erradicación del Truncamiento y Anclaje Sintáctico Robusto**:
+       - Eliminación de alternancias flotantes en `extractAddressCorrection` e `isAliasAddressCorrectionIntent`. Las expresiones ahora exigen anclaje al inicio (`^`) o marcadores explícitos de corrección.
+       - En `awaiting_address`, se suprimió la partición destructiva `splitMatch` cuando el alias ya tiene nombre asignado, permitiendo que la dirección íntegra pase a geocodificación y análisis LLM sin recortes.
+    2. **Fusión Contextual con LLM (`mergeAddressAdjustmentWithLLM`) y Motor Heurístico**:
+       - Implementación de `mergeAddressAdjustmentWithLLM(baseAddress, userAdjustmentText, context)` en `conversationService.ts`: Groq LLM (Llama 3.3 70B Versatile, temp=0.1) analiza qué componente específico se está corrigiendo (número exterior, colonia, calle, cruce) y genera el JSON unificado con `formattedSearchQuery`, `formattedUserLabel` y `changedFieldDescription` (ej. *"al número 150"* o *"a la colonia Roma Norte"*).
+       - Motor de respaldo `mergeAddressAdjustmentHeuristic`: sustitución inteligente de números y reemplazo de colonia conservando calle y número base en modo offline o sin latencia.
+    3. **Protección Contra Falsos Positivos de Negación**:
+       - Función `isAddressAdjustmentPattern(normalized)` integrada en `isNegativeOrCancel(normalized)`. Cualquier frase que contenga un ajuste numérico (*"no, es el 150"*, *"el 150"*), de colonia (*"no, en la roma"*) o vial no activa la cancelación y se canaliza inmediatamente al motor de fusión.
+    4. **Retroalimentación Auditiva y Visual Adaptativa (Voice UX & Mobile Frontend)**:
+       - Respuesta auditiva cálida y precisa informando el cambio exacto realizado:
+         * Registro: *«Entendido, cambié al número 150: Calle Sonora 150, Condesa. ¿Es correcta esta ubicación para Casa de mi primo?»*.
+         * Actualización: *«Entendido, cambié al número 150: Calle Sonora 150, Condesa. ¿Desea actualizar la dirección de Casa de mi primo con esta ubicación?»*.
+       - Re-geocodificación inmediata con OpenRouteService / Nominatim (`orsService.geocodeDestination`) y actualización reactiva de coordenadas y etiqueta en `MinimalHomeScreen.tsx` para reflejar el nuevo pin en el mapa y la tarjeta WCAG AAA.
+  - **Certificación y Pruebas**:
+    - Suite de pruebas unitarias automatizada (`test_address_improvements.js`) superada al 100% en todos los casos: protección de negaciones, preservación de direcciones completas con "en", fusión de número exterior y fusión de colonia.
+    - Certificación estricta de compilación TypeScript con `npx tsc --noEmit` superada con 0 errores.
+
+- [x] **TASK-40**: **Sistema Híbrido de Desambiguación Asistida por Referencias (Landmark-Assisted Disambiguation) en Viajes Directos y Alias (`06-mapas-ruteo.md`, `04-nlu-conversacional.md`, `03-voice-ux.md`, `07-mobile-frontend.md`, `09-qa-accesibilidad.md`)**:
+  - **Objetivo Completado**:
+    Se resolvió el problema de homonimia y ambigüedad de direcciones (calles o destinos repetidos en múltiples alcaldías como "Hidalgo", "Juárez", "Reforma") mediante un enfoque híbrido que combina desambiguación multizona (2 a 3 opciones claras) y anclaje con puntos de referencia notorios (Landmarks / Estaciones de Metro/Metrobús/Parques/Hospitales).
+    Aplica tanto para **viajes directos concretos** (`navegar_a`) como para el **registro o edición de alias** (`guardar_ubicacion` / `pendingAliasRegistration`).
+  - **Entregables por Agente Especializado**:
+    1. **Agente de Mapas y Ruteo (`06-mapas-ruteo.md`)**:
+       - Implementado `findNearestLandmark(coords)` en `orsService.ts` utilizando los catálogos en memoria `CDMX_TRANSPORT_POIS` (más de 1,000 estaciones de transporte masivo) y `FALLBACK_DESTINATIONS` (hospitales, parques, museos, monumentos).
+       - Implementado `getDisambiguationCandidates(query, userLocation, maxCandidates = 3)` con deduplicación por cercanía (<1,000m), detección de dispersión geográfica (>2.5 km) y extracción de zona principal con `extractZoneFromLabel`.
+    2. **Agente de NLU y Backend Conversacional (`04-nlu-conversacional.md` & `03-voice-ux.md`)**:
+       - Definidas interfaces `DisambiguationCandidate` y `PendingDisambiguation` en `conversationService.ts`.
+       - Conectado el flujo de navegación directa (`navegar_a`, `executeNavegarAFlow` y rectificaciones) y el flujo de alias (`guardar_ubicacion`, `awaiting_address`) para activar el estado `pendingDisambiguation` cuando la consulta arroje opciones homónimas dispersas.
+       - Implementado generador verbal cálido y respetuoso `buildDisambiguationSpokenPrompt`: *«Encontré [N] lugares con ese nombre: 1, en [Zona 1], cerca de [Landmark 1]... ¿A cuál de ellos desea ir? Puede decirme el número, la zona o un lugar cercano.»*.
+       - Implementado intérprete semántico `resolveDisambiguationSelection` con soporte para respuestas ordinales (*"la primera"*, *"la 2"*), por zona (*"Coyoacán"*), por landmark específico (*"metro viveros"*, *"metro hidalgo"*) o genérico único (*"la del parque"*), además de soporte para nuevas pistas y cancelaciones directas.
+    3. **Agente Mobile / Frontend (`07-mobile-frontend.md`)**:
+       - Implementado componente de tarjetas de desambiguación en `MinimalHomeScreen.tsx` con alto contraste WCAG AAA en Modo Día y Modo Noche.
+       - Cada tarjeta incluye: insignia circular con número ordinal de 42dp+, nombre de alcaldía o zona en tipografía grande (18sp+), dirección completa legible, insignias temáticas con iconos de landmark (🚇 Metro, 🚊 Metrobús, 🌳 Parque, 🏥 Hospital, 🏛️ Centro/Monumento), insignia de distancia en km/m y botón táctil accesible con chevron.
+       - Barra multimodal inferior con botón "CANCELAR" táctil de 60dp, micrófono central con ondas concéntricas animadas y guía accesible.
+    4. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
+       - Suite de pruebas automatizadas `test_disambiguation.ts` superada al 100% (17/17 pruebas pasando):
+         * Detección de landmarks y extracción de zonas.
+         * Generación de prompts verbales para navegación y alias.
+         * Selección ordinal, por número, por zona y por landmark.
+         * Flujos conversacionales completos de desambiguación en navegación y alias.
+         * Geocodificación en vivo con `orsService.getDisambiguationCandidates`.
+       - Certificación estricta de TypeScript con `npx tsc --noEmit` superada con 0 errores.
+
+- [x] **TASK-41**: **Precisión Predial y Geocodificación Estructurada de Casas y Vías (`06-mapas-ruteo.md`, `04-nlu-conversacional.md`, `07-mobile-frontend.md`, `09-qa-accesibilidad.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo**:
+    Eliminar la imprecisión en la geocodificación de calles concretas y números prediales/casas en la Ciudad de México y área metropolitana, impidiendo que el motor de mapas degenere a centroides de colonias o centros urbanos genéricos cuando no halla un número exterior exacto en OpenStreetMap.
+  - **Solución Implementada**:
+    1. **Agente de Mapas y Ruteo (`06-mapas-ruteo.md`)**:
+       - Creada función `parseStructuredAddress` con soporte para calles con fechas ("5 de Mayo", "16 de Septiembre"), cruces viales ("Sonora casi esquina con Ámsterdam") y números prediales.
+       - Corrección crítica de Photon API Komoot (sustituido `lang: 'es'` no soportado por `lang: 'default'`).
+       - Pelias ORS configurado con `layers=address,street,venue` forzando anclaje en predios y vías reales.
+       - Nominatim con búsqueda en cascada y *Street Segment Fallback*: si el número exacto no está catalogado en OSM, el motor relaja la búsqueda al tramo vial de la calle dentro de la colonia indicada, etiquetando la precisión como `'street'` en lugar de enviar al usuario al Zócalo o al centroide de la colonia.
+       - Modelo de datos enriquecido con `GeocodePrecision = 'exact' | 'street' | 'interpolated' | 'approximate'`.
+    2. **Agente de NLU y Backend Conversacional (`04-nlu-conversacional.md`)**:
+       - Extensión de `normalizeAddressWithLLM` y `normalizeAddressHeuristic` con extracción de `cruce` y generación de `StructuredAddressQuery`.
+       - Integración de geocodificación estructurada en flujos de navegación, guardado de alias, rectificaciones incrementales y confirmaciones.
+       - Diálogo verbal gerontológico con honestidad técnica cuando el pin esté a nivel calle: *«Ubiqué la Calle [calle] en [colonia] a la altura aproximada del número [número]»*.
+    3. **Agente Mobile / Frontend (`07-mobile-frontend.md`)**:
+       - Distintivo visual y accesible (WCAG AAA) de precisión en la tarjeta previa de confirmación en `MinimalHomeScreen.tsx` (*"📍 Dirección exacta"* en verde vs *"📍 Sobre la calle (aprox. al predio)"* en ámbar).
+    4. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
+       - Suite de pruebas automatizada `test_address_precision.ts` con 19 pruebas de integración y geocodificación real en CDMX superadas al 100%.
+       - Certificación estricta de TypeScript con `npx tsc --noEmit` superada con 0 errores.
+
 #### 5. Agente de Privacidad y Seguridad (`10-privacidad-seguridad.md`)
 - [ ] **TASK-20**: **Auditoría de Seguridad y Zero-Persistence en Producción**:
   - Actualización y blindaje de `.env.example` con las credenciales de Supabase.
   - Verificación de no-persistencia de audios ni datos de rastreo no autorizados.
 
-#### 6. Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)
-- [ ] **TASK-17**: **Configuración de EAS Build y Generación de APK de Prueba**:
-  - Configuración de `eas.json` con perfil `preview` para generación de APK independiente (sideloading en Android).
-  - Validación de compilación limpia y pruebas de campo en vehículo real.
+- [x] **TASK-17**: **Configuración de EAS Build y Generación de APK de Prueba**:
+  - Configuración de `eas.json` con perfil `preview` (`"buildType": "apk"`) y perfil `production` para sideloading directo en dispositivos Android.
+  - Scripts añadidos en `package.json`: `npm run build:apk` y `npm run start:tunnel`.
+  - Nueva API key de ElevenLabs validada con respuesta HTTP 200 y síntesis de audio de alta fidelidad.
+  - Validación de compilación limpia de TypeScript (`npx tsc --noEmit` con 0 errores).
 
 

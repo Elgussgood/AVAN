@@ -8,6 +8,7 @@ import {
   Animated,
   useColorScheme,
   ActivityIndicator,
+  ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -18,11 +19,30 @@ import { AudioRecorderService } from '../services/audioRecorderService';
 import {
   ConversationService,
   ConversationContext,
+  buildDisambiguationSpokenPrompt,
 } from '../services/conversationService';
-import { orsService, StepInstruction } from '../services/orsService';
+import { orsService, StepInstruction, DisambiguationCandidate, GeocodePrecision } from '../services/orsService';
 import { LocationService } from '../services/locationService';
 import { AliasService } from '../services/aliasService';
 import { InteractiveMap } from '../components/InteractiveMap';
+
+const getLandmarkIcon = (type?: string): { name: any; color: string } => {
+  switch (type) {
+    case 'metro':
+      return { name: 'subway', color: '#E11D48' };
+    case 'metrobus':
+      return { name: 'bus', color: '#D97706' };
+    case 'parque':
+      return { name: 'leaf', color: '#16A34A' };
+    case 'hospital':
+      return { name: 'medkit', color: '#DC2626' };
+    case 'museo':
+    case 'monumento':
+      return { name: 'business', color: '#2563EB' };
+    default:
+      return { name: 'location', color: '#FF5722' };
+  }
+};
 
 export type VoiceState = 'idle' | 'listening' | 'processing' | 'speaking';
 
@@ -89,6 +109,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
   const hasAnnouncedWelcomeRef = useRef<boolean>(false);
   const lastProcessedRegistrationRef = useRef<any>(null);
   const lastProcessedConfirmationRef = useRef<any>(null);
+  const lastProcessedDisambiguationRef = useRef<any>(null);
   const addressPromptTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Sincronizar contexto entrante (incluyendo salto de contexto desde el mapa para registro o confirmación de viaje)
@@ -100,6 +121,29 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       if (addressPromptTimeoutRef.current) {
         clearTimeout(addressPromptTimeoutRef.current);
         addressPromptTimeoutRef.current = null;
+      }
+
+      // Caso 0: Salto de contexto para desambiguación de direcciones (TASK-40)
+      const dis = propContext.pendingDisambiguation;
+      if (!dis) {
+        lastProcessedDisambiguationRef.current = null;
+      } else if (dis !== lastProcessedDisambiguationRef.current) {
+        lastProcessedDisambiguationRef.current = dis;
+        hasAnnouncedWelcomeRef.current = true; // Suprimir bienvenida genérica para no encimar
+
+        const prompt = buildDisambiguationSpokenPrompt(
+          dis.candidates,
+          dis.intent,
+          dis.aliasName
+        );
+        setSpokenMessage(prompt);
+        setVoiceState('speaking');
+        addressPromptTimeoutRef.current = setTimeout(() => {
+          VoiceService.speak(prompt, async () => {
+            await startListeningWithVAD();
+          });
+        }, 350);
+        return;
       }
 
       // Caso 1: Salto de contexto para registro de direcciones
@@ -649,6 +693,9 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       if (response.updatedContext.pendingAliasRegistration) {
         lastProcessedRegistrationRef.current = response.updatedContext.pendingAliasRegistration;
       }
+      if (response.updatedContext.pendingDisambiguation) {
+        lastProcessedDisambiguationRef.current = response.updatedContext.pendingDisambiguation;
+      }
 
       if (onContextChange) {
         onContextChange(response.updatedContext);
@@ -781,6 +828,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
             (response.shouldAutoListen === true ||
               Boolean(response.updatedContext.pendingConfirmation) ||
               Boolean(response.updatedContext.pendingAliasRegistration) ||
+              Boolean(response.updatedContext.pendingDisambiguation) ||
               (Boolean(response.updatedContext.pendingTripCompletion) && asksQuestion) ||
               (response.shouldAutoListen !== false &&
                 (asksQuestion ||
@@ -797,7 +845,9 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
               // Ignorar si haptics no está disponible
             }
 
-            if (response.updatedContext.pendingConfirmation) {
+            if (response.updatedContext.pendingDisambiguation) {
+              setSpokenMessage('Diga el número, la zona o toque una opción...');
+            } else if (response.updatedContext.pendingConfirmation) {
               setSpokenMessage(
                 `¿Desea iniciar el viaje a ${response.updatedContext.pendingConfirmation.destination}?`
               );
@@ -962,6 +1012,10 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       return 'Diga "Sí" para confirmar o "Cancelar" para detener';
     }
 
+    if (currentContext.pendingDisambiguation) {
+      return 'Diga el número, la zona o toque una de las opciones';
+    }
+
     if (currentContext.pendingTripCompletion) {
       return 'Diga un nuevo destino o "No" para terminar';
     }
@@ -985,6 +1039,13 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     Boolean(currentContext.pendingConfirmation) &&
     Boolean(currentContext.pendingConfirmation?.coordinates);
 
+  const isDisambiguating = Boolean(
+    currentContext.pendingDisambiguation &&
+    currentContext.pendingDisambiguation.candidates &&
+    currentContext.pendingDisambiguation.candidates.length > 0
+  );
+  const disambiguationData = currentContext.pendingDisambiguation;
+
   const isShowingConfirmationPreview = isConfirmingAddress || isConfirmingTrip;
 
   // Variables unificadas para confirmación visual en mapa (dirección o viaje)
@@ -1001,6 +1062,10 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         ? 'Viaje foráneo en carretera (>50 km)'
         : 'Destino seleccionado')
     : currentContext.pendingAliasRegistration?.addressCandidate || 'Dirección seleccionada';
+
+  const previewPrecision: GeocodePrecision | undefined = isConfirmingTrip
+    ? currentContext.pendingConfirmation?.precision
+    : currentContext.pendingAliasRegistration?.precision;
 
   const isUpdatingAlias = Boolean(
     !isConfirmingTrip &&
@@ -1122,6 +1187,64 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
               >
                 {previewSubtitle}
               </Text>
+
+              {/* TASK-41: Distintivo de Precisión Gerontológica Accesible (WCAG AAA) */}
+              {previewPrecision && (
+                <View
+                  style={[
+                    styles.precisionBadge,
+                    previewPrecision === 'exact'
+                      ? (isDarkMode ? styles.precisionExactBadgeDark : styles.precisionExactBadge)
+                      : previewPrecision === 'street'
+                      ? (isDarkMode ? styles.precisionStreetBadgeDark : styles.precisionStreetBadge)
+                      : (isDarkMode ? styles.precisionApproxBadgeDark : styles.precisionApproxBadge),
+                  ]}
+                  accessibilityLabel={
+                    previewPrecision === 'exact'
+                      ? 'Precisión de geocodificación: Dirección exacta'
+                      : previewPrecision === 'street'
+                      ? 'Precisión de geocodificación: Sobre la calle, aproximado al predio'
+                      : 'Precisión de geocodificación: Zona aproximada'
+                  }
+                >
+                  <Ionicons
+                    name={
+                      previewPrecision === 'exact'
+                        ? 'checkmark-circle'
+                        : previewPrecision === 'street'
+                        ? 'navigate-circle'
+                        : 'location-outline'
+                    }
+                    size={16}
+                    color={
+                      previewPrecision === 'exact'
+                        ? (isDarkMode ? '#4ADE80' : '#166534')
+                        : previewPrecision === 'street'
+                        ? (isDarkMode ? '#FDE047' : '#854D0E')
+                        : (isDarkMode ? '#60A5FA' : '#1E40AF')
+                    }
+                  />
+                  <Text
+                    style={[
+                      styles.precisionBadgeText,
+                      {
+                        color:
+                          previewPrecision === 'exact'
+                            ? (isDarkMode ? '#4ADE80' : '#166534')
+                            : previewPrecision === 'street'
+                            ? (isDarkMode ? '#FDE047' : '#854D0E')
+                            : (isDarkMode ? '#60A5FA' : '#1E40AF'),
+                      },
+                    ]}
+                  >
+                    {previewPrecision === 'exact'
+                      ? 'Dirección exacta'
+                      : previewPrecision === 'street'
+                      ? 'Sobre la calle (aprox. al predio)'
+                      : 'Zona aproximada'}
+                  </Text>
+                </View>
+              )}
             </View>
 
             {/* Pregunta clara de confirmación */}
@@ -1231,6 +1354,243 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
               Hable al micrófono o presione una opción
             </Text>
           </View>
+        ) : isDisambiguating && disambiguationData ? (
+          /* TASK-40: Vista de Desambiguación Multilocación Asistida por Referencias */
+          <View style={styles.disambiguationContainer}>
+            {/* Cabecera accesible */}
+            <View style={styles.previewHeaderRow}>
+              <Ionicons
+                name="navigate-circle"
+                size={26}
+                color={currentTheme.buttonOrange}
+              />
+              <Text
+                style={[
+                  styles.previewHeaderText,
+                  { color: currentTheme.textPrimary },
+                ]}
+              >
+                {disambiguationData.intent === 'alias_registration'
+                  ? `GUARDAR: ${disambiguationData.aliasName?.toUpperCase() || 'UBICACIÓN'}`
+                  : 'SELECCIONE EL DESTINO'}
+              </Text>
+            </View>
+
+            {/* Subtítulo instructivo de alto contraste */}
+            <Text
+              style={[
+                styles.disambiguationSubtitle,
+                { color: currentTheme.textSecondary },
+              ]}
+            >
+              Encontré varias ubicaciones con ese nombre. Toque una opción o diga su número:
+            </Text>
+
+            {/* Lista deslizable de tarjetas de candidatos */}
+            <ScrollView
+              style={styles.disambiguationScroll}
+              contentContainerStyle={styles.disambiguationScrollContent}
+              showsVerticalScrollIndicator={false}
+            >
+              {disambiguationData.candidates.map((candidate, idx) => {
+                const landmarkInfo = getLandmarkIcon(candidate.landmarkType);
+                const distanceStr =
+                  candidate.distanceMeters !== undefined
+                    ? candidate.distanceMeters >= 1000
+                      ? `${(candidate.distanceMeters / 1000).toFixed(1)} km`
+                      : `${candidate.distanceMeters} m`
+                    : null;
+
+                return (
+                  <TouchableOpacity
+                    key={candidate.id || `disambiguation-${idx}`}
+                    style={[
+                      styles.candidateCard,
+                      {
+                        backgroundColor: isDarkMode ? '#131E31' : '#FFFFFF',
+                        borderColor: isDarkMode ? '#233857' : '#CBD5E1',
+                      },
+                    ]}
+                    onPress={() => handleProcessInput(`la ${idx + 1}`)}
+                    activeOpacity={0.8}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Opción ${idx + 1}: en ${candidate.colonia_o_alcaldia}${
+                      candidate.landmarkRef ? `, cerca de ${candidate.landmarkRef}` : ''
+                    }`}
+                    accessibilityHint="Presione para elegir esta ubicación"
+                  >
+                    {/* Badge de Número Ordinal Gigante */}
+                    <View style={styles.candidateNumberBadge}>
+                      <Text style={styles.candidateNumberText}>{idx + 1}</Text>
+                    </View>
+
+                    {/* Contenido Central: Zona, Etiqueta y Landmark */}
+                    <View style={styles.candidateInfoCol}>
+                      <Text
+                        style={[
+                          styles.candidateZoneText,
+                          { color: currentTheme.textPrimary },
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {candidate.colonia_o_alcaldia}
+                      </Text>
+
+                      <Text
+                        style={[
+                          styles.candidateLabelText,
+                          { color: currentTheme.textSecondary },
+                        ]}
+                        numberOfLines={2}
+                      >
+                        {candidate.label}
+                      </Text>
+
+                      {/* Fila de Insignias / Pills (Landmark + Distancia) */}
+                      <View style={styles.candidatePillsRow}>
+                        {candidate.landmarkRef && (
+                          <View
+                            style={[
+                              styles.landmarkPill,
+                              {
+                                backgroundColor: isDarkMode ? '#1E293B' : '#F1F5F9',
+                                borderColor: isDarkMode ? '#334155' : '#E2E8F0',
+                              },
+                            ]}
+                          >
+                            <Ionicons
+                              name={landmarkInfo.name}
+                              size={15}
+                              color={landmarkInfo.color}
+                              style={{ marginRight: 5 }}
+                            />
+                            <Text
+                              style={[
+                                styles.landmarkPillText,
+                                { color: currentTheme.textPrimary },
+                              ]}
+                              numberOfLines={1}
+                            >
+                              Cerca de {candidate.landmarkRef}
+                            </Text>
+                          </View>
+                        )}
+
+                        {distanceStr && (
+                          <View
+                            style={[
+                              styles.distancePill,
+                              {
+                                backgroundColor: isDarkMode ? '#1E293B' : '#F1F5F9',
+                                borderColor: isDarkMode ? '#334155' : '#E2E8F0',
+                              },
+                            ]}
+                          >
+                            <Ionicons
+                              name="navigate-outline"
+                              size={13}
+                              color={currentTheme.buttonOrange}
+                              style={{ marginRight: 4 }}
+                            />
+                            <Text
+                              style={[
+                                styles.distancePillText,
+                                { color: currentTheme.textSecondary },
+                              ]}
+                            >
+                              a {distanceStr}
+                            </Text>
+                          </View>
+                        )}
+                      </View>
+                    </View>
+
+                    {/* Flecha lateral indicadora */}
+                    <View style={styles.candidateArrowCol}>
+                      <Ionicons
+                        name="chevron-forward"
+                        size={24}
+                        color={currentTheme.textSecondary}
+                      />
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+
+            {/* Controles Multimodales Inferiores: Micrófono y Botón Cancelar */}
+            <View style={styles.disambiguationControlsRow}>
+              {/* Botón táctil Cancelar */}
+              <TouchableOpacity
+                style={[
+                  styles.disambiguationCancelButton,
+                  {
+                    backgroundColor: isDarkMode ? '#450A0A' : '#FEE2E2',
+                    borderColor: '#EF4444',
+                  },
+                ]}
+                onPress={() => handleProcessInput('cancelar')}
+                activeOpacity={0.8}
+                accessibilityRole="button"
+                accessibilityLabel="Cancelar selección"
+                accessibilityHint="Regresa a la pantalla principal"
+              >
+                <Ionicons name="close-circle" size={24} color="#EF4444" />
+                <Text
+                  style={[
+                    styles.decisionTouchText,
+                    { color: isDarkMode ? '#F87171' : '#B91C1C' },
+                  ]}
+                >
+                  CANCELAR
+                </Text>
+              </TouchableOpacity>
+
+              {/* Micrófono central accesible */}
+              <View style={styles.miniMicWrapper}>
+                <Animated.View
+                  style={[
+                    styles.miniGlowHalo,
+                    {
+                      backgroundColor: getHaloColor(),
+                      opacity: haloOpacityAnim,
+                      transform: [{ scale: pulseAnim }],
+                    },
+                  ]}
+                  pointerEvents="none"
+                />
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={handleVoicePress}
+                  style={[
+                    styles.miniMicButton,
+                    {
+                      backgroundColor: getButtonColor(),
+                      shadowColor: getButtonColor(),
+                    },
+                  ]}
+                  accessibilityLabel="Botón de micrófono para hablar"
+                  accessibilityRole="button"
+                >
+                  {voiceState === 'processing' ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Ionicons name={getButtonIcon()} size={36} color="#FFFFFF" />
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Guía inferior */}
+            <Text
+              style={[
+                styles.voiceOrTouchHint,
+                { color: currentTheme.textSecondary, marginBottom: 8 },
+              ]}
+            >
+              Diga "la primera", "Coyoacán" o toque una opción
+            </Text>
+          </View>
         ) : (
           /* Centro de la pantalla: One-Button UI pura con botón central dominante */
           <View style={styles.centerContainer}>
@@ -1333,7 +1693,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         )}
 
         {/* Espaciador inferior */}
-        {!isConfirmingAddress && <View style={styles.bottomSpacer} />}
+        {!isConfirmingAddress && !isDisambiguating && <View style={styles.bottomSpacer} />}
       </SafeAreaView>
 
       {/* Requerimiento 3: Pantalla / Indicador de Carga Gerontológico */}
@@ -1520,6 +1880,52 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 18,
   },
+  precisionBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 4,
+    paddingHorizontal: 12,
+    borderRadius: 20,
+    marginTop: 8,
+    alignSelf: 'center',
+  },
+  precisionExactBadge: {
+    backgroundColor: '#DCFCE7',
+    borderColor: '#86EFAC',
+    borderWidth: 1,
+  },
+  precisionExactBadgeDark: {
+    backgroundColor: '#064E3B',
+    borderColor: '#059669',
+    borderWidth: 1,
+  },
+  precisionStreetBadge: {
+    backgroundColor: '#FEF9C3',
+    borderColor: '#FDE047',
+    borderWidth: 1,
+  },
+  precisionStreetBadgeDark: {
+    backgroundColor: '#451A03',
+    borderColor: '#D97706',
+    borderWidth: 1,
+  },
+  precisionApproxBadge: {
+    backgroundColor: '#DBEAFE',
+    borderColor: '#93C5FD',
+    borderWidth: 1,
+  },
+  precisionApproxBadgeDark: {
+    backgroundColor: '#1E293B',
+    borderColor: '#3B82F6',
+    borderWidth: 1,
+  },
+  precisionBadgeText: {
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+  },
   confirmPromptText: {
     fontSize: 20,
     fontWeight: '800',
@@ -1577,5 +1983,120 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     textAlign: 'center',
     marginTop: 2,
+  },
+  disambiguationContainer: {
+    flex: 1,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 12,
+  },
+  disambiguationSubtitle: {
+    fontSize: 15,
+    fontWeight: '600',
+    textAlign: 'center',
+    marginVertical: 6,
+    lineHeight: 20,
+  },
+  disambiguationScroll: {
+    flex: 1,
+    marginVertical: 6,
+  },
+  disambiguationScrollContent: {
+    paddingBottom: 10,
+  },
+  candidateCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 18,
+    borderWidth: 2,
+    padding: 12,
+    marginBottom: 10,
+    minHeight: 76,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  candidateNumberBadge: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: '#FF5722',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  candidateNumberText: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
+  candidateInfoCol: {
+    flex: 1,
+  },
+  candidateZoneText: {
+    fontSize: 18,
+    fontWeight: '800',
+    letterSpacing: 0.3,
+    marginBottom: 2,
+  },
+  candidateLabelText: {
+    fontSize: 13,
+    fontWeight: '500',
+    lineHeight: 17,
+    marginBottom: 6,
+  },
+  candidatePillsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 6,
+  },
+  landmarkPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  landmarkPillText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  distancePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  distancePillText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  candidateArrowCol: {
+    paddingLeft: 6,
+    justifyContent: 'center',
+  },
+  disambiguationControlsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+    marginVertical: 6,
+  },
+  disambiguationCancelButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 16,
+    borderWidth: 2,
+    height: 60,
+    marginRight: 12,
   },
 });

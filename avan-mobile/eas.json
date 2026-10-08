@@ -1,0 +1,36 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_ELEVENLABS_API_KEY": "TU_API_KEY_ELEVENLABS_AQUI",
+        "EXPO_PUBLIC_GROQ_API_KEY": "TU_API_KEY_GROQ_AQUI",
+        "EXPO_PUBLIC_ORS_API_KEY": "TU_API_KEY_ORS_AQUI"
+      }
+    },
+    "production": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_ELEVENLABS_API_KEY": "TU_API_KEY_ELEVENLABS_AQUI",
+        "EXPO_PUBLIC_GROQ_API_KEY": "TU_API_KEY_GROQ_AQUI",
+        "EXPO_PUBLIC_ORS_API_KEY": "TU_API_KEY_ORS_AQUI"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}
