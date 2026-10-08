@@ -475,6 +475,9 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
   - Configuración de `eas.json` con perfil `preview` (`"buildType": "apk"`) y perfil `production` para sideloading directo en dispositivos Android.
   - Scripts añadidos en `package.json`: `npm run build:apk` y `npm run start:tunnel`.
   - Nueva API key de ElevenLabs validada con respuesta HTTP 200 y síntesis de audio de alta fidelidad.
+  - Variables de entorno inyectadas en la compilación de la nube para funcionamiento autónomo.
+  - **APK Generado con Éxito**: Build ID `f38212b0-7afc-4a31-bb8e-26cc1525db79`.
+  - **URL de Descarga del APK**: `https://expo.dev/artifacts/eas/jDFrf9bbWNlNNlC-02saJkzoIdgfmyvwmIBSYmYK5Dw.apk`.
   - Validación de compilación limpia de TypeScript (`npx tsc --noEmit` con 0 errores).
 
 
