@@ -552,6 +552,32 @@ export class OpenRouteService {
   private apiKey: string;
   private baseUrl = 'https://api.openrouteservice.org';
 
+  private static readonly CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutos
+  private static readonly MAX_CACHE_ENTRIES = 120;
+  private static geocodeCache = new Map<string, { data: GeocodeResult[]; timestamp: number }>();
+  private static reverseCache = new Map<string, { data: GeocodeResult; timestamp: number }>();
+
+  public static getFromCache<T>(cache: Map<string, { data: T; timestamp: number }>, key: string): T | null {
+    const entry = cache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.timestamp > OpenRouteService.CACHE_TTL_MS) {
+      cache.delete(key);
+      return null;
+    }
+    // Refrescar orden en caché LRU (eliminar e insertar al final)
+    cache.delete(key);
+    cache.set(key, entry);
+    return entry.data;
+  }
+
+  public static setInCache<T>(cache: Map<string, { data: T; timestamp: number }>, key: string, data: T): void {
+    if (cache.size >= OpenRouteService.MAX_CACHE_ENTRIES) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey) cache.delete(oldestKey);
+    }
+    cache.set(key, { data, timestamp: Date.now() });
+  }
+
   constructor(apiKey?: string) {
     this.apiKey = apiKey || process.env.EXPO_PUBLIC_ORS_API_KEY || '';
   }
@@ -672,35 +698,78 @@ export class OpenRouteService {
     }
 
     // 1. TIER 0: Búsqueda inmediata en el Catálogo Curado de Alta Fidelidad
+    const cacheKey = `${trimmed.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')}_${userLocation ? `${userLocation.latitude.toFixed(2)},${userLocation.longitude.toFixed(2)}` : 'cdmx'}`;
+    const cached = OpenRouteService.getFromCache(OpenRouteService.geocodeCache, cacheKey);
+    if (cached && cached.length > 0) {
+      return cached;
+    }
+
     const catalogResults = this.searchFallbackDestinations(trimmed);
     if (catalogResults.length > 0) {
+      OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, catalogResults);
       return catalogResults;
     }
     if (structured.street && structured.street !== trimmed) {
       const catalogStreetResults = this.searchFallbackDestinations(structured.street);
       if (catalogStreetResults.length > 0) {
+        OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, catalogStreetResults);
         return catalogStreetResults;
       }
     }
 
-    // 2. TIER 1: OpenRouteService con delimitación por círculo metropolitano (65km) y layers específicos
+    // 2. Concurrencia de baja latencia: Ejecución en paralelo de ORS (Tier 1) y Photon (Tier 3)
+    const apiTasks: Promise<{ source: string; results: GeocodeResult[] }>[] = [];
     if (this.apiKey) {
-      try {
-        const orsResults = await this.geocodeWithORS(structured, userLocation);
-        if (orsResults && orsResults.length > 0) {
-          if (structured.colonia) {
-            const expectedColonia = structured.colonia.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-            const labelNorm = orsResults[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-            if (labelNorm.includes(expectedColonia)) {
-              return orsResults;
-            }
-            // Si ORS ignoró la colonia, continuar a Nominatim
-          } else {
-            return orsResults;
-          }
+      apiTasks.push(
+        this.geocodeWithORS(structured, userLocation)
+          .then((results) => ({ source: 'ors', results: results || [] }))
+          .catch((err) => {
+            console.warn('[orsService] Error en geocodificación ORS:', err);
+            return { source: 'ors', results: [] };
+          })
+      );
+    }
+    apiTasks.push(
+      this.geocodeWithPhoton(structured, userLocation)
+        .then((results) => ({ source: 'photon', results: results || [] }))
+        .catch((err) => {
+          console.warn('[orsService] Error en geocodificación Photon:', err);
+          return { source: 'photon', results: [] };
+        })
+    );
+
+    const apiResponses = await Promise.all(apiTasks);
+    const orsMatch = apiResponses.find((r) => r.source === 'ors')?.results || [];
+    const photonMatch = apiResponses.find((r) => r.source === 'photon')?.results || [];
+
+    // Validar si ORS devolvió resultados conformes a la colonia (o sin colonia restrictiva)
+    if (orsMatch.length > 0) {
+      if (structured.colonia) {
+        const expectedColonia = structured.colonia.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const labelNorm = orsMatch[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        if (labelNorm.includes(expectedColonia)) {
+          OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, orsMatch);
+          return orsMatch;
         }
-      } catch (err) {
-        console.warn('[orsService] Error en geocodificación ORS, recurriendo a Nominatim:', err);
+        // Si ORS ignoró la colonia, continuar a Nominatim
+      } else {
+        OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, orsMatch);
+        return orsMatch;
+      }
+    }
+
+    // Si Photon encontró resultado de precisión exacta respetando la colonia
+    if (photonMatch.length > 0 && photonMatch[0].precision === 'exact') {
+      if (structured.colonia) {
+        const expectedColonia = structured.colonia.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const labelNorm = photonMatch[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        if (labelNorm.includes(expectedColonia)) {
+          OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, photonMatch);
+          return photonMatch;
+        }
+      } else {
+        OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, photonMatch);
+        return photonMatch;
       }
     }
 
@@ -708,20 +777,17 @@ export class OpenRouteService {
     try {
       const nominatimResults = await this.geocodeWithNominatim(structured, userLocation);
       if (nominatimResults && nominatimResults.length > 0) {
+        OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, nominatimResults);
         return nominatimResults;
       }
     } catch (err) {
-      console.warn('[orsService] Error en geocodificación Nominatim, recurriendo a Photon:', err);
+      console.warn('[orsService] Error en geocodificación Nominatim:', err);
     }
 
-    // 4. TIER 3: Photon API de Komoot (libre, rápido, con bias de CDMX)
-    try {
-      const photonResults = await this.geocodeWithPhoton(structured, userLocation);
-      if (photonResults && photonResults.length > 0) {
-        return photonResults;
-      }
-    } catch (err) {
-      console.warn('[orsService] Error en geocodificación Photon:', err);
+    // 4. Si Nominatim no encontró coincidencias pero Photon devolvió resultados a nivel de calle
+    if (photonMatch.length > 0) {
+      OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, photonMatch);
+      return photonMatch;
     }
 
     // 5. Fallback seguro: Si no hubo red ni coincidencias
@@ -1224,7 +1290,13 @@ export class OpenRouteService {
 
       const url = `https://router.project-osrm.org/route/v1/driving/${start.longitude},${start.latitude};${destination.longitude},${destination.latitude}?overview=full&geometries=geojson&steps=true`;
 
-      const response = await fetch(url, { signal: controller.signal });
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'AVAN-Senior-Navigation-App/1.0 (contacto: avan-app@escom.ipn.mx)',
+        },
+        signal: controller.signal,
+      });
       clearTimeout(timeout);
 
       if (!response.ok) {
@@ -1495,7 +1567,130 @@ export class OpenRouteService {
       isFallback: true,
     };
   }
+
+  /**
+   * Geocodificación inversa vía OpenStreetMap / Nominatim:
+   * Convierte coordenadas GPS en una dirección legible con calle, número y colonia.
+   * Cuenta con caché en memoria LRU para evitar llamadas repetidas en la calzada.
+   */
+  public async reverseGeocode(coord: Coordinates): Promise<GeocodeResult | null> {
+    if (!coord || typeof coord.latitude !== 'number' || typeof coord.longitude !== 'number') {
+      return null;
+    }
+
+    const cacheKey = `rev_${coord.latitude.toFixed(4)}_${coord.longitude.toFixed(4)}`;
+    const cached = OpenRouteService.getFromCache(OpenRouteService.reverseCache, cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3500);
+
+      const params = new URLSearchParams({
+        lat: coord.latitude.toString(),
+        lon: coord.longitude.toString(),
+        format: 'json',
+        addressdetails: '1',
+      });
+
+      const response = await fetch(`https://nominatim.openstreetmap.org/reverse?${params.toString()}`, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'AVAN-Senior-Navigation-App/1.0 (contacto: avan-app@escom.ipn.mx)',
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data && data.address) {
+          const addr = data.address;
+          const road = addr.road || addr.pedestrian || addr.street || '';
+          const houseNumber = addr.house_number || '';
+          const suburb = addr.suburb || addr.neighbourhood || addr.quarter || addr.city_district || '';
+          const city = addr.city || addr.town || addr.municipality || 'Ciudad de México';
+
+          const mainName = road ? (houseNumber ? `${road} ${houseNumber}` : road) : (data.name || 'Ubicación actual');
+          const labelParts = [
+            mainName,
+            suburb,
+            city,
+          ].filter(Boolean);
+
+          const result: GeocodeResult = {
+            id: `rev-${data.place_id || Date.now()}`,
+            name: mainName,
+            label: labelParts.join(', '),
+            coordinates: {
+              latitude: parseFloat(data.lat) || coord.latitude,
+              longitude: parseFloat(data.lon) || coord.longitude,
+            },
+            precision: houseNumber ? 'exact' : 'street',
+          };
+
+          OpenRouteService.setInCache(OpenRouteService.reverseCache, cacheKey, result);
+          return result;
+        }
+      }
+    } catch (err) {
+      console.warn('[orsService] Error en reverseGeocode:', err);
+    }
+
+    return null;
+  }
+
+  /**
+   * Ajusta una coordenada GPS a la calzada vial más cercana usando el endpoint Nearest de OSRM.
+   * Elimina el jitter o desviación de GPS cuando el vehículo está circulando.
+   */
+  public async snapToRoad(
+    coord: Coordinates
+  ): Promise<{ snappedCoord: Coordinates; distanceMeters: number; streetName?: string } | null> {
+    if (!coord || typeof coord.latitude !== 'number' || typeof coord.longitude !== 'number') {
+      return null;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+
+      const url = `https://router.project-osrm.org/nearest/v1/driving/${coord.longitude},${coord.latitude}?number=1`;
+
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'AVAN-Senior-Navigation-App/1.0 (contacto: avan-app@escom.ipn.mx)',
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.code === 'Ok' && data.waypoints && data.waypoints[0]) {
+          const wp = data.waypoints[0];
+          const [lon, lat] = wp.location;
+          return {
+            snappedCoord: { latitude: lat, longitude: lon },
+            distanceMeters: Math.round(wp.distance || 0),
+            streetName: wp.name || undefined,
+          };
+        }
+      }
+    } catch (err) {
+      console.warn('[orsService] Error en snapToRoad OSRM:', err);
+    }
+
+    return null;
+  }
 }
 
 // Instancia singleton por defecto
 export const orsService = new OpenRouteService();
+
+// Exportaciones de conveniencia
+export const reverseGeocode = (coord: Coordinates) => orsService.reverseGeocode(coord);
+export const snapToRoad = (coord: Coordinates) => orsService.snapToRoad(coord);

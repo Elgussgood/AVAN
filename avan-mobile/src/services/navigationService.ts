@@ -57,11 +57,20 @@ export function getBearing(start: Coordinates, end: Coordinates): number {
 }
 
 /**
- * Distancia perpendicular en metros desde un punto a un segmento rectilíneo.
+ * Proyecta ortogonalmente un punto sobre un segmento de calle y devuelve el punto proyectado y la distancia en metros.
  */
-function distanceToSegmentMeters(p: Coordinates, v: Coordinates, w: Coordinates): number {
+export function projectPointToSegment(
+  p: Coordinates,
+  v: Coordinates,
+  w: Coordinates
+): { projectedPoint: Coordinates; distanceMeters: number } {
   const segLength = getDistanceMeters(v, w);
-  if (segLength === 0) return getDistanceMeters(p, v);
+  if (segLength === 0) {
+    return {
+      projectedPoint: { latitude: v.latitude, longitude: v.longitude },
+      distanceMeters: getDistanceMeters(p, v),
+    };
+  }
 
   const cosLat = Math.cos((v.latitude * Math.PI) / 180);
   const x = (p.longitude - v.longitude) * cosLat;
@@ -70,11 +79,84 @@ function distanceToSegmentMeters(p: Coordinates, v: Coordinates, w: Coordinates)
   const dy = w.latitude - v.latitude;
   const dot = x * dx + y * dy;
   const lenSq = dx * dx + dy * dy;
-  const t = Math.max(0, Math.min(1, dot / lenSq));
+  const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, dot / lenSq));
 
   const projLat = v.latitude + t * (w.latitude - v.latitude);
   const projLon = v.longitude + t * (w.longitude - v.longitude);
-  return getDistanceMeters(p, { latitude: projLat, longitude: projLon });
+  const projCoord: Coordinates = { latitude: projLat, longitude: projLon };
+
+  return {
+    projectedPoint: projCoord,
+    distanceMeters: getDistanceMeters(p, projCoord),
+  };
+}
+
+/**
+ * Distancia perpendicular en metros desde un punto a un segmento rectilíneo.
+ */
+function distanceToSegmentMeters(p: Coordinates, v: Coordinates, w: Coordinates): number {
+  return projectPointToSegment(p, v, w).distanceMeters;
+}
+
+/**
+ * Proyecta la posición del vehículo a la calzada vial más cercana de la ruta activa (Snap-to-Road).
+ * Si la lectura de GPS está dentro del radio de tolerancia (default 35m),
+ * ajusta el punto al asfalto de la vía para eliminar jitter e imprecisión visual.
+ */
+export function snapPointToPolyline(
+  point: Coordinates,
+  polyline: Coordinates[],
+  maxSnapDistanceMeters: number = 35
+): {
+  snappedPoint: Coordinates;
+  isSnapped: boolean;
+  distanceToRoad: number;
+  closestSegmentIndex: number;
+} {
+  if (!polyline || polyline.length === 0) {
+    return {
+      snappedPoint: point,
+      isSnapped: false,
+      distanceToRoad: 0,
+      closestSegmentIndex: 0,
+    };
+  }
+
+  if (polyline.length === 1) {
+    const dist = getDistanceMeters(point, polyline[0]);
+    return {
+      snappedPoint: dist <= maxSnapDistanceMeters ? polyline[0] : point,
+      isSnapped: dist <= maxSnapDistanceMeters,
+      distanceToRoad: dist,
+      closestSegmentIndex: 0,
+    };
+  }
+
+  let minDistance = Infinity;
+  let bestPoint = point;
+  let bestSegmentIdx = 0;
+
+  for (let i = 0; i < polyline.length - 1; i++) {
+    const { projectedPoint, distanceMeters } = projectPointToSegment(
+      point,
+      polyline[i],
+      polyline[i + 1]
+    );
+
+    if (distanceMeters < minDistance) {
+      minDistance = distanceMeters;
+      bestPoint = projectedPoint;
+      bestSegmentIdx = i;
+    }
+  }
+
+  const isSnapped = minDistance <= maxSnapDistanceMeters;
+  return {
+    snappedPoint: isSnapped ? bestPoint : point,
+    isSnapped,
+    distanceToRoad: minDistance,
+    closestSegmentIndex: bestSegmentIdx,
+  };
 }
 
 /**
@@ -196,6 +278,8 @@ export function formatDuration(seconds: number): string {
  * Servicio de navegación turn-by-turn en tiempo real.
  */
 export class NavigationService {
+  static projectPointToSegment = projectPointToSegment;
+  static snapPointToPolyline = snapPointToPolyline;
   static getDistanceMeters = getDistanceMeters;
   static getBearing = getBearing;
   static getMinDistanceToPolyline = getMinDistanceToPolyline;
@@ -263,17 +347,34 @@ export class NavigationService {
 
     const distanceToNextManeuver = getDistanceMeters(userLocation, maneuverCoord);
 
-    // 5. Cálculo de distancia y duración restante estimada
+    // 5. Cálculo de distancia y duración restante estimada con jerarquía vial real de la API
     let remainingDist = distanceToNextManeuver;
-    for (let i = validStepIndex + 1; i < steps.length; i++) {
-      remainingDist += steps[i].distance || 0;
-    }
-    if (remainingDist === 0) {
-      remainingDist = distToDestination;
+    let remainingDuration = 0;
+
+    // Duración proporcional del paso activo según los datos reales de la API
+    if (currentStep && currentStep.distance > 0 && typeof currentStep.duration === 'number' && currentStep.duration > 0) {
+      const stepRatio = Math.max(0, Math.min(1, distanceToNextManeuver / currentStep.distance));
+      remainingDuration += Math.round(currentStep.duration * stepRatio);
+    } else {
+      // Fallback si el paso no cuenta con duración explícita
+      remainingDuration += Math.round(distanceToNextManeuver / 8.33);
     }
 
-    // Estimación a velocidad urbana de 30 km/h (~8.33 m/s)
-    const remainingDuration = Math.round(remainingDist / 8.33);
+    // Sumar duraciones reales provistas por la API de ruteo para los pasos subsecuentes
+    for (let i = validStepIndex + 1; i < steps.length; i++) {
+      const st = steps[i];
+      remainingDist += st.distance || 0;
+      if (typeof st.duration === 'number' && st.duration > 0) {
+        remainingDuration += st.duration;
+      } else {
+        remainingDuration += Math.round((st.distance || 0) / 8.33);
+      }
+    }
+
+    if (remainingDist === 0) {
+      remainingDist = distToDestination;
+      remainingDuration = Math.round(distToDestination / 8.33);
+    }
 
     return {
       currentStepIndex: validStepIndex,

@@ -165,7 +165,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     } catch {}
   };
 
-  const effectiveLocation: UserLocation | null = isSimulating
+  const rawEffectiveLocation: UserLocation | null = isSimulating
     ? simulatedLocation
     : (userLocation || (activeRouteCoords && activeRouteCoords.length > 0 ? {
         latitude: activeRouteCoords[0].latitude,
@@ -175,6 +175,27 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           : 0,
         speed: 0,
       } : null));
+
+  // Snap-to-Road: Proyección a la calzada vial de la ruta activa para eliminar jitter de GPS
+  const effectiveLocation: UserLocation | null = useMemo(() => {
+    if (!rawEffectiveLocation) return null;
+    if (isSimulating || !activeRouteCoords || activeRouteCoords.length < 2) {
+      return rawEffectiveLocation;
+    }
+    const snap = NavigationService.snapPointToPolyline(
+      rawEffectiveLocation,
+      activeRouteCoords,
+      35 // Tolerancia de 35 metros para estabilizar el cursor en el asfalto
+    );
+    if (snap.isSnapped) {
+      return {
+        ...rawEffectiveLocation,
+        latitude: snap.snappedPoint.latitude,
+        longitude: snap.snappedPoint.longitude,
+      };
+    }
+    return rawEffectiveLocation;
+  }, [rawEffectiveLocation, activeRouteCoords, isSimulating]);
 
   const initialMapRegion = useMemo(() => {
     const lat = (activeRouteCoords && activeRouteCoords[0]?.latitude) ||

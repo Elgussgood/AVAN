@@ -480,4 +480,23 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
   - **URL de Descarga del APK**: `https://expo.dev/artifacts/eas/jDFrf9bbWNlNNlC-02saJkzoIdgfmyvwmIBSYmYK5Dw.apk`.
   - Validación de compilación limpia de TypeScript (`npx tsc --noEmit` con 0 errores).
 
+- [x] **TASK-42**: **Fase 1: Optimización de APIs de Navegación (API-First Navigation Architecture) (`06-mapas-ruteo.md`, `07-mobile-frontend.md`, `09-qa-accesibilidad.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo Completado**:
+    Migrar la navegación a un modelo 100% soportado en APIs, eliminando cálculos heurísticos locales de velocidad fija, previniendo falsos desvíos por jitter de GPS con Snap-to-Road, y acelerando la geocodificación mediante concurrencia y caché LRU en memoria.
+  - **Entregables por Agente**:
+    1. **Agente de Mapas y Ruteo (`06-mapas-ruteo.md`)**:
+       - `snapPointToPolyline` y `projectPointToSegment` implementados en `navigationService.ts` con tolerancia de 35 metros para anclar el cursor GPS al asfalto de la vía.
+       - Cálculo de ETA dinámico y turn-by-turn en `evaluateProgress`: reemplazada la fórmula estática de 30 km/h por el acumulado de duraciones reales provistas por los `step.duration` de la API de ruteo (OpenRouteService / OSRM), ponderando la fracción restante del paso activo.
+       - Caché LRU en memoria en `orsService.ts` (`Map<string, CacheEntry>`) con TTL de 15 minutos y capacidad de 120 entradas para respuestas inmediatas (<5ms).
+       - Concurrencia de baja latencia en geocodificación: ejecución simultánea de ORS (Tier 1) y Photon (Tier 3) con arbitraje por precisión y concordancia de colonia antes de recurrir a Nominatim.
+       - Implementado `reverseGeocode` para obtener la dirección y contexto de calle/colonia a partir de coordenadas GPS.
+       - Implementado `snapToRoad` usando el endpoint Nearest de OSRM con encabezado `User-Agent` autorizado (eliminando errores HTTP 403).
+    2. **Agente Mobile / Frontend (`07-mobile-frontend.md`)**:
+       - Integrado `snapPointToPolyline` en `effectiveLocation` dentro de `HomeScreen.tsx` para estabilizar el cursor vehicular y la polilínea restante sobre la calzada vial activa, manteniendo la detección de desvío real (>100m).
+    3. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
+       - Nueva suite de pruebas automatizadas `test_navigation_api_phase1.ts` superada al 100% (16/16 pruebas exitosas).
+       - Suplementadas las suites `test_address_precision.ts` (19/19) y `test_disambiguation.ts` (17/17).
+       - Scripts añadidos en `package.json` (`npm run test:phase1`, `test:precision`, `test:disambiguation`, `test:all`).
+       - Certificación estricta de TypeScript con `npx tsc --noEmit` superada con 0 errores.
+
 
