@@ -57,6 +57,16 @@ export type ZoomIntensity = 'normal' | 'mucho' | 'poco';
 export interface NavegarAArgs {
   /** Nombre del destino, dirección o punto de interés */
   destino: string;
+  /** Nombre de la calle o avenida si aplica */
+  calle?: string;
+  /** Número exterior si aplica */
+  numero?: string;
+  /** Colonia o barrio si aplica */
+  colonia?: string;
+  /** Alcaldía o municipio si aplica */
+  alcaldia?: string;
+  /** Cruce o esquina si aplica */
+  cruce?: string;
   /** Coordenadas opcionales si provienen de un alias */
   latitud?: number;
   longitud?: number;
@@ -76,6 +86,14 @@ export interface GuardarUbicacionArgs {
   longitud?: number;
   /** Dirección física opcional */
   direccion?: string;
+  /** Nombre de la calle o avenida si aplica */
+  calle?: string;
+  /** Número exterior si aplica */
+  numero?: string;
+  /** Colonia o barrio si aplica */
+  colonia?: string;
+  /** Cruce o esquina si aplica */
+  cruce?: string;
 }
 
 /**
@@ -174,14 +192,38 @@ export const AVAN_TOOLS: readonly ToolDefinition[] = [
     function: {
       name: 'navegar_a',
       description:
-        'Calcula la ruta hacia un destino y formula la confirmación en dos pasos requerida antes de iniciar la navegación.',
+        'Calcula la ruta hacia un destino, dirección o punto de interés, y formula la confirmación en dos pasos requerida antes de iniciar la navegación.',
       parameters: {
         type: 'object',
         properties: {
           destino: {
             type: 'string',
             description:
-              'Nombre del lugar, dirección o punto de interés al que desea desplazarse el usuario.',
+              'Nombre normalizado del lugar, dirección o punto de interés al que desea desplazarse el usuario (ej. "Palacio de Bellas Artes", "Sonora 120, Condesa").',
+          },
+          calle: {
+            type: 'string',
+            description: 'Nombre de la calle o avenida si se indicó una dirección vial (ej. "Sonora", "Insurgentes").',
+          },
+          numero: {
+            type: 'string',
+            description: 'Número exterior si se especificó en la dirección (ej. "120", "1422").',
+          },
+          colonia: {
+            type: 'string',
+            description: 'Colonia o barrio si se indicó (ej. "Condesa", "Roma Norte", "Del Valle").',
+          },
+          alcaldia: {
+            type: 'string',
+            description: 'Alcaldía o municipio si se indicó (ej. "Cuauhtémoc", "Benito Juárez").',
+          },
+          cruce: {
+            type: 'string',
+            description: 'Calle transversal, cruce o esquina si fue mencionada (ej. "Ámsterdam").',
+          },
+          isForaneo: {
+            type: 'boolean',
+            description: 'Verdadero si el destino es un viaje foráneo en carretera (>50 km fuera de la ciudad, ej. Cuernavaca, Puebla, Acapulco).',
           },
         },
         required: ['destino'],
@@ -193,7 +235,7 @@ export const AVAN_TOOLS: readonly ToolDefinition[] = [
     function: {
       name: 'guardar_ubicacion',
       description:
-        'Guarda una ubicación con un alias o etiqueta personalizada (ej. "casa", "doctor", "hijo").',
+        'Guarda o actualiza una ubicación con un alias o etiqueta personalizada (ej. "casa", "doctor", "hijo").',
       parameters: {
         type: 'object',
         properties: {
@@ -205,6 +247,22 @@ export const AVAN_TOOLS: readonly ToolDefinition[] = [
           direccion: {
             type: 'string',
             description: 'Dirección física o colonia completa del lugar.',
+          },
+          calle: {
+            type: 'string',
+            description: 'Nombre de la calle o avenida si se especificó.',
+          },
+          numero: {
+            type: 'string',
+            description: 'Número exterior si aplica.',
+          },
+          colonia: {
+            type: 'string',
+            description: 'Colonia o barrio si aplica.',
+          },
+          cruce: {
+            type: 'string',
+            description: 'Calle de cruce o esquina si aplica.',
           },
         },
         required: ['alias'],
@@ -1338,6 +1396,17 @@ export async function mergeAddressAdjustmentWithLLM(
     };
   }
 
+  // 1. FAST-PATH HEURÍSTICO / 0ms: Si es un ajuste numérico, de colonia o calle predecible
+  const heuristicResult = mergeAddressAdjustmentHeuristic(trimmedBase, trimmedAdjustment);
+  if (
+    heuristicResult &&
+    heuristicResult.changedFieldDescription &&
+    heuristicResult.changedFieldDescription !== 'a la nueva ubicación' &&
+    heuristicResult.formattedSearchQuery !== trimmedBase
+  ) {
+    return heuristicResult;
+  }
+
   const apiKey = process.env.EXPO_PUBLIC_GROQ_API_KEY;
 
   if (apiKey && apiKey.trim() !== '') {
@@ -1523,6 +1592,12 @@ export async function normalizeAddressWithLLM(
       formattedSearchQuery: 'Ciudad de México',
       formattedUserLabel: 'Ubicación no especificada',
     };
+  }
+
+  // 1. FAST-PATH HEURÍSTICO / 0ms: Si es un landmark conocido o tiene componentes claros de calle y número/colonia
+  const heuristic = normalizeAddressHeuristic(trimmed);
+  if (heuristic && (heuristic.landmark || (heuristic.calle && (heuristic.numero || heuristic.colonia)))) {
+    return heuristic;
   }
 
   const apiKey = process.env.EXPO_PUBLIC_GROQ_API_KEY;
@@ -1867,14 +1942,14 @@ async function callGroqLLM(
     dynamicContextPrompt += `\n\nALIAS GUARDADOS DEL USUARIO (úsales para resolver destinos):\n${aliasesList}`;
   }
 
-  // 2. Historial de mensajes recientes
+  // 2. Historial de mensajes recientes (sin duplicar el mensaje actual recién añadido)
   const messages: GroqMessage[] = [
     { role: 'system', content: dynamicContextPrompt },
   ];
 
-  if (context.history && context.history.length > 0) {
-    const recent = context.history.slice(-4);
-    for (const msg of recent) {
+  if (context.history && context.history.length > 1) {
+    const previousHistory = context.history.slice(0, -1).slice(-3);
+    for (const msg of previousHistory) {
       messages.push({
         role: msg.role === 'user' ? 'user' : 'assistant',
         content: msg.content,
@@ -1903,7 +1978,7 @@ async function callGroqLLM(
         messages,
         tools: AVAN_TOOLS,
         tool_choice: 'auto',
-        temperature: 0.2,
+        temperature: 0.1,
         max_tokens: 256,
       }),
       signal: controller.signal,
@@ -1929,7 +2004,8 @@ async function callGroqLLM(
     // Función centralizada para resolver, geocodificar y confirmar navegar_a (soporta rectificaciones y cambios de opinión)
     const executeNavegarAFlow = async (
       targetDest: string,
-      customSpoken?: string
+      customSpoken?: string,
+      structuredFromArgs?: Partial<StructuredAddressQuery>
     ): Promise<ConversationResponse> => {
       // Salto de contexto ubicuo: Limpiar cualquier registro pendiente o viaje anterior
       context.pendingAliasRegistration = null;
@@ -2043,7 +2119,16 @@ async function callGroqLLM(
       const destName = aliasRes.resolvedName;
       let destCoords = aliasRes.coordinates;
       let destPrecision: GeocodePrecision | undefined;
-      const structuredDest = parseStructuredAddress(rawDest);
+      const parsed = parseStructuredAddress(rawDest);
+      const structuredDest: StructuredAddressQuery = {
+        street: structuredFromArgs?.street || parsed.street,
+        houseNumber: structuredFromArgs?.houseNumber || parsed.houseNumber,
+        colonia: structuredFromArgs?.colonia || parsed.colonia,
+        alcaldia: structuredFromArgs?.alcaldia || parsed.alcaldia,
+        crossStreet: structuredFromArgs?.crossStreet || parsed.crossStreet,
+        city: structuredFromArgs?.city || parsed.city || 'Ciudad de México',
+        rawQuery: rawDest,
+      };
 
       if (!destCoords) {
         try {
@@ -2158,7 +2243,14 @@ async function callGroqLLM(
       switch (fnName) {
         case 'navegar_a': {
           const rawDest = fnArgs.destino || userSpeechText;
-          return await executeNavegarAFlow(rawDest, rawContent);
+          const structuredFromArgs: Partial<StructuredAddressQuery> = {
+            street: fnArgs.calle,
+            houseNumber: fnArgs.numero,
+            colonia: fnArgs.colonia,
+            alcaldia: fnArgs.alcaldia,
+            crossStreet: fnArgs.cruce,
+          };
+          return await executeNavegarAFlow(rawDest, rawContent, structuredFromArgs);
         }
 
         case 'confirmar_viaje': {
@@ -2329,8 +2421,40 @@ async function callGroqLLM(
             };
           }
 
-          // Si sí especificó dirección, normalizar con LLM y geocodificar para vista previa exacta
-          const normalizedAddr = await normalizeAddressWithLLM(address, context);
+          // Si sí especificó dirección o se extrajeron entidades directamente en el Tool Call:
+          let normalizedAddr: NormalizedAddressResult;
+          if (fnArgs.calle || fnArgs.colonia || fnArgs.numero) {
+            const parts: string[] = [];
+            if (fnArgs.calle) {
+              parts.push(`Calle ${fnArgs.calle}${fnArgs.numero ? ' ' + fnArgs.numero : ''}`);
+            } else if (fnArgs.numero) {
+              parts.push(`Número ${fnArgs.numero}`);
+            }
+            if (fnArgs.colonia) parts.push(fnArgs.colonia);
+            if (fnArgs.cruce) parts.push(`esq. ${fnArgs.cruce}`);
+
+            const userLabel = parts.join(', ') || address;
+            const fullSearch = `${userLabel}, Ciudad de México`;
+
+            normalizedAddr = {
+              formattedSearchQuery: fullSearch,
+              formattedUserLabel: userLabel,
+              calle: fnArgs.calle,
+              numero: fnArgs.numero,
+              colonia: fnArgs.colonia,
+              cruce: fnArgs.cruce,
+              structuredQuery: {
+                street: fnArgs.calle || '',
+                houseNumber: fnArgs.numero,
+                colonia: fnArgs.colonia,
+                crossStreet: fnArgs.cruce,
+                city: 'Ciudad de México',
+                rawQuery: fullSearch,
+              },
+            };
+          } else {
+            normalizedAddr = await normalizeAddressWithLLM(address, context);
+          }
           if (normalizedAddr.aliasCandidate && (alias === 'nueva ubicación' || alias === 'nueva ubicacion')) {
             alias = normalizedAddr.aliasCandidate;
           }

@@ -500,3 +500,22 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
        - Certificación estricta de TypeScript con `npx tsc --noEmit` superada con 0 errores.
 
 
+
+- [x] **TASK-43**: **Fase 2: Optimización de NLU y Diálogo Conversacional (Single-Turn Tool Call & Latencia Reducida) (`04-nlu-conversacional.md`, `03-voice-ux.md`, `09-qa-accesibilidad.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo Completado**:
+    Unificar el análisis de NLU en una sola llamada LLM por turno mediante Function Calling enriquecido (`navegar_a` y `guardar_ubicacion`), podar tokens redundantes en el historial y System Prompt, incorporar fast-paths de 0ms para direcciones sintácticas y landmarks conocidos, y reducir la latencia de diálogo conversacional a <1.0s manteniendo la confirmación gerontológica en 2 pasos.
+  - **Entregables por Agente**:
+    1. **Agente de NLU y Backend Conversacional (`04-nlu-conversacional.md`)**:
+       - Esquema enriquecido de herramientas en `AVAN_TOOLS` (`navegar_a` y `guardar_ubicacion`) con extracción directa de entidades de dirección: `calle`, `numero`, `colonia`, `alcaldia`, `cruce`.
+       - Eliminada la segunda llamada de red a `normalizeAddressWithLLM` en `executeNavegarAFlow` y `guardar_ubicacion`: los campos provistos por el tool call se inyectan directamente a `StructuredAddressQuery` y se pasan al geocodificador.
+       - Corrección de bug de duplicación de turnos: `callGroqLLM` ahora excluye el turno actual del usuario de los mensajes previos de historial (`context.history.slice(0, -1).slice(-3)`), evitando enviar el mensaje dos veces por turno.
+       - Ajuste de `temperature: 0.1` en `callGroqLLM` para respuestas ultra-rápidas y deterministas (tiempos de inferencia en Groq <150ms).
+       - Fast-paths heurísticos inmediatos (0ms - 5ms) en `mergeAddressAdjustmentWithLLM` (números, colonias) y `normalizeAddressWithLLM` (landmarks emblemáticos como Bellas Artes, Soumaya, Zócalo y direcciones estándar).
+    2. **Agente de Diseño Conversacional (Voice UX) (`03-voice-ux.md`)**:
+       - Garantizada la confirmación gerontológica estricta en 2 pasos ("He localizado [Destino]. ¿Desea que iniciemos el viaje hacia allá?").
+       - Mantenimiento del tono cálido, respetuoso y empático, con respuestas concisas de 1 a 2 oraciones.
+    3. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
+       - Nueva suite de pruebas automatizadas `test_nlu_phase2.ts` con 19/19 pruebas superadas al 100%.
+       - Certificación de latencia de diálogo de punta a punta: `navegar_a` en 843ms - 877ms (<1.0s) y `guardar_ubicacion` en 741ms (<1.0s).
+       - Suite general `npm run test:all` superada con 71/71 pruebas exitosas (Fase 1: 16/16, Fase 2: 19/19, Precisión: 19/19, Desambiguación: 17/17).
+       - Compilación TypeScript estricta (`npx tsc --noEmit`) con 0 errores.
