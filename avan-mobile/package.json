@@ -38,9 +38,10 @@
     "build:apk:local": "eas build -p android --profile preview --local",
     "test:phase1": "npx tsx test_navigation_api_phase1.ts",
     "test:phase2": "npx tsx test_nlu_phase2.ts",
+    "test:tts-cache": "npx tsx test_tts_cache.ts",
     "test:precision": "npx tsx test_address_precision.ts",
     "test:disambiguation": "npx tsx test_disambiguation.ts",
-    "test:all": "npx tsx test_navigation_api_phase1.ts && npx tsx test_nlu_phase2.ts && npx tsx test_address_precision.ts && npx tsx test_disambiguation.ts"
+    "test:all": "npx tsx test_navigation_api_phase1.ts && npx tsx test_nlu_phase2.ts && npx tsx test_tts_cache.ts && npx tsx test_address_precision.ts && npx tsx test_disambiguation.ts"
   },
   "private": true
 }

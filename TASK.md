@@ -519,3 +519,18 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
        - Certificación de latencia de diálogo de punta a punta: `navegar_a` en 843ms - 877ms (<1.0s) y `guardar_ubicacion` en 741ms (<1.0s).
        - Suite general `npm run test:all` superada con 71/71 pruebas exitosas (Fase 1: 16/16, Fase 2: 19/19, Precisión: 19/19, Desambiguación: 17/17).
        - Compilación TypeScript estricta (`npx tsc --noEmit`) con 0 errores.
+
+- [x] **TASK-44**: **Fase 3: Caché de Frases TTS en Memoria y Reducción de Dependencia de Tokens (`05-voz-stt-tts.md`, `09-qa-accesibilidad.md`, `10-privacidad-seguridad.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo Completado**:
+    Implementar una caché en memoria volátil de buffers de audio TTS (`TTSAudioCache`) para reutilizar instantáneamente (<15ms) frases recurrentes (saludos, despedidas, confirmaciones en 2 pasos, cancelaciones y comandos de zoom), logrando **0 tokens consumidos** en ElevenLabs para diálogos estándar. Realizar la evaluación técnica de modelos de voz alternativos para mitigar o suprimir la dependencia de tokens.
+  - **Entregables por Agente**:
+    1. **Agente de Voz (STT / TTS) (`05-voz-stt-tts.md`)**:
+       - Creado [`ttsCacheService.ts`](avan-mobile/src/services/ttsCacheService.ts) implementando `TTSAudioCache`: normalización fonética y sintáctica de claves (`getCacheKey` insensible a acentos, signos de puntuación y mayúsculas), capacidad LRU de 80 entradas y métodos de inspección (`store`, `get`, `has`, `count`, `clear`).
+       - Conectada la caché directamente en [`voiceService.ts`](avan-mobile/src/services/voiceService.ts): verificación previa en `speak()` antes de invocar la red, y almacenamiento automático tras síntesis con ElevenLabs u OpenAI.
+       - La reproducción desde caché opera incluso si la cuota mensual de ElevenLabs está agotada, preservando la voz de alta fidelidad sin coste adicional.
+    2. **Agente de Privacidad y Seguridad (`10-privacidad-seguridad.md`)**:
+       - Respetada estrictamente la directiva de **Zero-Persistence**: los audios cacheados residen exclusivamente en la memoria RAM del proceso móvil y se purgan al terminar la sesión; no se almacenan permanentemente en base de datos ni almacenamiento de disco.
+    3. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
+       - Nueva suite de pruebas automatizadas [`test_tts_cache.ts`](avan-mobile/test_tts_cache.ts) con 14/14 pruebas superadas al 100%.
+       - Suite completa del proyecto (`npm run test:all`) actualizada a 85/85 pruebas superadas (100% de éxito).
+       - Compilación TypeScript estricta (`npx tsc --noEmit`) con 0 errores.

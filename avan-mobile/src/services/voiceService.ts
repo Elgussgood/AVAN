@@ -1,4 +1,4 @@
-import { Platform } from 'react-native';
+const isWeb = typeof document !== 'undefined';
 import * as Speech from 'expo-speech';
 import {
   createAudioPlayer,
@@ -7,6 +7,7 @@ import {
   type AudioStatus,
 } from 'expo-audio';
 import { File, Paths } from 'expo-file-system';
+import { TTSAudioCache } from './ttsCacheService';
 
 export type OpenAITTSVoice = 'nova' | 'shimmer' | 'alloy' | 'echo' | 'fable' | 'onyx';
 
@@ -48,6 +49,41 @@ export class VoiceService {
   private static apiBaseUrl = 'https://api.openai.com/v1/audio/speech';
   private static speed = 0.88;
   private static pitch = 0.95;
+
+  /**
+   * Retorna el número de frases TTS almacenadas actualmente en memoria.
+   */
+  static getCachedPhrasesCount(): number {
+    return TTSAudioCache.count();
+  }
+
+  /**
+   * Consulta si una frase específica ya se encuentra en caché de memoria.
+   */
+  static hasCachedPhrase(text: string): boolean {
+    return TTSAudioCache.has(text);
+  }
+
+  /**
+   * Limpia la caché en memoria de frases sintetizadas.
+   */
+  static clearCache(): void {
+    TTSAudioCache.clear();
+  }
+
+  /**
+   * Almacena manualmente un buffer de audio para una frase en la caché en memoria.
+   */
+  static cacheAudioPhrase(text: string, data: Uint8Array | Blob): void {
+    TTSAudioCache.store(text, data);
+  }
+
+  /**
+   * Genera una clave normalizada para identificar frases en la caché de voz.
+   */
+  static getCacheKey(text: string): string {
+    return TTSAudioCache.getCacheKey(text);
+  }
 
   /**
    * Configura si se debe forzar el uso exclusivo de la voz default del sistema (expo-speech).
@@ -168,6 +204,18 @@ export class VoiceService {
     // permitir reintentar con la API de ElevenLabs
     if (this.isElevenLabsQuotaExceeded && Date.now() - this.quotaExceededTimestamp > 15 * 60 * 1000) {
       this.isElevenLabsQuotaExceeded = false;
+    }
+
+    // 0. VERIFICAR CACHÉ EN MEMORIA (Ahorro de cuota ElevenLabs/OpenAI y 0 ms de red)
+    if (!this.useDefaultVoiceOnly) {
+      const cachedAudio = TTSAudioCache.get(naturalText);
+      if (cachedAudio) {
+        console.log(`[VoiceService] ⚡ Frase en caché detectada: "${naturalText.slice(0, 35)}..." (0 tokens consumidos)`);
+        const played = await this.playCachedAudio(cachedAudio, onDone, onStart);
+        if (played) {
+          return;
+        }
+      }
     }
 
     // Si el usuario seleccionó la voz default para pruebas o la cuota externa está agotada,
@@ -413,14 +461,16 @@ export class VoiceService {
       }
 
       // Procesar buffer binario MP3
-      if (Platform.OS === 'web') {
+      if (isWeb) {
         const blob = await response.blob();
+        TTSAudioCache.store(text, blob);
         webObjectUrl = URL.createObjectURL(blob);
         this.currentWebObjectUrl = webObjectUrl;
         audioUri = webObjectUrl;
       } else {
         const arrayBuffer = await response.arrayBuffer();
         const bytes = new Uint8Array(arrayBuffer);
+        TTSAudioCache.store(text, bytes);
         const fileName = `avan_tts_el_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`;
         tempFile = new File(Paths.cache, fileName);
         tempFile.create({ overwrite: true });
@@ -489,14 +539,16 @@ export class VoiceService {
       }
 
       // Procesar buffer binario
-      if (Platform.OS === 'web') {
+      if (isWeb) {
         const blob = await response.blob();
+        TTSAudioCache.store(text, blob);
         webObjectUrl = URL.createObjectURL(blob);
         this.currentWebObjectUrl = webObjectUrl;
         audioUri = webObjectUrl;
       } else {
         const arrayBuffer = await response.arrayBuffer();
         const bytes = new Uint8Array(arrayBuffer);
+        TTSAudioCache.store(text, bytes);
         const fileName = `avan_tts_oa_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`;
         tempFile = new File(Paths.cache, fileName);
         tempFile.create({ overwrite: true });
@@ -520,6 +572,49 @@ export class VoiceService {
       }
 
       console.warn('[VoiceService] Falló síntesis OpenAI TTS, intentando fallback:', error?.message || error);
+      return false;
+    }
+  }
+
+  /**
+   * Reproduce un buffer de audio previamente almacenado en la caché en memoria.
+   * Evita llamadas de red y consumo de tokens a APIs externas (<15ms).
+   */
+  private static async playCachedAudio(
+    cachedBytes: Uint8Array | Blob,
+    onDone?: () => void,
+    onStart?: () => void
+  ): Promise<boolean> {
+    let audioUri: string | null = null;
+    let tempFile: File | null = null;
+    let webObjectUrl: string | null = null;
+
+    try {
+      if (isWeb) {
+        const blob =
+          cachedBytes instanceof Blob
+            ? cachedBytes
+            : new Blob([cachedBytes as any], { type: 'audio/mpeg' });
+        webObjectUrl = URL.createObjectURL(blob);
+        this.currentWebObjectUrl = webObjectUrl;
+        audioUri = webObjectUrl;
+      } else {
+        const bytes =
+          cachedBytes instanceof Uint8Array
+            ? cachedBytes
+            : new Uint8Array(await (cachedBytes as Blob).arrayBuffer());
+        const fileName = `avan_tts_cached_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`;
+        tempFile = new File(Paths.cache, fileName);
+        tempFile.create({ overwrite: true });
+        tempFile.write(bytes);
+        this.currentTempFile = tempFile;
+        audioUri = tempFile.uri;
+      }
+
+      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart);
+    } catch (error) {
+      console.warn('[VoiceService] Error al reproducir audio desde caché:', error);
+      this.cleanupResources(tempFile, webObjectUrl);
       return false;
     }
   }
