@@ -587,17 +587,17 @@ function generateMapLibreHtml(
             break;
           case 'ZOOM_IN':
             if (!map) return;
-            var inDelta = 1.0;
-            if (data && data.intensity === 'mucho') inDelta = 2.0;
-            else if (data && data.intensity === 'poco') inDelta = 0.5;
-            map.easeTo({ zoom: Math.min(19, map.getZoom() + inDelta), duration: 300 });
+            var inDelta = 1.2;
+            if (data && data.intensity === 'mucho') inDelta = 2.5;
+            else if (data && data.intensity === 'poco') inDelta = 0.6;
+            map.easeTo({ zoom: Math.min(19, map.getZoom() + inDelta), duration: 350 });
             break;
           case 'ZOOM_OUT':
             if (!map) return;
             var outDelta = 1.5;
             if (data && data.intensity === 'mucho') outDelta = 3.5;
             else if (data && data.intensity === 'poco') outDelta = 0.7;
-            map.easeTo({ zoom: Math.max(10, map.getZoom() - outDelta), duration: 300 });
+            map.easeTo({ zoom: Math.max(10, map.getZoom() - outDelta), duration: 350 });
             break;
           case 'SET_ZOOM':
             if (map && data && typeof data.zoom === 'number') {
@@ -605,13 +605,15 @@ function generateMapLibreHtml(
             }
             break;
           case 'RECENTER':
-            if (map && data.lat !== undefined && data.lng !== undefined) {
-              var targetZoom = (data && typeof data.zoom === 'number') ? data.zoom : map.getZoom();
-              if (typeof data.heading === 'number') {
+            var recenterLng = (data && data.lng !== undefined) ? data.lng : (userMarker ? userMarker.getLngLat().lng : null);
+            var recenterLat = (data && data.lat !== undefined) ? data.lat : (userMarker ? userMarker.getLngLat().lat : null);
+            if (map && recenterLng !== null && recenterLat !== null) {
+              var targetZoom = (data && typeof data.zoom === 'number') ? data.zoom : 17;
+              if (data && typeof data.heading === 'number') {
                 currentSmoothedBearing = data.heading;
               }
               map.easeTo({
-                center: [data.lng, data.lat],
+                center: [recenterLng, recenterLat],
                 zoom: targetZoom,
                 bearing: currentSmoothedBearing || 0,
                 pitch: 45,
@@ -717,15 +719,13 @@ export const InteractiveMap = forwardRef<InteractiveMapRef, InteractiveMapProps>
         sendMessage({ type: 'SET_ZOOM', zoom });
       },
       recenter: (zoom?: number) => {
-        if (userLocation) {
-          sendMessage({
-            type: 'RECENTER',
-            lat: userLocation.latitude,
-            lng: userLocation.longitude,
-            heading: userLocation.heading ?? 0,
-            zoom: zoom || 17,
-          });
-        }
+        sendMessage({
+          type: 'RECENTER',
+          lat: userLocation?.latitude,
+          lng: userLocation?.longitude,
+          heading: userLocation?.heading ?? 0,
+          zoom: zoom !== undefined ? zoom : 17,
+        });
       },
       animateToRegion: (region: Region) => {
         sendMessage({

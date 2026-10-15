@@ -231,12 +231,12 @@ const FALLBACK_DESTINATIONS: (GeocodeResult & { keywords: string[] })[] = [
 /**
  * Traduce maniobras de OSRM a instrucciones en español natural para AVAN.
  */
-function translateOsrmManeuver(m: any, streetName: string): { instruction: string; type: number } {
+function translateOsrmManeuver(m: any, streetName: string, isFirstStep?: boolean): { instruction: string; type: number } {
   const typeStr = m?.type || '';
   const modifier = m?.modifier || '';
   const targetStreet = streetName ? `"${streetName}"` : 'la vía principal';
 
-  if (typeStr === 'depart') {
+  if (typeStr === 'depart' || (isFirstStep && typeStr === 'arrive')) {
     return {
       instruction: streetName ? `Inicie su recorrido por ${targetStreet}` : 'Inicie su recorrido por la ruta indicada',
       type: 11, // Depart
@@ -1333,7 +1333,7 @@ export class OpenRouteService {
         currentCoordIndex = endIndex;
 
         const streetName = s.name ? s.name.trim() : '';
-        const { instruction, type } = translateOsrmManeuver(s.maneuver, streetName);
+        const { instruction, type } = translateOsrmManeuver(s.maneuver, streetName, i === 0);
 
         steps.push({
           instruction,

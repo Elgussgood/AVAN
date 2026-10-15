@@ -762,6 +762,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           }));
 
           const firstInstruction =
+            routeResult.steps.find((s) => s.type !== 10 && !s.instruction?.toLowerCase().includes('ha llegado'))?.instruction ||
             routeResult.steps[0]?.instruction ||
             `Continúa recto hacia ${dest}`;
 

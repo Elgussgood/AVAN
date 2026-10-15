@@ -24,6 +24,7 @@ import { AudioRecorderService } from '../services/audioRecorder';
 import {
   ConversationService,
   ConversationContext,
+  detectZoomIntensity,
 } from '../services/conversationService';
 import { useLocationTracking } from '../hooks/useLocationTracking';
 import { LatLng } from 'react-native-maps';
@@ -162,6 +163,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const hasAnnouncedApproachRef = useRef<Set<number>>(new Set());
   const hasAnnouncedImminentRef = useRef<Set<number>>(new Set());
   const hasArrivedRef = useRef<boolean>(false);
+  const tripStartTimeRef = useRef<number>(Date.now());
   const offRouteCountRef = useRef<number>(0);
   const isRecalculatingRef = useRef<boolean>(false);
 
@@ -185,8 +187,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       clearTimeout(recenterTimeoutRef.current);
       recenterTimeoutRef.current = null;
     }
-    // Preservar el zoom actual del usuario sin forzar zoom 17 arbitrario
-    mapRef.current?.recenter();
+    // Restablecer al zoom estándar de conducción vehicular (17) y vista POV orientada al avance
+    mapRef.current?.recenter(17);
     setIsUserExploringMap(false);
     try {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -346,6 +348,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   useEffect(() => {
     if (destination || destinationName) {
       setTargetDestination(destination || destinationName || 'Hospital General');
+      tripStartTimeRef.current = Date.now();
+      hasArrivedRef.current = false;
     }
   }, [destination, destinationName]);
 
@@ -380,7 +384,15 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   // Al montar la pantalla de navegación activa, dar la bienvenida de inicio de ruta
   useEffect(() => {
     let isCancelled = false;
-    const welcomeMsg = `Iniciando ruta hacia ${targetDestination}. ${instruction}.`;
+    // Asegurar que la locución inicial tome la maniobra de salida y nunca "Ha llegado a su destino"
+    const validInitialInstruction =
+      instruction && !instruction.toLowerCase().includes('ha llegado')
+        ? instruction
+        : activeSteps[0]?.instruction && !activeSteps[0].instruction.toLowerCase().includes('ha llegado')
+        ? activeSteps[0].instruction
+        : activeSteps[1]?.instruction || `Continúe recto hacia ${targetDestination}`;
+
+    const welcomeMsg = `Iniciando ruta hacia ${targetDestination}. ${validInitialInstruction}.`;
 
     // Detener de forma estricta cualquier audio residual previo para evitar colisión de voces
     VoiceService.stop().then(() => {
@@ -534,14 +546,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     setNavProgress(progress);
 
     // 2. Detección automática de llegada a destino con validación estricta de ruta:
-    // Evita finalizar prematuramente si el vehículo pasa a la altura del destino pero del otro lado
-    // de la avenida antes de dar el retorno en U. Requiere proximidad física Y que la distancia restante de ruta sea mínima.
+    // Evita finalizar prematuramente al arrancar el viaje (guardia de 12 segundos) o si el vehículo
+    // pasa del otro lado de la avenida antes de dar el retorno en U. Requiere proximidad física Y que la distancia restante de ruta sea mínima.
+    const elapsedSinceStartSec = (Date.now() - tripStartTimeRef.current) / 1000;
+    const isNewTripGracePeriod = elapsedSinceStartSec < 12; // Mínimo 12 segundos tras arrancar antes de admitir llegada
     const distToTarget = getDistanceMeters(currentCoords, targetCoord);
+    const hasEnoughRoutePoints = activeRouteCoords.length >= 2;
     const isAtEndOfRoute =
-      progress.remainingDistance <= 75 ||
-      (isSimulating && simIndexRef.current >= activeRouteCoords.length - 2);
+      hasEnoughRoutePoints &&
+      (progress.remainingDistance <= 60 ||
+        (isSimulating && simIndexRef.current >= activeRouteCoords.length - 2));
 
-    if (distToTarget <= 50 && isAtEndOfRoute && !hasArrivedRef.current) {
+    if (
+      (!isNewTripGracePeriod || (isSimulating && simIndexRef.current >= activeRouteCoords.length - 1)) &&
+      distToTarget <= 50 &&
+      isAtEndOfRoute &&
+      !hasArrivedRef.current
+    ) {
       hasArrivedRef.current = true;
       if (simulationTimerRef.current) {
         clearInterval(simulationTimerRef.current);
@@ -577,9 +598,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       offRouteCountRef.current = 0;
     }
 
-    // Actualizar instrucción visible
+    // Actualizar instrucción visible (protegida contra falsa llegada al arrancar)
     if (progress.currentStep?.instruction) {
-      setInstruction(progress.currentStep.instruction);
+      const stepInst = progress.currentStep.instruction;
+      if (!isNewTripGracePeriod || !stepInst.toLowerCase().includes('ha llegado')) {
+        setInstruction(stepInst);
+      }
     }
 
     // 4. Anuncios proactivos por voz sin intervención manual:
@@ -1170,10 +1194,26 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     const lowerText = cleanText.toLowerCase();
 
-    // Manejo directo de comandos de mapa frecuentes en marcha
-    if (lowerText.includes('acercar') || lowerText.includes('cerca') || lowerText.includes('mas grande')) {
-      mapRef.current?.zoomIn();
-      const responseText = 'Acercando el mapa.';
+    // Manejo directo de comandos de mapa frecuentes en marcha con detección de intensidad
+    const zoomIntensity = detectZoomIntensity(lowerText);
+
+    if (
+      lowerText.includes('acercar') ||
+      lowerText.includes('acerca') ||
+      lowerText.includes('cerca') ||
+      lowerText.includes('mas grande') ||
+      lowerText.includes('haz zoom') ||
+      lowerText.includes('ampliar') ||
+      lowerText.includes('amplia') ||
+      (lowerText.includes('zoom') && !lowerText.includes('alejar') && !lowerText.includes('menos zoom'))
+    ) {
+      mapRef.current?.zoomIn(zoomIntensity);
+      const responseText =
+        zoomIntensity === 'mucho'
+          ? 'Acercando ampliamente el mapa.'
+          : zoomIntensity === 'poco'
+          ? 'Acercando un poco el mapa.'
+          : 'Acercando el mapa.';
       setVoiceState('speaking');
       setStatusMessage(responseText);
       await VoiceService.speak(responseText, () => {
@@ -1183,9 +1223,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    if (lowerText.includes('alejar') || lowerText.includes('lejos') || lowerText.includes('mas pequeno')) {
-      mapRef.current?.zoomOut();
-      const responseText = 'Alejando el mapa.';
+    if (
+      lowerText.includes('alejar') ||
+      lowerText.includes('aleja') ||
+      lowerText.includes('lejos') ||
+      lowerText.includes('mas pequeno') ||
+      lowerText.includes('menos zoom') ||
+      lowerText.includes('reducir') ||
+      lowerText.includes('vista general') ||
+      lowerText.includes('vista amplia')
+    ) {
+      mapRef.current?.zoomOut(zoomIntensity);
+      const responseText =
+        zoomIntensity === 'mucho'
+          ? 'Alejando ampliamente el mapa para mostrar el panorama general.'
+          : zoomIntensity === 'poco'
+          ? 'Alejando un poco el mapa.'
+          : 'Alejando el mapa.';
       setVoiceState('speaking');
       setStatusMessage(responseText);
       await VoiceService.speak(responseText, () => {
@@ -1197,11 +1251,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     if (
       lowerText.includes('centrar') ||
+      lowerText.includes('centra') ||
       lowerText.includes('dónde estoy') ||
-      lowerText.includes('donde estoy')
+      lowerText.includes('donde estoy') ||
+      lowerText.includes('ubicar') ||
+      lowerText.includes('ubicame') ||
+      lowerText.includes('mi ubicacion') ||
+      lowerText.includes('mi ubicación')
     ) {
       handleRecenter();
-      const responseText = 'Centrando el mapa en su posición.';
+      const responseText = 'Centrando el mapa en su vehículo con la vista estándar.';
       setVoiceState('speaking');
       setStatusMessage(responseText);
       await VoiceService.speak(responseText, () => {

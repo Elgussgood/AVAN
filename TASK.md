@@ -549,3 +549,23 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
     3. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
        - Verificación de compilación limpia de TypeScript (`npx tsc --noEmit` con 0 errores).
        - Suite completa del proyecto (`npm run test:all`) certificada con 85/85 pruebas pasando (100% de éxito).
+
+- [x] **TASK-46**: **Pulido de Navegación, Supresión de Falsa Llegada Inicial y Calibración de Zoom/Recentrado Estándar (`06-mapas-ruteo.md`, `07-mobile-frontend.md`, `04-nlu-conversacional.md`, `09-qa-accesibilidad.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo Completado**:
+    Resolver 3 anomalías reportadas durante las pruebas dinámicas con Expo en desarrollo: (1) Supresión de la falsa alerta inicial de *"Ha llegado a su destino"* al arrancar la navegación turn-by-turn; (2) Calibración de las intensidades de zoom (*"mucho"*, *"normal"*, *"poco"*, *"al máximo"*) tanto por voz como en el mapa; y (3) Restablecimiento infalible del nivel de zoom estándar vehicular (**zoom 17**) al pulsar el botón flotante o dar el comando de recentrado.
+  - **Entregables por Agente**:
+    1. **Agente de Mapas y Ruteo (`06-mapas-ruteo.md`) & Agente Mobile / Frontend (`07-mobile-frontend.md`)**:
+       - **Supresión de Falsa Llegada en `HomeScreen.tsx`**: Implementada guardia temporal con `tripStartTimeRef` (`elapsedSinceStartSec < 12`) que bloquea cualquier disparo de llegada durante los primeros 12 segundos tras montar la ruta, requiriendo además que la polilínea tenga al menos 2 coordenadas y que la distancia restante sea <= 60 m.
+       - **Instrucción Inicial de Avance en `HomeScreen.tsx`, `MinimalHomeScreen.tsx` y `orsService.ts`**: Filtrado de maniobras terminales (`type !== 10` y sin frase de llegada) garantizando que la indicación hablada y visual de salida sea siempre la maniobra de inicio de recorrido (ej. *"Inicie su recorrido por..."*) y nunca la de llegada.
+       - **Calibración de Zoom con Intensidad en `InteractiveMap.tsx`**: Parametrizados deltas diferenciales en MapLibre GL JS: `acercar` (+2.5 para mucho, +1.2 para normal, +0.6 para poco) y `alejar` (-3.5 para mucho, -1.5 para normal, -0.7 para poco), con transiciones suaves de 350ms.
+       - **Recentrado al Zoom Estándar 17 en `InteractiveMap.tsx` y `HomeScreen.tsx`**: El botón flotante de recentrado y la acción de voz invocan `recenter(17)`, restableciendo `pitch: 45`, `bearing: currentSmoothedBearing` y `zoom: 17` para recuperar la perspectiva POV de conducción turn-by-turn sin importar el zoom manual previo.
+    2. **Agente de NLU y Backend Conversacional (`04-nlu-conversacional.md`)**:
+       - Exportada la función `detectZoomIntensity` en `conversationService.ts` con normalización de acentos y diacríticos (`.normalize('NFD').replace(/[\u0300-\u036f]/g, '')`) para reconocer fiablemente variantes como *"al máximo"*, *"más zoom"*, *"lo más que puedas"*, *"un poco"*, *"tantito"*.
+       - Priorización de comandos de control de zoom en `processUserMessageLocal` ubicándolos antes de la detección general de destinos, e integración en `isControlOrNonDest` de `extractDestination` para evitar que frases como *"aleja un poco"* o *"acerca"* sean confundidas con destinos de navegación.
+       - Frases habladas de confirmación calibradas por intensidad (*"Acercando ampliamente el mapa..."*, *"Alejando un poco..."*, *"Centrando el mapa en su ubicación actual"*).
+    3. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
+       - Creada suite de pruebas automatizadas `test_navigation_fixes.ts` con 37/37 pruebas pasando al 100% (Detección de intensidad, Guardia temporal de llegada, Instrucción inicial de salida y Comandos NLU).
+       - Integrado `test:navigation-fixes` en `package.json` y `npm run test:all`.
+       - Suite completa del proyecto (`npm run test:all`) certificada con **122/122 pruebas superadas** (100% de éxito).
+       - Compilación TypeScript estricta (`npx tsc --noEmit`) con 0 errores.
+

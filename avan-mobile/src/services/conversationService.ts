@@ -951,7 +951,10 @@ function extractDestination(rawText: string, normalized: string): string | null 
   const isControlOrNonDest =
     isAffirmative(normalized) ||
     isNegativeOrCancel(normalized) ||
-    /(?:acercar|alejar|centrar|zoom|mas cerca|mas lejos|trafico|incidente|accidente|bache|ayuda|hola|adios|gracias)/i.test(normalized) ||
+    Boolean(detectZoomDirection(normalized)) ||
+    /(?:acercar|acerca|alejar|aleja|centrar|centra|zoom|mas cerca|mas lejos|menos zoom|mas zoom|alejate|acercate|centrate|trafico|incidente|accidente|bache|ayuda|hola|adios|gracias)/i.test(
+      normalized
+    ) ||
     isAddAddressIntent(normalized);
 
   if (!isControlOrNonDest) {
@@ -1176,7 +1179,12 @@ function extractAddressCorrection(rawText: string, normalized: string): string |
   return null;
 }
 
-function detectZoomDirection(normalized: string): ZoomDirection | null {
+function detectZoomDirection(text: string): ZoomDirection | null {
+  const normalized = (text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
   if (
     /(?:acercar|acerca|haz\s+(?:\w+\s+)?zoom|zoom|mas cerca|ampliar|amplia|aumentar|aumenta|acercate|no veo bien|hazlo\s+(?:\w+\s+)?grande|mas grande|acercamiento)/i.test(
       normalized
@@ -1204,9 +1212,14 @@ function detectZoomDirection(normalized: string): ZoomDirection | null {
   return null;
 }
 
-function detectZoomIntensity(normalized: string): ZoomIntensity {
+export function detectZoomIntensity(text: string): ZoomIntensity {
+  const normalized = (text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
   if (
-    /(?:mucho|bastante|al maximo|maximo|bien grande|muy cerca|mucho zoom|lo mas que puedas|todo el zoom|mas mas|mucho mas|bien lejos|muy lejos|todo)/i.test(
+    /(?:mucho|bastante|al maximo|maximo|bien grande|muy cerca|mucho zoom|lo mas que puedas|todo el zoom|mas mas|mucho mas|bien lejos|muy lejos|todo|harto|mas zoom)/i.test(
       normalized
     )
   ) {
@@ -1214,7 +1227,7 @@ function detectZoomIntensity(normalized: string): ZoomIntensity {
   }
 
   if (
-    /(?:un poco|poco|tantito|un leve|leve|un tantito|despacio|ligeramente|apenitas)/i.test(
+    /(?:un poco|poco|tantito|un leve|leve|un tantito|despacio|ligeramente|apenitas|un toque|un piquito|minimo)/i.test(
       normalized
     )
   ) {
@@ -3811,7 +3824,56 @@ async function processUserMessageLocal(
   }
 
   // --------------------------------------------------------------------------
-  // CASO 2: SOLICITUD DE NAVEGACIÓN (PASO 1)
+  // CASO 2: AJUSTAR ZOOM Y CENTRADO DE MAPA (COMANDOS DIRECTOS PRIORITARIOS)
+  // --------------------------------------------------------------------------
+  const zoomDirection = detectZoomDirection(normalized);
+  if (zoomDirection) {
+    const zoomIntensity = detectZoomIntensity(normalized);
+    let spokenText = '';
+    switch (zoomDirection) {
+      case 'acercar':
+        spokenText =
+          zoomIntensity === 'mucho'
+            ? 'Acercando bastante el mapa para ver el máximo detalle.'
+            : zoomIntensity === 'poco'
+            ? 'Acercando un poco el mapa.'
+            : 'Acercando el mapa para que pueda ver con mayor detalle.';
+        break;
+      case 'alejar':
+        spokenText =
+          zoomIntensity === 'mucho'
+            ? 'Alejando ampliamente el mapa para mostrar el panorama general.'
+            : zoomIntensity === 'poco'
+            ? 'Alejando un poco el mapa.'
+            : 'Alejando el mapa para mostrar una vista más amplia.';
+        break;
+      case 'centrar':
+        spokenText = 'Centrando el mapa en su ubicación actual.';
+        break;
+    }
+
+    const functionCall: FunctionCall = {
+      name: 'ajustar_zoom',
+      args: { direccion: zoomDirection, intensidad: zoomIntensity },
+    };
+
+    currentContext.history?.push({
+      role: 'assistant',
+      content: spokenText,
+      functionCall,
+      timestamp: Date.now(),
+    });
+
+    return {
+      spokenText,
+      functionCall,
+      updatedContext: currentContext,
+      requiresConfirmation: false,
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // CASO 3: SOLICITUD DE NAVEGACIÓN (PASO 1)
   // --------------------------------------------------------------------------
   const personQuery = detectPersonOrHomeQuery(rawText, normalized);
   const rawDestination =
@@ -3951,54 +4013,6 @@ async function processUserMessageLocal(
     };
   }
 
-  // --------------------------------------------------------------------------
-  // CASO 3: AJUSTAR ZOOM
-  // --------------------------------------------------------------------------
-  const zoomDirection = detectZoomDirection(normalized);
-  if (zoomDirection) {
-    const zoomIntensity = detectZoomIntensity(normalized);
-    let spokenText = '';
-    switch (zoomDirection) {
-      case 'acercar':
-        spokenText =
-          zoomIntensity === 'mucho'
-            ? 'Acercando bastante el mapa para ver el máximo detalle.'
-            : zoomIntensity === 'poco'
-            ? 'Acercando un poco el mapa.'
-            : 'Acercando el mapa para que pueda ver con mayor detalle.';
-        break;
-      case 'alejar':
-        spokenText =
-          zoomIntensity === 'mucho'
-            ? 'Alejando ampliamente el mapa para mostrar el panorama general.'
-            : zoomIntensity === 'poco'
-            ? 'Alejando un poco el mapa.'
-            : 'Alejando el mapa para mostrar una vista más amplia.';
-        break;
-      case 'centrar':
-        spokenText = 'Centrando el mapa en su ubicación actual.';
-        break;
-    }
-
-    const functionCall: FunctionCall = {
-      name: 'ajustar_zoom',
-      args: { direccion: zoomDirection, intensidad: zoomIntensity },
-    };
-
-    currentContext.history?.push({
-      role: 'assistant',
-      content: spokenText,
-      functionCall,
-      timestamp: Date.now(),
-    });
-
-    return {
-      spokenText,
-      functionCall,
-      updatedContext: currentContext,
-      requiresConfirmation: false,
-    };
-  }
 
   // --------------------------------------------------------------------------
   // CASO 4: GUARDAR UBICACIÓN MANUALMENTE
