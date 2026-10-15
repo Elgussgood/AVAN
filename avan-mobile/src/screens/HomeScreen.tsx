@@ -7,7 +7,9 @@ import {
   TouchableOpacity,
   Animated,
   ActivityIndicator,
+  BackHandler,
 } from 'react-native';
+import { useKeepAwake } from 'expo-keep-awake';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { lightTheme, darkTheme, typography } from '../theme/theme';
@@ -111,6 +113,32 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     ];
   });
   const [currentStepIndex, setCurrentStepIndex] = useState<number>(0);
+
+  // 1. PANTALLA SIEMPRE ACTIVA (KEEP AWAKE):
+  // Mantiene encendida la pantalla durante todo el viaje vehicular en el mapa.
+  // Al salir de HomeScreen, la suscripción se desmonta y restaura el ahorro de batería.
+  useKeepAwake();
+
+  // 2. CONTROL DEL BOTÓN FÍSICO "ATRÁS" DE ANDROID:
+  // Si el conductor presiona el botón físico o gesto de atrás, finaliza o cancela el viaje de forma segura
+  // regresando a MinimalHomeScreen, evitando el cierre abrupto de la aplicación.
+  useEffect(() => {
+    const onBackPress = () => {
+      const exitFn = onStopTrip || onCancelTrip;
+      if (exitFn) {
+        exitFn();
+        return true; // Previene cerrar la app
+      }
+      return false;
+    };
+
+    const backSubscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      onBackPress
+    );
+
+    return () => backSubscription.remove();
+  }, [onStopTrip, onCancelTrip]);
 
   // Modo simulación de recorrido para pruebas dinámicas
   const [isSimulating, setIsSimulating] = useState<boolean>(false);

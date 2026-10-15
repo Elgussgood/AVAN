@@ -534,3 +534,18 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
        - Nueva suite de pruebas automatizadas [`test_tts_cache.ts`](avan-mobile/test_tts_cache.ts) con 14/14 pruebas superadas al 100%.
        - Suite completa del proyecto (`npm run test:all`) actualizada a 85/85 pruebas superadas (100% de éxito).
        - Compilación TypeScript estricta (`npx tsc --noEmit`) con 0 errores.
+
+- [x] **TASK-45**: **Fase 4: Optimización Frontend, Ergonomía y Ciclo de Vida Mobile (`07-mobile-frontend.md`, `02-ux-accesibilidad.md`, `09-qa-accesibilidad.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo Completado**:
+    Optimizar el comportamiento del ciclo de vida de la aplicación en el dispositivo físico: mantener la pantalla encendida de forma continua durante la navegación activa en el mapa (`expo-keep-awake`), interceptar el botón físico y gestos "Atrás" de Android (`BackHandler`) para evitar cierres accidentales de la app, y limpiar las declaraciones de permisos de Android en `app.json`.
+  - **Entregables por Agente**:
+    1. **Agente de Mobile / Frontend (`07-mobile-frontend.md`)**:
+       - Integrado `useKeepAwake()` en [`HomeScreen.tsx`](avan-mobile/src/screens/HomeScreen.tsx): la pantalla permanece encendida durante todo el trayecto en auto sin que el conductor deba tocar el celular; al regresar a la pantalla de reposo, el bloqueo y ahorro de batería se restauran automáticamente.
+       - Intercepción de hardware en [`HomeScreen.tsx`](avan-mobile/src/screens/HomeScreen.tsx) con `BackHandler`: si el conductor pulsa el botón físico o gesto de "Atrás", se invoca `onStopTrip || onCancelTrip` regresando a `MinimalHomeScreen` de forma segura en vez de salir de la app.
+       - Intercepción de hardware en [`MinimalHomeScreen.tsx`](avan-mobile/src/screens/MinimalHomeScreen.tsx) con `BackHandler`: si hay un diálogo o modal interactivo activo (confirmación de viaje, tarjeta de desambiguación o registro de alias), la tecla "Atrás" cancela el diálogo y retorna a la One-Button UI pura sin interrumpir el proceso.
+       - Limpieza y deduplicación de permisos en [`app.json`](avan-mobile/app.json) eliminando la doble declaración de `ACCESS_COARSE_LOCATION` y `ACCESS_FINE_LOCATION` con prefijos redundantes.
+    2. **Agente de UX / Accesibilidad (`02-ux-accesibilidad.md`)**:
+       - Cumplimiento de ergonomía gerontológica vehicular: cero distracciones por apagado de pantalla en ruta, y protección contra cierres accidentales por toques involuntarios en la barra de navegación del sistema Android.
+    3. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
+       - Verificación de compilación limpia de TypeScript (`npx tsc --noEmit` con 0 errores).
+       - Suite completa del proyecto (`npm run test:all`) certificada con 85/85 pruebas pasando (100% de éxito).

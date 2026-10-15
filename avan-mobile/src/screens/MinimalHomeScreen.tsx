@@ -9,6 +9,7 @@ import {
   useColorScheme,
   ActivityIndicator,
   ScrollView,
+  BackHandler,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -889,6 +890,38 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       setVoiceState('idle');
     }
   };
+
+  // CONTROL DEL BOTÓN FÍSICO "ATRÁS" DE ANDROID:
+  // Si el usuario presiona el botón físico o gesto de Atrás y existe un diálogo interactivo activo
+  // (confirmación de viaje, tarjeta de desambiguación o registro de alias), cancela el diálogo
+  // y retorna al estado inicial limpio (One-Button UI pura) sin cerrar la aplicación.
+  useEffect(() => {
+    const onBackPress = () => {
+      const hasActiveModal = Boolean(
+        currentContext.pendingConfirmation ||
+        currentContext.pendingDisambiguation ||
+        currentContext.pendingAliasRegistration
+      );
+
+      if (hasActiveModal) {
+        handleProcessInput('cancelar');
+        return true; // Previene cerrar la aplicación
+      }
+
+      return false; // Permite el comportamiento estándar del sistema
+    };
+
+    const backSubscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      onBackPress
+    );
+
+    return () => backSubscription.remove();
+  }, [
+    currentContext.pendingConfirmation,
+    currentContext.pendingDisambiguation,
+    currentContext.pendingAliasRegistration,
+  ]);
 
   /**
    * Manejador de pulsación del botón central dominante de micrófono
