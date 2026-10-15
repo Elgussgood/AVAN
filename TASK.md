@@ -569,3 +569,81 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
        - Suite completa del proyecto (`npm run test:all`) certificada con **122/122 pruebas superadas** (100% de éxito).
        - Compilación TypeScript estricta (`npx tsc --noEmit`) con 0 errores.
 
+---
+
+### Fase 5: Migración a Google AI (Gemini 2.5 Flash) y Google Maps Platform (Ecosistema Google Unificado) [PENDIENTE - LISTA PARA EJECUCIÓN]
+
+- [ ] **TASK-47**: **Capa de Infraestructura, SDK Oficial de Google GenAI y Configuración de Claves (`08-backend-infraestructura.md`, `10-privacidad-seguridad.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo**:
+    Preparar el entorno de desarrollo con el SDK oficial `@google/genai` (TypeScript/React Native), utilidades de decodificación de polilíneas de Google Maps y variables de entorno seguras (`EXPO_PUBLIC_GEMINI_API_KEY`, `EXPO_PUBLIC_GOOGLE_MAPS_API_KEY`) en `.env`, `.env.example` y `app.json`, aplicando políticas de restricción de claves y Zero-Persistence.
+  - **Entregables por Agente**:
+    1. **Agente de Backend e Infraestructura (`08-backend-infraestructura.md`)**:
+       - Instalar y verificar compatibilidad del paquete oficial `@google/genai`.
+       - Implementar decodificador utilitario geométrico de polilíneas comprimidas (`polylineDecoder.ts`) sin dependencias nativas pesadas, convirtiendo strings de Google Directions en arreglos `Array<[number, number]>` (lat, lng GeoJSON).
+       - Actualizar `.env.example` y la configuración de carga de variables en `avan-mobile`.
+    2. **Agente de Privacidad y Seguridad (`10-privacidad-seguridad.md`)**:
+       - Definir guía de restricción de API Keys en Google Cloud Console: restricción por huella SHA-1 y nombre de paquete Android (`com.gustavomtz.avan`) para Google Maps, y restricción por API para Gemini.
+       - Garantizar la directiva de Cero Persistencia en el paso de datos hacia las APIs de Google.
+    3. **Agente Orquestador / Tech Lead (`11-orquestador-pm.md`)**:
+       - Certificar compilación limpia de dependencias con `npx tsc --noEmit`.
+
+- [ ] **TASK-48**: **Motor NLU Gemini 2.5 Flash con Function Calling y Failover Multicapa (`04-nlu-conversacional.md`, `03-voice-ux.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo**:
+    Implementar el servicio `geminiService.ts` e integrarlo en la arquitectura de `conversationService.ts`, migrando la extracción de intenciones y entidades a **Gemini 2.5 Flash** con el System Prompt gerontológico de AVAN, Function Calling enriquecido (`navegar_a`, `guardar_ubicacion`, `ajustar_zoom`, `confirmar_viaje`, `cancelar`, `consultar_trafico`, `reportar_incidente`, `finalizar_viaje`) y un mecanismo de failover en cascada (Gemini $\rightarrow$ Groq $\rightarrow$ Heurística local de 0ms).
+  - **Entregables por Agente**:
+    1. **Agente de NLU y Backend Conversacional (`04-nlu-conversacional.md`)**:
+       - Crear `src/services/geminiService.ts` utilizando `@google/genai` con modelo `gemini-2.5-flash`.
+       - Mapear la definición de herramientas `AVAN_TOOLS` al formato oficial de `functionDeclarations` de Google GenAI con validación estricta de parámetros de dirección (`calle`, `numero`, `colonia`, `alcaldia`, `cruce`).
+       - Configurar parámetros de inferencia calibrados para conducción: `temperature: 0.1` y timeout de 3.5 segundos con `AbortController`.
+       - Implementar el mecanismo de failover en cascada: si la llamada a Gemini excede el timeout o falla la cuota, conmuta automáticamente a Groq LLM como primer respaldo; si ambos fallan o no hay conexión de datos, activa el motor local offline `processUserMessageLocal` (0ms).
+    2. **Agente de Diseño Conversacional (Voice UX) (`03-voice-ux.md`)**:
+       - Garantizar que Gemini genere respuestas habladas cálidas, directas y empáticas de 1-2 oraciones, respetando el saludo personal y la confirmación en 2 pasos.
+
+- [ ] **TASK-49**: **Servicio de Ruteo y Geocodificación con Google Maps Platform (`06-mapas-ruteo.md`, `08-backend-infraestructura.md`)**:
+  - **Objetivo**:
+    Crear `googleMapsService.ts` para geocodificar destinos con Google Places/Geocoding y calcular rutas vehiculares con Google Directions API (tráfico en tiempo real de CDMX, maniobras paso a paso en español), conectándolo a un proveedor unificado `routingAdapter.ts` con fallback automático a OpenRouteService.
+  - **Entregables por Agente**:
+    1. **Agente de Mapas y Ruteo (`06-mapas-ruteo.md`)**:
+       - Implementar `src/services/googleMapsService.ts`:
+         * `geocodeDestination(query, currentLocation)`: Búsqueda con Google Geocoding / Places FindPlace en el contexto geográfico de CDMX / México.
+         * `getDirections(origin, destination)`: Consulta a Google Directions API (`mode=driving`, `language=es`, `departure_time=now`, `traffic_model=best_guess`).
+         * Decodificación de `overview_polyline` y mapeo de pasos turn-by-turn limpiando etiquetas HTML de `html_instructions`.
+         * Filtro estricto de maniobra inicial: garantizar que el primer paso sea de avance de ruta y nunca la indicación de llegada.
+       - Implementar `src/services/routingAdapter.ts`:
+         * Abstracción que consulta Google Maps si `EXPO_PUBLIC_GOOGLE_MAPS_API_KEY` está presente.
+         * En caso de error de cuota o fallo de red, conmuta de forma transparente y sin error visible a `orsService.ts` (OpenRouteService).
+
+- [ ] **TASK-50**: **Integración y Compatibilidad Frontend en `HomeScreen` y `InteractiveMap` (`07-mobile-frontend.md`, `02-ux-accesibilidad.md`)**:
+  - **Objetivo**:
+    Conectar el nuevo proveedor unificado de navegación a [`HomeScreen.tsx`](avan-mobile/src/screens/HomeScreen.tsx) y [`MinimalHomeScreen.tsx`](avan-mobile/src/screens/MinimalHomeScreen.tsx), garantizando que las polilíneas de Google Maps se dibujen con la estética de alto contraste (Día/Noche), la perspectiva POV de Zoom 17 y la tarjeta de maniobras turn-by-turn.
+  - **Entregables por Agente**:
+    1. **Agente de Mobile / Frontend (`07-mobile-frontend.md`)**:
+       - Conectar `routingAdapter.ts` en `MinimalHomeScreen.tsx` para el cálculo de ruta tras la confirmación de viaje en 2 pasos.
+       - Conectar `routingAdapter.ts` en `HomeScreen.tsx` para el recálculo dinámico automático (rerouting) cuando el GPS detecta desvío > 45m.
+       - Garantizar compatibilidad geométrica total con `InteractiveMap.tsx`: polilínea de alto contraste (`#2B5B84` en Día, `#00E5FF` en Noche) y marcador chevron rotado según el heading.
+       - Preservar la guardia temporal de 12 segundos y el botón de recentrado al estándar **Zoom 17** con inclinación de 45°.
+    2. **Agente de UX / Accesibilidad (`02-ux-accesibilidad.md`)**:
+       - Validar que las maniobras paso a paso de Google Maps muestren iconos direccionales claros y legibles en la tarjeta superior gerontológica.
+
+- [ ] **TASK-51**: **Desambiguación Inteligente con Google Places y Enriquecimiento de Puntos de Referencia (`04-nlu-conversacional.md`, `06-mapas-ruteo.md`, `03-voice-ux.md`)**:
+  - **Objetivo**:
+    Integrar la búsqueda de lugares homónimos (ej. *"Parque México"*, *"Farmacia San Pablo"*, *"Hospital Ángeles"*) usando Google Places para enriquecer las opciones de desambiguación con colonias y referencias de CDMX reales, generando diálogos hablados claros para el adulto mayor.
+  - **Entregables por Agente**:
+    1. **Agente de Mapas y Ruteo (`06-mapas-ruteo.md`) & Agente NLU (`04-nlu-conversacional.md`)**:
+       - Implementar `getDisambiguationCandidates` en `googleMapsService.ts` para obtener hasta 3 candidatos ordenados por relevancia y proximidad al conductor.
+       - Enriquecer cada opción con la colonia o alcaldía para que el conductor identifique fácilmente el lugar correcto.
+    2. **Agente de Diseño Conversacional (Voice UX) (`03-voice-ux.md`)**:
+       - Conectar con `buildDisambiguationSpokenPrompt` para que el conductor pueda elegir su destino diciendo el número (*"el 1"*), el ordinal (*"la primera"*) o la zona (*"la de Coyoacán"*).
+
+- [ ] **TASK-52**: **Suite de Pruebas Automatizadas y Certificación de Calidad Ecosistema Google (`09-qa-accesibilidad.md`, `11-orquestador-pm.md`)**:
+  - **Objetivo**:
+    Diseñar y ejecutar suites de pruebas automatizadas para certificar la precisión de Gemini 2.5 Flash, el ruteo de Google Maps, la decodificación de polilíneas, el mecanismo de failover y la compilación limpia de TypeScript.
+  - **Entregables por Agente**:
+    1. **Agente de QA y Accesibilidad (`09-qa-accesibilidad.md`)**:
+       - Crear `test_gemini_nlu.ts`: Prueba unitaria de Function Calling en Gemini 2.5 Flash para `navegar_a`, `guardar_ubicacion`, `ajustar_zoom` (con intensidades), `confirmar_viaje` y `cancelar`.
+       - Crear `test_google_maps_routing.ts`: Prueba unitaria de geocodificación, decodificación de polilínea y parsing de maniobras en español con Google Directions API.
+       - Crear `test_failover_resilience.ts`: Prueba de resiliencia que simule caída o desconexión de las APIs de Google y valide la conmutación automática limpia a OpenRouteService / motor local offline.
+       - Integrar scripts en `package.json` y actualizar `npm run test:all`.
+       - Certificación estricta de tipos TypeScript con `npx tsc --noEmit` con 0 errores.
+
+
