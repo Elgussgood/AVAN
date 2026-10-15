@@ -730,3 +730,25 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
   - Integración en `package.json` (`npm run test:disambiguation-breakout` y `npm run test:all`).
   - `npx tsc --noEmit`: 0 errores de compilación TypeScript.
   - `npm run test:all`: 11 suites de prueba superadas al 100%.
+
+---
+
+### Fase 8: Sincronización Acústica, Eliminación de Sobreposición de Voces y Compilación de APK [COMPLETADA]
+
+- [x] **TASK-61**: **Eliminación Definitiva de Sobreposición de Voces al Iniciar Ruta y Compilación de APK Android (`05-voz-stt-tts.md`, `07-mobile-frontend.md`, `09-qa-accesibilidad.md`)**:
+  - **Diagnóstico de Traslapes de Audio al Iniciar Ruta**:
+    * En `MinimalHomeScreen.tsx`: al confirmar el viaje se iniciaba una locución de preparación (*"Calculando la mejor ruta hacia..."*) que 200ms después era interrumpida de golpe por `VoiceService.stop()`, dejando fragmentos o buffers residuales en el sintetizador nativo.
+    * En `HomeScreen.tsx`: al montar la vista de mapa, el efecto de bienvenida disparaba *"Iniciando ruta hacia [Destino]. [Primera maniobra]"*, y en el mismo instante el ciclo turn-by-turn de navegación por GPS detectaba que el auto estaba en el origen con el paso 0 desmarcado, disparando concurrentemente *"En X metros gire a la derecha"*, reproduciendo dos voces encima una de otra.
+    * En `voiceService.ts`: la ausencia de serialización atómica permitía que llamadas concurrentes cruzaran el `stop()` asíncrono y abrieran reproductores de audio paralelos.
+  - **Corrección y Blindaje de Audio**:
+    * **Serialización Atómica por Utterance ID**: Se implementó `activeUtteranceId` en `VoiceService`. `await this.stop()` se ejecuta de forma prioritaria antes de emitir el nuevo identificador incremental, invalidando de raíz cualquier locución o síntesis previa y garantizando detención incondicional de `Speech.stop()`.
+    * **Transición Limpia de Pantallas**: `MinimalHomeScreen.tsx` provee retroalimentación visual inmediata durante el cálculo y silencia audios residuales, cediendo la locución verbal única a `HomeScreen.tsx`.
+    * **Coordinación de Bienvenida y Maniobra Inicial**: En `HomeScreen.tsx`, al emitir la bienvenida se marcan los conjuntos `hasAnnouncedApproachRef` y `hasAnnouncedImminentRef` para el paso 0. Se implementó una guardia temporal de 7 segundos y la condición `!VoiceService.isSpeaking()` en el loop de navegación para impedir que cualquier alerta de proximidad se sobreponga a la bienvenida.
+  - **Compilación de APK de Distribución Interna con Expo EAS Build**:
+    * Perfil: `preview` con `"buildType": "apk"`.
+    * ID de Compilación: `1098c599-954a-48f8-87f0-c59ae4da73e6` en `@elgussgod/avan-mobile`.
+    * Estado: **FINISHED** (Duración de compilación: 7m 28s).
+    * Enlace directo de descarga APK: [AVAN-v1.0.0-preview.apk](https://expo.dev/artifacts/eas/XSGmE_rfU7k032fDf62XYBt7cAM2fVWYoS6p3BYdMzw.apk)
+    * Dashboard EAS: [expo.dev/@elgussgod/avan-mobile/builds/1098c599-954a-48f8-87f0-c59ae4da73e6](https://expo.dev/accounts/elgussgod/projects/avan-mobile/builds/1098c599-954a-48f8-87f0-c59ae4da73e6)
+    * Variables de entorno verificadas: `EXPO_PUBLIC_ELEVENLABS_API_KEY`, `EXPO_PUBLIC_GROQ_API_KEY`, `EXPO_PUBLIC_ORS_API_KEY`.
+    * Integridad funcional: `npx tsc --noEmit` certificado con 0 errores y 11/11 suites de pruebas superadas al 100%.
