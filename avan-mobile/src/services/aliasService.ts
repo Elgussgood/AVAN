@@ -22,6 +22,14 @@ export interface SavedAlias {
   category?: 'family' | 'home' | 'medical' | 'work' | 'leisure';
 }
 
+export interface SaveAliasOptions {
+  alias?: string;
+  name: string;
+  address: string;
+  coordinates: { latitude: number; longitude: number };
+  category?: 'family' | 'home' | 'medical' | 'work' | 'leisure';
+}
+
 export interface AliasResolutionResult {
   resolvedName: string;
   coordinates?: { latitude: number; longitude: number };
@@ -115,10 +123,24 @@ export class AliasService {
   private aliases: Map<string, SavedAlias> = new Map();
   private isInitialized: boolean = false;
   private isSyncing: boolean = false;
+  private initPromise: Promise<void> | null = null;
 
   private constructor() {
     this.preloadDefaults();
-    this.initializeStorage();
+    this.initPromise = this.initializeStorage();
+  }
+
+  /**
+   * Asegura que los alias guardados en AsyncStorage estén 100% cargados en memoria
+   */
+  public async ensureInitialized(): Promise<void> {
+    if (this.isInitialized) return;
+    if (this.initPromise) {
+      await this.initPromise;
+      return;
+    }
+    this.initPromise = this.initializeStorage();
+    await this.initPromise;
   }
 
   /**
@@ -145,6 +167,11 @@ export class AliasService {
    */
   private async initializeStorage(): Promise<void> {
     try {
+      if (typeof window === 'undefined' && typeof (globalThis as any).nativeCallSyncHook === 'undefined') {
+        // En entorno Node/CLI de pruebas sin runtime nativo
+        this.isInitialized = true;
+        return;
+      }
       const stored = await AsyncStorage.getItem(STORAGE_KEY);
       if (stored) {
         const parsed: SavedAlias[] = JSON.parse(stored);
@@ -174,6 +201,9 @@ export class AliasService {
    */
   private async persistToLocal(): Promise<void> {
     try {
+      if (typeof window === 'undefined' && typeof (globalThis as any).nativeCallSyncHook === 'undefined') {
+        return;
+      }
       const list = Array.from(this.aliases.values());
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
     } catch (error) {
@@ -280,15 +310,20 @@ export class AliasService {
 
     // 2. Coincidencia eliminando partículas conversacionales comunes
     // ("ir con", "a casa de", "con", "donde", "a lo de", "a", "al", "mi", "el", "la")
-    let cleanQuery = normalizedQuery;
+    // y sufijos de cortesía ("por favor", "porfa", "gracias", etc.)
+    let cleanQuery = normalizedQuery
+      .replace(/\s+(?:por\s+favor|porfa|por\s+fa|gracias|muchas\s+gracias)$/g, '')
+      .trim();
+
     let prevClean = '';
     while (cleanQuery !== prevClean) {
       prevClean = cleanQuery;
       cleanQuery = cleanQuery
-        .replace(/^(?:quiero\s+ir|quisiera\s+ir|deseo\s+ir|voy\s+a|ir\s+con|ir\s+a|llevarme\s+con|llevame\s+con|llevame\s+a|vamos\s+con|vamos\s+a|navegar\s+a|llegar\s+a)\s+/g, '')
+        .replace(/^(?:quiero\s+ir|quisiera\s+ir|deseo\s+ir|voy\s+a|ir\s+con|ir\s+a|llevarme\s+con|llevame\s+con|llevame\s+a|llevame|vamos\s+con|vamos\s+a|vamos|navegar\s+a|llegar\s+a)\s+/g, '')
         .replace(/^(?:a\s+la\s+casa\s+de|a\s+casa\s+de|la\s+casa\s+de|el\s+departamento\s+de|casa\s+de|a\s+lo\s+de|lo\s+de|donde)\s+/g, '')
         .replace(/^(?:a|al|en|con|de|hacia|para|por)\s+/g, '')
         .replace(/^(?:mi|mis|el|la|los|las|un|una)\s+/g, '')
+        .replace(/\s+(?:por\s+favor|porfa|por\s+fa|gracias|muchas\s+gracias)$/g, '')
         .trim();
     }
 
@@ -354,7 +389,13 @@ export class AliasService {
 
       // Si el alias es 'mi casa', solo coincide si la consulta es específicamente 'mi casa' o 'casa'
       if (item.id === 'alias-casa') {
-        if (normalizedQuery === 'mi casa' || normalizedQuery === 'casa' || cleanQuery === 'casa') {
+        if (
+          normalizedQuery === 'mi casa' ||
+          normalizedQuery === 'casa' ||
+          cleanQuery === 'casa' ||
+          cleanQuery === 'mi casa' ||
+          /\b(?:mi\s+casa|casa)\b/i.test(cleanQuery)
+        ) {
           return item;
         }
         continue;
@@ -408,22 +449,42 @@ export class AliasService {
    * y sincroniza en segundo plano con Supabase.
    */
   public saveAlias(
-    alias: string,
-    name: string,
-    address: string,
-    coordinates: { latitude: number; longitude: number },
+    aliasOrOptions: string | SaveAliasOptions,
+    name?: string,
+    address?: string,
+    coordinates?: { latitude: number; longitude: number },
     category?: 'family' | 'home' | 'medical' | 'work' | 'leisure'
   ): SavedAlias {
-    const existing = this.getAlias(alias);
+    let finalAlias = '';
+    let finalName = '';
+    let finalAddress = '';
+    let finalCoords = { latitude: 19.4326, longitude: -99.1332 };
+    let finalCat = category;
+
+    if (typeof aliasOrOptions === 'object' && aliasOrOptions !== null) {
+      finalName = aliasOrOptions.name || '';
+      finalAlias = aliasOrOptions.alias || aliasOrOptions.name || '';
+      finalAddress = aliasOrOptions.address || '';
+      finalCoords = aliasOrOptions.coordinates || finalCoords;
+      finalCat = aliasOrOptions.category || category;
+    } else {
+      finalAlias = aliasOrOptions || '';
+      finalName = name || aliasOrOptions || '';
+      finalAddress = address || '';
+      finalCoords = coordinates || finalCoords;
+      finalCat = category;
+    }
+
+    const existing = this.getAlias(finalAlias);
     const id = existing ? existing.id : `alias-${Date.now()}`;
-    const resolvedCat = category || this.inferCategory(alias);
+    const resolvedCat = finalCat || this.inferCategory(finalAlias);
 
     const newAlias: SavedAlias = {
       id,
-      alias: alias.trim(),
-      name: name.trim(),
-      address: address.trim(),
-      coordinates,
+      alias: finalAlias.trim(),
+      name: finalName.trim(),
+      address: finalAddress.trim(),
+      coordinates: finalCoords,
       category: resolvedCat,
     };
 
@@ -534,13 +595,13 @@ export class AliasService {
   }
 
   public static saveAlias(
-    alias: string,
-    name: string,
-    address: string,
-    coordinates: { latitude: number; longitude: number },
+    aliasOrOptions: string | SaveAliasOptions,
+    name?: string,
+    address?: string,
+    coordinates?: { latitude: number; longitude: number },
     category?: 'family' | 'home' | 'medical' | 'work' | 'leisure'
   ): SavedAlias {
-    return AliasService.getInstance().saveAlias(alias, name, address, coordinates, category);
+    return AliasService.getInstance().saveAlias(aliasOrOptions, name, address, coordinates, category);
   }
 
   public static resolveDestinationWithAlias(query: string): AliasResolutionResult {
@@ -553,6 +614,10 @@ export class AliasService {
 
   public static async syncWithCloud(): Promise<void> {
     return AliasService.getInstance().syncWithCloud();
+  }
+
+  public static async ensureInitialized(): Promise<void> {
+    return AliasService.getInstance().ensureInitialized();
   }
 
   public static async deleteAlias(id: string): Promise<boolean> {

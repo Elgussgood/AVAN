@@ -30,6 +30,7 @@ export interface GeocodeResult {
   coordinates: Coordinates;
   distanceMeters?: number;
   precision?: GeocodePrecision;
+  isFallback?: boolean;
 }
 
 export interface DisambiguationCandidate {
@@ -69,6 +70,7 @@ export interface RouteResult {
 }
 
 import { CDMX_TRANSPORT_POIS } from '../data/cdmxTransportPois';
+import { AliasService } from './aliasService';
 
 // Destinos predefinidos y puntos de interés de referencia en CDMX y área metropolitana
 const FALLBACK_DESTINATIONS: (GeocodeResult & { keywords: string[] })[] = [
@@ -702,6 +704,23 @@ export class OpenRouteService {
     const cached = OpenRouteService.getFromCache(OpenRouteService.geocodeCache, cacheKey);
     if (cached && cached.length > 0) {
       return cached;
+    }
+
+    // TIER 0A: Comprobar si corresponde a un alias registrado por el usuario
+    const queryForAlias = trimmed || structured.street || '';
+    if (queryForAlias) {
+      const aliasMatch = AliasService.resolveDestinationWithAlias(queryForAlias);
+      if (aliasMatch.isAlias && aliasMatch.coordinates) {
+        const aliasResult: GeocodeResult = {
+          id: aliasMatch.alias?.id || 'alias-resolved',
+          name: aliasMatch.resolvedName,
+          label: `${aliasMatch.resolvedName} - ${aliasMatch.alias?.address || 'Ubicación guardada'}`,
+          coordinates: aliasMatch.coordinates,
+          precision: 'exact',
+        };
+        OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, [aliasResult]);
+        return [aliasResult];
+      }
     }
 
     const catalogResults = this.searchFallbackDestinations(trimmed);
@@ -1479,7 +1498,7 @@ export class OpenRouteService {
    * Genera una ruta vehicular simulada con trazo tipo cuadrícula urbana y
    * maniobras turn-by-turn en español neutro para AVAN.
    */
-  private generateFallbackRoute(
+  public generateFallbackRoute(
     start: Coordinates,
     destination: Coordinates
   ): RouteResult {

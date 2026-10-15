@@ -19,6 +19,7 @@ import {
   aliasService,
 } from './aliasService';
 import {
+  Coordinates,
   DisambiguationCandidate,
   GeocodePrecision,
   StructuredAddressQuery,
@@ -625,6 +626,9 @@ function isAffirmative(normalized: string): boolean {
     /^correcto\b/,
     /^seguro\b/,
     /^estoy seguro\b/,
+    /^por supuesto\b/,
+    /^desde luego\b/,
+    /^sin duda\b/,
   ];
 
   return affirmativePatterns.some((pattern) => pattern.test(normalized));
@@ -640,11 +644,16 @@ export function hasRectificationPattern(normalized: string): boolean {
     /(?:quiero\s+ir|quisiera\s+ir|deseo\s+ir|voy\s+a\s+ir|llevame|llevarme|vamos|mejor|cambia|cambialo|modifica|prefiero|a\s+la\s+casa|casa\s+de|con\s+mi|donde\s+mi)\b/i.test(
       normalized
     ) ||
-    /^(?:no\s*,?\s+)(?:a|al|hacia|con|para)\s+[a-z0-9]/i.test(normalized) ||
-    /^(?:no\s*,?\s+)(?:el\s+|la\s+)?(?:metro|metrobus|metrob[uú]s|suburbano|tren|hospital|parque|plaza|museo|alameda|bellas\s+artes|zocalo|z[oó]calo|aeropuerto)\b/i.test(
+    /^(?:no\s*,?\s+)(?:a|al|hacia|con|para|en)\s+[a-z0-9]/i.test(normalized) ||
+    /^(?:no\s*,?\s+)(?:el\s+|la\s+)?(?:calle\s+|avenida\s+|av\.?\s+|eje\s+|calzada\s+|paseo\s+|cerrada\s+|privada\s+|camino\s+|carretera\s+|metro|metrobus|metrob[uú]s|suburbano|tren|hospital|parque|plaza|museo|alameda|bellas\s+artes|zocalo|z[oó]calo|aeropuerto)\b/i.test(
       normalized
     ) ||
-    /^(?:no\s*,?\s+)?(?:me\s+equivoqu[eé]|no\s+es\s+ah[ií]|esta\s+mal)\s*,?\s*(?:es\s+en|es\s+a|era\s+en|era\s+a|vamos\s+a|quiero\s+ir\s+a|llevame\s+a)\s+[a-z0-9]/i.test(
+    /^(?:no\s*,?\s+)[a-z0-9\s]{2,}\s+\d+/i.test(normalized) ||
+    /^(?:no\s*,?\s+)(?:reforma|insurgentes|sonora|durango|monterrey|cuauhtemoc|tlalpan|periferico|viaducto|zaragoza|universidad|polanco|condesa|roma|del valle|santa fe|coyoacan|san angel|escom|unam|ipn|aeropuerto|zocalo|chapultepec|angel|soumaya)\b/i.test(
+      normalized
+    ) ||
+    /^(?:no\s*,?\s*)?(?:es\s+en|era\s+en|esta\s+en|en\s+realidad\s+es\s+en)\s+[a-z0-9]/i.test(normalized) ||
+    /^(?:no\s*,?\s*)?(?:me\s+equivoqu[eé]|no\s+es\s+ah[ií]|esta\s+mal)\s*,?\s*(?:es\s+en|es\s+a|era\s+en|era\s+a|vamos\s+a|quiero\s+ir\s+a|llevame\s+a)\s+[a-z0-9]/i.test(
       normalized
     )
   );
@@ -657,6 +666,23 @@ export function extractDestinationFromRectification(
   rawText: string,
   normalized: string
 ): string | null {
+  // 0. Patrones de "es en...", "era en...", "esta en...", "en realidad es en..."
+  // Ej: "es en Sonora 120", "no, es en Reforma 222", "en realidad es en Insurgentes Sur 1500"
+  const esEnMatch = normalized.match(
+    /^(?:no\s*,?\s*)?(?:en\s+realidad\s+es\s+en|es\s+en|era\s+en|esta\s+en|es\s+a|era\s+a)\s+(.+)/i
+  );
+  if (esEnMatch && esEnMatch[1]) {
+    let candidate = esEnMatch[1].trim();
+    candidate = candidate.replace(/^(?:la\s+direccion\s+es|calle|en|a|al)\s+/i, '').trim();
+    if (
+      candidate.length > 2 &&
+      !isAffirmative(candidate) &&
+      !['verdad', 'cierto', 'correcto', 'seguro', 'gracias', 'cancelar', 'cancela', 'ya no', 'detener'].includes(candidate.toLowerCase())
+    ) {
+      return capitalizeWords(candidate);
+    }
+  }
+
   // 1. Patrones directos de transporte / POI con "no, ..."
   // Ej: "no, metro politécnico", "no, al metro politécnico", "no, el metrobus insurgentes", "no, bellas artes"
   const noPoiMatch = normalized.match(
@@ -665,6 +691,38 @@ export function extractDestinationFromRectification(
   if (noPoiMatch && noPoiMatch[1]) {
     const candidate = noPoiMatch[1].trim();
     if (candidate.length > 2 && !['gracias', 'cancelar', 'cancela', 'ya no', 'detener'].includes(candidate.toLowerCase())) {
+      return capitalizeWords(candidate);
+    }
+  }
+
+  // 1b. Patrones con "no, en [calle/avenida/número]" o "no, calle [nombre]" o "no, avenida [nombre]"
+  // Ej: "no, en Sonora 120", "no, calle Durango 215", "no, en Insurgentes Sur 1500"
+  const noAddressMatch = normalized.match(
+    /^(?:no\s*,?\s+)(?:en\s+|la\s+calle\s+|calle\s+|la\s+avenida\s+|avenida\s+|av\.?\s+|el\s+eje\s+|eje\s+|calzada\s+|paseo\s+)(.+)/i
+  );
+  if (noAddressMatch && noAddressMatch[1]) {
+    let candidate = noAddressMatch[1].trim();
+    candidate = candidate.replace(/^(?:la\s+direccion\s+es|calle|en|a|al)\s+/i, '').trim();
+    if (
+      candidate.length > 2 &&
+      !isAffirmative(candidate) &&
+      !['serio', 'broma', 'vano', 'gracias', 'cancelar', 'cancela', 'ya no', 'detener'].includes(candidate.toLowerCase())
+    ) {
+      return capitalizeWords(candidate);
+    }
+  }
+
+  // 1c. Patrón directo "no, [nombre] [número]" (ej: "no, sonora 120", "no, insurgentes sur 1500", "no, reforma 222")
+  const noStreetNumberMatch = normalized.match(
+    /^(?:no\s*,?\s+)([a-z0-9\s]{2,}\s+\d+[a-z0-9\s,-]*)/i
+  );
+  if (noStreetNumberMatch && noStreetNumberMatch[1]) {
+    const candidate = noStreetNumberMatch[1].trim();
+    if (
+      candidate.length > 2 &&
+      !isAffirmative(candidate) &&
+      !['gracias', 'cancelar', 'cancela', 'ya no', 'detener'].includes(candidate.toLowerCase())
+    ) {
       return capitalizeWords(candidate);
     }
   }
@@ -689,21 +747,21 @@ export function extractDestinationFromRectification(
   // 3. Patrones de verbos y conectores de rectificación
   const patterns = [
     // "no, quiero ir a...", "no, quisiera ir a...", "no quiero ir a..."
-    /^(?:no\s*,?\s*)?(?:me\s+equivoqu[eé]\s*,?\s*|no\s+es\s+ah[ií]\s*,?\s*)?(?:mejor\s+)?(?:quiero|quisiera|deseo|voy\s+a)\s+(?:ir|llegar|viajar|navegar)\s+(?:a|al|hacia|para)\s+(.+)/i,
+    /^(?:no\s*,?\s*)?(?:me\s+equivoqu[eé]\s*,?\s*|no\s+es\s+ah[ií]\s*,?\s*)?(?:mejor\s+)?(?:quiero|quisiera|deseo|voy\s+a)\s+(?:ir|llegar|viajar|navegar)\s+(?:a|al|hacia|para|en)\s+(.+)/i,
     // "no, mejor llévame a...", "llévame mejor a...", "no, llévame a...", "llévame a..."
-    /^(?:no\s*,?\s*)?(?:mejor\s+)?(?:llevame|llevarme|llevanos|conduceme|dirigeme)\s+(?:mejor\s+)?(?:a|al|hacia|para)\s+(.+)/i,
+    /^(?:no\s*,?\s*)?(?:mejor\s+)?(?:llevame|llevarme|llevanos|conduceme|dirigeme)\s+(?:mejor\s+)?(?:a|al|hacia|para|en)\s+(.+)/i,
     // "no, cámbialo a...", "cambia el destino a...", "cambiar a..."
-    /^(?:no\s*,?\s*)?(?:cambialo|c[aá]mbialo|cambia|cambiar|modifica|modificar)\s+(?:el\s+destino\s+a|a|al|hacia|por)\s+(.+)/i,
+    /^(?:no\s*,?\s*)?(?:cambialo|c[aá]mbialo|cambia|cambiar|modifica|modificar)\s+(?:el\s+destino\s+a|a|al|hacia|por|en)\s+(.+)/i,
     // "no, mejor a...", "mejor al...", "mejor hacia...", "mejor en..."
     /^(?:no\s*,?\s*)?mejor\s+(?:a|al|hacia|en)\s+(.+)/i,
     // "no, prefiero ir a...", "prefiero ir a...", "prefiero ir al..."
-    /^(?:no\s*,?\s*)?prefiero\s+(?:ir\s+a|ir\s+al|ir\s+hacia|a|al|hacia)\s+(.+)/i,
+    /^(?:no\s*,?\s*)?prefiero\s+(?:ir\s+a|ir\s+al|ir\s+hacia|a|al|hacia|en)\s+(.+)/i,
     // "no, vamos a...", "vamos mejor a..."
-    /^(?:no\s*,?\s*)?vamos\s+(?:mejor\s+)?(?:a|al|hacia)\s+(.+)/i,
+    /^(?:no\s*,?\s*)?vamos\s+(?:mejor\s+)?(?:a|al|hacia|en)\s+(.+)/i,
     // "no es ahí, es en / es a...", "era en...", "es a..."
-    /^(?:no\s*,?\s*)?(?:no\s+es\s+ah[ií]|esta\s+mal)\s*,?\s*(?:es\s+en|es\s+a|era\s+en|era\s+a|vamos\s+a)\s+(.+)/i,
-    // "no, a...", "no, al...", "no, hacia..." (ej: "no, a Bellas Artes", "no, al Zócalo", "no, a Polanco")
-    /^(?:no\s*,?\s+)(?:a|al|hacia|para)\s+(.+)/i,
+    /^(?:no\s*,?\s*)?(?:no\s+es\s+ah[ií]|esta\s+mal)\s*,?\s*(?:es\s+en|es\s+a|era\s+en|era\s+a|vamos\s+a|en\s+realidad\s+es\s+en)\s+(.+)/i,
+    // "no, a...", "no, al...", "no, hacia...", "no, en..." (ej: "no, a Bellas Artes", "no, al Zócalo", "no, en Sonora 120")
+    /^(?:no\s*,?\s+)(?:a|al|hacia|para|en)\s+(.+)/i,
   ];
 
   for (const pattern of patterns) {
@@ -793,28 +851,7 @@ export function isAliasAddressCorrectionIntent(
     return { isCorrection: true, newAddress };
   }
 
-  // 4. Detección de "no, es en [dirección]" / "no, era en [dirección]"
-  const noEsEnMatch = normalized.match(
-    /^(?:no\s*,?\s+)?(?:es\s+en|era\s+en|esta\s+en)\s+(.+)/i
-  );
-  if (noEsEnMatch && noEsEnMatch[1]) {
-    let newAddress = noEsEnMatch[1].trim();
-    newAddress = newAddress.replace(/^(?:la\s+direccion\s+es|la\s+direccion|direccion)\s+/i, '').trim();
-    if (!['verdad', 'cierto', 'correcto', 'seguro'].includes(newAddress)) {
-      return { isCorrection: true, newAddress };
-    }
-  }
 
-  // 5. Detección de "no, en [calle/número/avenida]"
-  const noEnMatch = normalized.match(
-    /^(?:no\s*,?\s+)(?:en\s+)([a-z0-9].+)/i
-  );
-  if (noEnMatch && noEnMatch[1]) {
-    let newAddress = noEnMatch[1].trim();
-    if (!['serio', 'broma', 'vano'].includes(newAddress)) {
-      return { isCorrection: true, newAddress };
-    }
-  }
 
   // 6. Detección de ajuste numérico (ej. "no, es el 150", "es el 150", "al 150")
   const numAdjMatch = normalized.match(
@@ -836,6 +873,11 @@ export function isAliasAddressCorrectionIntent(
 }
 
 function isNegativeOrCancel(normalized: string): boolean {
+  // Las expresiones afirmativas ("sí", "vamos", "por favor", "inicia", etc.) NUNCA son cancelaciones
+  if (isAffirmative(normalized)) {
+    return false;
+  }
+
   // Si contiene una rectificación hacia otro destino, NO es una cancelación pura
   if (hasRectificationPattern(normalized)) {
     return false;
@@ -912,7 +954,7 @@ function isIncidentReport(normalized: string): {
   return { isReport: false, tipo: 'general' };
 }
 
-function extractDestination(rawText: string, normalized: string): string | null {
+export function extractDestination(rawText: string, normalized: string): string | null {
   const patterns = [
     /(?:por favor\s+)?(?:me puedes llevar|llevame|llevarme|llevanos|vamos|ir|quiero ir|quisiera ir|navegar|navega|dirigeme|dirigirme|como llego|como puedo llegar|rumbo|camino)\s+(?:a|al|hacia|para|con|en)\s+(.+)/i,
     /(?:iniciar viaje a|iniciar ruta a|viajar a|iniciar hacia|ruta hacia|ruta a)\s+(.+)/i,
@@ -953,14 +995,20 @@ function extractDestination(rawText: string, normalized: string): string | null 
     isAffirmative(normalized) ||
     isNegativeOrCancel(normalized) ||
     Boolean(detectZoomDirection(normalized)) ||
-    /(?:acercar|acerca|alejar|aleja|centrar|centra|zoom|mas cerca|mas lejos|menos zoom|mas zoom|alejate|acercate|centrate|trafico|incidente|accidente|bache|ayuda|hola|adios|gracias)/i.test(
+    /(?:acercar|acerca|alejar|aleja|centrar|centra|zoom|mas cerca|mas lejos|menos zoom|mas zoom|alejate|acercate|centrate|trafico|incidente|accidente|bache|ayuda|hola|adios|gracias|primera|primero|primer|segunda|segundo|tercera|tercero|cuarta|cuarto|opcion)/i.test(
       normalized
     ) ||
     isAddAddressIntent(normalized);
 
   if (!isControlOrNonDest) {
+    const hasAddressIndicators =
+      /\b(?:calle|avenida|av|av\.?|eje|calzada|calz|paseo|cerrada|privada|camino|carretera|colonia|col|alcaldia|alcaldía|municipio|numero|número|num|cruce|esquina|sur|norte|oriente|poniente|roma|condesa|del valle|polanco|centro|narvarte|coyoacan|coyoacán|tlalpan|san angel|san ángel)\b/i.test(
+        normalized
+      ) || /\d+/.test(normalized);
+
+    const maxWords = hasAddressIndicators ? 16 : 6;
     const words = normalized.split(/\s+/).filter(Boolean);
-    if (words.length >= 1 && words.length <= 6) {
+    if (words.length >= 1 && words.length <= maxWords) {
       if (!/^\d+$/.test(normalized) && normalized.length > 3) {
         return capitalizeWords(rawText.trim());
       }
@@ -1526,9 +1574,11 @@ export function mergeAddressAdjustmentHeuristic(
 ): MergedAddressResult {
   const cleanAdj = adjustmentText.trim();
 
-  // 1. Ajuste numérico (ej: "150", "el 150", "es el 150", "número 150", "no, 150")
-  const numMatch = cleanAdj.match(/(?:es\s+el|el\s+numero|numero|al\s+numero|no\s*,?\s*es\s+el|no\s*,?\s*)?\s*(\d+[a-zA-Z0-9-]*)/i);
-  if (numMatch && numMatch[1] && (cleanAdj.length < 20 || /^\D*\d+\D*$/.test(cleanAdj))) {
+  // 1. Ajuste numérico (ej: "150", "el 150", "es el 150", "número 150", "no, 150", "no, es el 150")
+  const numMatch =
+    cleanAdj.match(/^(?:no\s*,?\s*)?(?:es\s+el|el\s+numero|numero|al\s+numero|al)\s*(\d+[a-zA-Z0-9-]*)$/i) ||
+    cleanAdj.match(/^(\d+[a-zA-Z0-9-]*)$/);
+  if (numMatch && numMatch[1]) {
     const newNum = numMatch[1];
     let updatedQuery = baseAddress;
     if (/\b\d+\b/.test(baseAddress)) {
@@ -1935,11 +1985,20 @@ async function callGroqLLM(
     }
     dynamicContextPrompt += `
     * Si el usuario confirma ("Sí", "Vamos", "De acuerdo", "Iniciar", "Por favor", "Adelante"): DEBES invocar 'confirmar_viaje'.
-    * Si el usuario rectifica o cambia de destino a otro lugar diferente (ej: "No, quiero ir a {lugar}", "No, mejor llévame a {lugar}", "Cámbialo a {lugar}", "No, al metro {estación}", "Mejor a {lugar}", "Prefiero {lugar}"): DEBES invocar 'navegar_a(destino: nuevo_destino)'. NUNCA invoques 'cancelar' ni preguntes "¿Desea ir a otro lugar?" si ya indicó a dónde ir.
+    * Si el usuario rectifica, cambia de destino a otro lugar diferente o proporciona una dirección nueva (ej: "No, quiero ir a {lugar}", "No, mejor llévame a {lugar}", "Cámbialo a {lugar}", "No, al metro {estación}", "No, en Sonora 120", "No, Sonora 120", "Es en Reforma 222", "Insurgentes Sur 1500"): DEBES invocar 'navegar_a(destino: nuevo_destino)'. NUNCA invoques 'cancelar' ni preguntes "¿Desea ir a otro lugar?" si ya indicó a dónde ir.
     * Si el usuario solo dice "No", "Cancela", "Ya no quiero ir", "Detener" o rechaza sin indicar otro lugar: DEBES invocar 'cancelar'.`;
     if (context.pendingConfirmation.isForaneo) {
       dynamicContextPrompt += ` (Es un viaje foráneo en carretera a más de 50 km).`;
     }
+  } else if (context.pendingDisambiguation) {
+    const candList = context.pendingDisambiguation.candidates
+      .map((c, i) => `${i + 1}. ${c.label || c.name}`)
+      .join(' | ');
+    dynamicContextPrompt += `\n- ESTADO: DESAMBIGUANDO DESTINO para la búsqueda "${context.pendingDisambiguation.originalQuery}".
+    * Opciones ofrecidas al usuario: [${candList}].
+    * Si el usuario elige una opción ("la primera", "la segunda", "el 1", "el 2", "la de {colonia}"): DEBES invocar 'navegar_a(destino: nombre_del_candidato_elegido)'.
+    * Si el usuario rectifica, menciona una dirección completamente nueva u otro lugar diferente (ej: "No, mejor a Bellas Artes", "Sonora 120, Condesa", "Es en Reforma 222", "No, en Sonora 120"): DEBES romper la desambiguación e invocar inmediatamente 'navegar_a(destino: nuevo_destino)'.
+    * Si el usuario dice "Cancelar", "Ninguno" o "Ya no": DEBES invocar 'cancelar'.`;
   } else if (context.pendingAliasRegistration) {
     dynamicContextPrompt += `\n- ESTADO: REGISTRANDO ALIAS "${context.pendingAliasRegistration.aliasName}". Esperando que el usuario indique la dirección o colonia.`;
   } else if (context.pendingTripCompletion) {
@@ -2071,7 +2130,7 @@ async function callGroqLLM(
         const addrToUse = correctionCheck.newAddress || targetDest || userSpeechText;
 
         const normalizedAddr = await normalizeAddressWithLLM(addrToUse, context);
-        let targetCoords = context.currentLocation || CDMX_CENTER;
+        let targetCoords: Coordinates | null = null;
         let formattedAddress = normalizedAddr.formattedUserLabel;
         let precision: GeocodePrecision | undefined;
 
@@ -2086,6 +2145,22 @@ async function callGroqLLM(
             precision = geocoded[0].precision;
           }
         } catch {}
+
+        if (!targetCoords) {
+          const notFoundText = `No pude localizar la dirección "${addrToUse}" en el mapa. Por favor indíqueme una calle principal o referencia conocida para actualizar ${aliasToUpdate}.`;
+          context.history?.push({
+            role: 'assistant',
+            content: notFoundText,
+            timestamp: Date.now(),
+          });
+          return {
+            spokenText: notFoundText,
+            functionCall: null,
+            updatedContext: context,
+            requiresConfirmation: true,
+            shouldAutoListen: true,
+          };
+        }
 
         context.pendingConfirmation = null;
         context.pendingAliasRegistration = {
@@ -2498,7 +2573,7 @@ async function callGroqLLM(
             alias = normalizedAddr.aliasCandidate;
           }
 
-          let targetCoords = context.currentLocation || CDMX_CENTER;
+          let targetCoords: Coordinates | null = null;
           let formattedAddress = normalizedAddr.formattedUserLabel;
           let aliasPrecision: GeocodePrecision | undefined;
 
@@ -2543,6 +2618,36 @@ async function callGroqLLM(
             }
           } catch (err) {
             console.warn('[conversationService] Fallback de geocodificación en guardar_ubicacion:', err);
+          }
+
+          if (!targetCoords) {
+            try {
+              const directGeo = await routingService.geocodeDestination(
+                normalizedAddr.formattedSearchQuery || address,
+                context.currentLocation
+              );
+              if (directGeo && directGeo.length > 0) {
+                targetCoords = directGeo[0].coordinates;
+                formattedAddress = formattedAddress || directGeo[0].label || directGeo[0].name;
+                aliasPrecision = directGeo[0].precision;
+              }
+            } catch {}
+          }
+
+          if (!targetCoords) {
+            const notFoundText = `No pude localizar la dirección "${address}" en el mapa. Por favor indíqueme una calle, cruce o referencia conocida para registrar ${alias}.`;
+            context.history?.push({
+              role: 'assistant',
+              content: notFoundText,
+              timestamp: Date.now(),
+            });
+            return {
+              spokenText: notFoundText,
+              functionCall: null,
+              updatedContext: context,
+              requiresConfirmation: true,
+              shouldAutoListen: true,
+            };
           }
 
           const isExisting = Boolean(AliasService.getAlias(alias));
@@ -2774,7 +2879,14 @@ async function processUserMessageLocal(
   if (currentContext.pendingDisambiguation) {
     const disambiguation = currentContext.pendingDisambiguation;
 
-    // Caso A: Cancelación explícita
+    // Caso A: Si es una rectificación explícita hacia otro destino o dirección (ej: "No, mejor a Bellas Artes", "No, en Sonora 120", "Es en Reforma 222")
+    const rectifiedDuringDisambiguation = extractDestinationFromRectification(rawText, normalized);
+    if (rectifiedDuringDisambiguation) {
+      currentContext.pendingDisambiguation = null;
+      return await processUserMessageLocal(rectifiedDuringDisambiguation, currentContext);
+    }
+
+    // Caso B: Cancelación explícita pura (sin rectificación)
     if (isNegativeOrCancel(normalized)) {
       currentContext.pendingDisambiguation = null;
       const cancelText = disambiguation.intent === 'alias_registration'
@@ -2796,7 +2908,7 @@ async function processUserMessageLocal(
       };
     }
 
-    // Caso B: El usuario seleccionó una de las opciones
+    // Caso C: El usuario seleccionó una de las opciones
     const selected = resolveDisambiguationSelection(rawText, normalized, disambiguation.candidates);
     if (selected) {
       currentContext.pendingDisambiguation = null;
@@ -2874,7 +2986,22 @@ async function processUserMessageLocal(
       }
     }
 
-    // Caso C: El usuario dio una pista o colonia adicional
+    // Caso D: ¿El usuario indicó una nueva dirección o destino directo que no corresponde a las opciones?
+    // Ej: "Sonora 120, Condesa", "Durango 215", "Bellas Artes", "Reforma 222"
+    const directDest = extractDestination(rawText, normalized);
+    if (directDest && directDest.toLowerCase() !== disambiguation.originalQuery.toLowerCase()) {
+      const standaloneCandidates = await routingService.getDisambiguationCandidates(
+        directDest,
+        currentContext.currentLocation,
+        3
+      );
+      if (standaloneCandidates.candidates.length > 0) {
+        currentContext.pendingDisambiguation = null;
+        return await processUserMessageLocal(directDest, currentContext);
+      }
+    }
+
+    // Caso E: El usuario dio una pista o colonia adicional para refinar la búsqueda original
     const newCombinedQuery = `${disambiguation.originalQuery} ${rawText}`;
     const newCandidatesResult = await routingService.getDisambiguationCandidates(
       newCombinedQuery,
@@ -2935,7 +3062,18 @@ async function processUserMessageLocal(
       }
     }
 
-    // Caso D: Aclaración
+    // Caso F: Si newCombinedQuery no devolvió nada, verificar si rawText por sí solo resuelve candidatos
+    const standaloneFallback = await routingService.getDisambiguationCandidates(
+      rawText,
+      currentContext.currentLocation,
+      3
+    );
+    if (standaloneFallback.candidates.length > 0) {
+      currentContext.pendingDisambiguation = null;
+      return await processUserMessageLocal(rawText, currentContext);
+    }
+
+    // Caso G: Aclaración
     const repeatPrompt = `Por favor dígame cuál opción prefiere (por ejemplo "la primera" o "la segunda") o un lugar conocido de referencia.`;
     return {
       spokenText: repeatPrompt,
@@ -3082,7 +3220,7 @@ async function processUserMessageLocal(
       }
 
       // Geocodificar la dirección ingresada para obtener coordenadas precisas
-      let targetCoords = currentContext.currentLocation || CDMX_CENTER;
+      let targetCoords: Coordinates | null = null;
       let formattedAddress = normalizedAddr.formattedUserLabel;
       let aliasPrecision: GeocodePrecision | undefined;
 
@@ -3127,6 +3265,36 @@ async function processUserMessageLocal(
         }
       } catch (err) {
         console.log('[conversationService] Fallback de geocodificación para alias:', err);
+      }
+
+      if (!targetCoords) {
+        try {
+          const directGeo = await routingService.geocodeDestination(
+            normalizedAddr.formattedSearchQuery || addressToUse,
+            currentContext.currentLocation
+          );
+          if (directGeo && directGeo.length > 0) {
+            targetCoords = directGeo[0].coordinates;
+            formattedAddress = formattedAddress || directGeo[0].label || directGeo[0].name;
+            aliasPrecision = directGeo[0].precision;
+          }
+        } catch {}
+      }
+
+      if (!targetCoords) {
+        const notFoundText = `No pude localizar la dirección "${addressToUse}" en el mapa. Por favor indíqueme una calle, cruce o referencia conocida para registrar ${aliasToUse}.`;
+        currentContext.history?.push({
+          role: 'assistant',
+          content: notFoundText,
+          timestamp: Date.now(),
+        });
+        return {
+          spokenText: notFoundText,
+          functionCall: null,
+          updatedContext: currentContext,
+          requiresConfirmation: true,
+          shouldAutoListen: true,
+        };
       }
 
       const isExisting = Boolean(AliasService.getAlias(aliasToUse));
@@ -3493,17 +3661,16 @@ async function processUserMessageLocal(
 
     // 0c. DETECCIÓN PRIORITARIA: Corrección o actualización de dirección de un ALIAS guardado
     // Si el destino pendiente es un alias o lugar personal y el usuario indica que la dirección es errónea o proporciona la correcta:
-    const isPendingAlias = Boolean(
+    const isExplicitPersonalAlias = Boolean(
       currentContext.pendingConfirmation.isAlias ||
       currentContext.pendingConfirmation.aliasKey ||
-      AliasService.getAlias(destination) ||
       isPersonalPlaceIntent(destination) ||
       (currentContext.pendingConfirmation.originalQuery && isPersonalPlaceIntent(currentContext.pendingConfirmation.originalQuery))
     );
 
     const aliasCorrection = isAliasAddressCorrectionIntent(rawText, normalized);
 
-    if ((isPendingAlias || /direccion|ubicacion/i.test(normalized)) && aliasCorrection.isCorrection) {
+    if ((isExplicitPersonalAlias || /(?:direccion|ubicacion|no es ahi|esta mal)/i.test(normalized)) && aliasCorrection.isCorrection) {
       const existingAlias =
         (currentContext.pendingConfirmation.aliasKey ? AliasService.getAlias(currentContext.pendingConfirmation.aliasKey) : undefined) ||
         AliasService.getAlias(destination) ||
@@ -3528,7 +3695,7 @@ async function processUserMessageLocal(
           formattedAddress = normalizedAddr.formattedUserLabel;
         }
 
-        let targetCoords = currentContext.currentLocation || CDMX_CENTER;
+        let targetCoords: Coordinates | null = null;
         let correctionPrecision: GeocodePrecision | undefined;
 
         try {
@@ -3543,6 +3710,22 @@ async function processUserMessageLocal(
           }
         } catch (err) {
           console.warn('[conversationService] Fallback de geocodificación en corrección de alias:', err);
+        }
+
+        if (!targetCoords) {
+          const notFoundText = `No pude localizar la dirección "${aliasCorrection.newAddress}" en el mapa. Por favor indíqueme una calle, cruce o referencia conocida para actualizar ${targetAliasName}.`;
+          currentContext.history?.push({
+            role: 'assistant',
+            content: notFoundText,
+            timestamp: Date.now(),
+          });
+          return {
+            spokenText: notFoundText,
+            functionCall: null,
+            updatedContext: currentContext,
+            requiresConfirmation: true,
+            shouldAutoListen: true,
+          };
         }
 
         currentContext.pendingConfirmation = null;
@@ -3608,10 +3791,10 @@ async function processUserMessageLocal(
     }
 
     // 1. RECTIFICACIÓN PRIORITARIA: El usuario corrige o cambia de opinión
-    // Ej: "No, quiero ir a Bellas Artes", "No, mejor al metro politécnico", "Cámbialo a Reforma", "No, con mi hijo", "Mejor a Coyoacán"
-    const rectifiedDestination =
-      extractDestinationFromRectification(rawText, normalized) ||
-      extractDestination(rawText, normalized);
+    // Solo se evalúa si el usuario NO está afirmando (para evitar falsos cambios ante "sí", "vamos", etc.)
+    const rectifiedDestination = !isAffirmative(normalized)
+      ? (extractDestinationFromRectification(rawText, normalized) || extractDestination(rawText, normalized))
+      : null;
 
     if (rectifiedDestination && rectifiedDestination.toLowerCase() !== destination.toLowerCase()) {
       const aliasResult = AliasService.resolveDestinationWithAlias(rectifiedDestination);
@@ -3683,6 +3866,20 @@ async function processUserMessageLocal(
           }
         } catch (err) {
           console.warn('[conversationService] Error al geocodificar destino:', err);
+        }
+
+        if (!newCoords) {
+          try {
+            const geocoded = await routingService.geocodeDestination(
+              resolvedTarget,
+              currentContext.currentLocation
+            );
+            if (geocoded && geocoded.length > 0) {
+              newCoords = geocoded[0].coordinates;
+            }
+          } catch (err) {
+            console.warn('[conversationService] Error al geocodificar destino rectificado:', err);
+          }
         }
       }
 
@@ -4322,7 +4519,13 @@ export async function processUserMessage(
       return await processUserMessageLocal(rawText, currentContext);
     }
 
-    if (isAffirmative(normalized) || isNegativeOrCancel(normalized)) {
+    if (
+      isAffirmative(normalized) ||
+      isNegativeOrCancel(normalized) ||
+      hasRectificationPattern(normalized) ||
+      Boolean(extractDestinationFromRectification(rawText, normalized)) ||
+      Boolean(extractDestination(rawText, normalized))
+    ) {
       return await processUserMessageLocal(rawText, currentContext);
     }
   }

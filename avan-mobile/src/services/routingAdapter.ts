@@ -19,6 +19,7 @@ import {
   StructuredAddressQuery,
 } from './orsService';
 import * as google from './googleMapsService';
+import { AliasService } from './aliasService';
 
 export type RoutingProvider = 'google' | 'ors';
 
@@ -34,6 +35,24 @@ class RoutingService {
     query: string | StructuredAddressQuery,
     userLocation?: Coordinates
   ): Promise<GeocodeResult[]> {
+    const queryString = typeof query === 'string' ? query : (query.rawQuery || query.street || '');
+    if (queryString && queryString.trim()) {
+      const aliasRes = AliasService.resolveDestinationWithAlias(queryString);
+      if (aliasRes.isAlias && aliasRes.coordinates) {
+        this.lastProvider.geocode = 'ors';
+        return [
+          {
+            id: aliasRes.alias?.id || 'alias-resolved',
+            name: aliasRes.resolvedName,
+            label: `${aliasRes.resolvedName} - ${aliasRes.alias?.address || 'Ubicación guardada'}`,
+            coordinates: aliasRes.coordinates,
+            precision: 'exact',
+            isFallback: false,
+          },
+        ];
+      }
+    }
+
     if (google.isGoogleMapsConfigured()) {
       try {
         const results = await google.geocodeDestination(query, userLocation);
@@ -54,6 +73,27 @@ class RoutingService {
     userLocation?: Coordinates,
     maxCandidates = 3
   ): Promise<DisambiguationResult> {
+    const queryString = typeof query === 'string' ? query : (query.rawQuery || query.street || '');
+    if (queryString && queryString.trim()) {
+      const aliasRes = AliasService.resolveDestinationWithAlias(queryString);
+      if (aliasRes.isAlias && aliasRes.coordinates) {
+        this.lastProvider.disambiguation = 'ors';
+        return {
+          isAmbiguous: false,
+          candidates: [
+            {
+              id: aliasRes.alias?.id || 'alias-resolved',
+              name: aliasRes.resolvedName,
+              label: `${aliasRes.resolvedName} - ${aliasRes.alias?.address || 'Ubicación guardada'}`,
+              colonia_o_alcaldia: aliasRes.alias?.address || 'Destino frecuente guardado',
+              coordinates: aliasRes.coordinates,
+              precision: 'exact',
+            },
+          ],
+        };
+      }
+    }
+
     if (google.isGoogleMapsConfigured()) {
       try {
         const result = await google.getDisambiguationCandidates(query, userLocation, maxCandidates);
@@ -73,7 +113,7 @@ class RoutingService {
     if (google.isGoogleMapsConfigured()) {
       try {
         const route = await google.getDirections(start, destination);
-        if (route) {
+        if (route && route.coordinates && route.coordinates.length >= 2) {
           this.lastProvider.directions = 'google';
           return route;
         }
@@ -82,7 +122,15 @@ class RoutingService {
       }
     }
     this.lastProvider.directions = 'ors';
-    return orsService.getDirections(start, destination);
+    try {
+      const orsRoute = await orsService.getDirections(start, destination);
+      if (orsRoute && orsRoute.coordinates && orsRoute.coordinates.length >= 2) {
+        return orsRoute;
+      }
+    } catch (orsError) {
+      console.warn('[routingAdapter] ORS getDirections falló, generando ruta de emergencia local:', orsError);
+    }
+    return orsService.generateFallbackRoute(start, destination);
   }
 }
 

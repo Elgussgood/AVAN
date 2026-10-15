@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useColorScheme } from 'react-native';
 import { LatLng } from 'react-native-maps';
 import { HomeScreen } from './src/screens/HomeScreen';
@@ -8,8 +8,12 @@ import {
   ConversationService,
   ConversationContext,
 } from './src/services/conversationService';
+import { AliasService } from './src/services/aliasService';
 
 export default function App() {
+  useEffect(() => {
+    AliasService.ensureInitialized();
+  }, []);
   // Modo Día/Noche automático según la hora de conducción (19:00 a 07:00 es noche)
   const isNightHour = (): boolean => {
     const hour = new Date().getHours();

@@ -33,6 +33,7 @@ export interface VoiceServiceOptions {
  */
 export class VoiceService {
   private static isSpeakingState = false;
+  private static activeUtteranceId = 0;
   private static currentPlayer: AudioPlayer | null = null;
   private static currentTempFile: File | null = null;
   private static currentWebObjectUrl: string | null = null;
@@ -182,8 +183,11 @@ export class VoiceService {
 
     const naturalText = this.formatTextForNaturalSpeech(trimmedText);
 
-    // Detener cualquier reproducción previa
+    // Detener cualquier reproducción previa antes de registrar la nueva alocución
     await this.stop();
+
+    // Registrar el ID único para esta nueva alocución
+    const utteranceId = ++this.activeUtteranceId;
 
     const elevenLabsExplicitKey =
       (typeof process !== 'undefined' && process.env
@@ -210,8 +214,9 @@ export class VoiceService {
     if (!this.useDefaultVoiceOnly) {
       const cachedAudio = TTSAudioCache.get(naturalText);
       if (cachedAudio) {
+        if (utteranceId !== this.activeUtteranceId) return;
         console.log(`[VoiceService] ⚡ Frase en caché detectada: "${naturalText.slice(0, 35)}..." (0 tokens consumidos)`);
-        const played = await this.playCachedAudio(cachedAudio, onDone, onStart);
+        const played = await this.playCachedAudio(cachedAudio, onDone, onStart, utteranceId);
         if (played) {
           return;
         }
@@ -221,7 +226,8 @@ export class VoiceService {
     // Si el usuario seleccionó la voz default para pruebas o la cuota externa está agotada,
     // utilizar expo-speech de inmediato sin latencia de red
     if (this.useDefaultVoiceOnly || this.isElevenLabsQuotaExceeded) {
-      await this.speakWithSpeechFallback(naturalText, onDone, onStart);
+      if (utteranceId !== this.activeUtteranceId) return;
+      await this.speakWithSpeechFallback(naturalText, onDone, onStart, utteranceId);
       return;
     }
 
@@ -237,13 +243,15 @@ export class VoiceService {
       typeof resolvedApiKey === 'string' && resolvedApiKey.startsWith('sk-');
 
     if (resolvedApiKey) {
+      if (utteranceId !== this.activeUtteranceId) return;
       if (isElevenLabsKey) {
         console.log('[VoiceService] Detectada API key de ElevenLabs, sintetizando voz ultra-natural...');
         success = await this.speakWithElevenLabs(
           naturalText,
           resolvedApiKey,
           onDone,
-          onStart
+          onStart,
+          utteranceId
         );
       } else if (isOpenAIKey) {
         console.log('[VoiceService] Detectada API key de OpenAI, sintetizando con OpenAI TTS...');
@@ -251,7 +259,8 @@ export class VoiceService {
           naturalText,
           resolvedApiKey,
           onDone,
-          onStart
+          onStart,
+          utteranceId
         );
       } else {
         // Clave genérica: intentar primero ElevenLabs, luego OpenAI
@@ -259,25 +268,29 @@ export class VoiceService {
           naturalText,
           resolvedApiKey,
           onDone,
-          onStart
+          onStart,
+          utteranceId
         );
-        if (!success) {
+        if (!success && utteranceId === this.activeUtteranceId) {
           success = await this.speakWithOpenAI(
             naturalText,
             resolvedApiKey,
             onDone,
-            onStart
+            onStart,
+            utteranceId
           );
         }
       }
 
-      if (success) {
+      if (success || utteranceId !== this.activeUtteranceId) {
         return;
       }
     }
 
     // Fallback mejorado y robusto con expo-speech
-    await this.speakWithSpeechFallback(naturalText, onDone, onStart);
+    if (utteranceId === this.activeUtteranceId) {
+      await this.speakWithSpeechFallback(naturalText, onDone, onStart, utteranceId);
+    }
   }
 
   /**
@@ -323,6 +336,9 @@ export class VoiceService {
    * liberando memoria y asegurando cero persistencia en disco.
    */
   static async stop(): Promise<void> {
+    // Incrementar ID de alocución para invalidar de inmediato cualquier síntesis o reproducción asíncrona en curso
+    this.activeUtteranceId++;
+
     // 1. Cancelar petición de red en curso
     if (this.currentAbortController) {
       try {
@@ -362,13 +378,10 @@ export class VoiceService {
       this.currentWebObjectUrl = null;
     }
 
-    // 5. Detener síntesis nativa de expo-speech únicamente si está activa
+    // 5. Detener síntesis nativa de expo-speech de forma incondicional
     try {
-      const isSpeaking = await Speech.isSpeakingAsync();
-      if (isSpeaking) {
-        await Speech.stop();
-        await new Promise((resolve) => setTimeout(resolve, 60));
-      }
+      await Speech.stop();
+      await new Promise((resolve) => setTimeout(resolve, 50));
     } catch (error) {
       console.warn('[VoiceService] Error al detener Speech nativo:', error);
     }
@@ -383,10 +396,15 @@ export class VoiceService {
     text: string,
     apiKey: string,
     onDone?: () => void,
-    onStart?: () => void
+    onStart?: () => void,
+    utteranceId?: number
   ): Promise<boolean> {
     if (this.isElevenLabsQuotaExceeded) {
       return false;
+    }
+
+    if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+      return true;
     }
 
     const controller = new AbortController();
@@ -479,16 +497,16 @@ export class VoiceService {
         audioUri = tempFile.uri;
       }
 
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || (utteranceId !== undefined && utteranceId !== this.activeUtteranceId)) {
         this.cleanupResources(tempFile, webObjectUrl);
         return true;
       }
 
-      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart);
+      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart, utteranceId);
     } catch (error: any) {
       this.cleanupResources(tempFile, webObjectUrl);
 
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || (utteranceId !== undefined && utteranceId !== this.activeUtteranceId)) {
         this.isSpeakingState = false;
         return true;
       }
@@ -506,8 +524,13 @@ export class VoiceService {
     text: string,
     apiKey: string,
     onDone?: () => void,
-    onStart?: () => void
+    onStart?: () => void,
+    utteranceId?: number
   ): Promise<boolean> {
+    if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+      return true;
+    }
+
     const controller = new AbortController();
     this.currentAbortController = controller;
 
@@ -557,16 +580,16 @@ export class VoiceService {
         audioUri = tempFile.uri;
       }
 
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || (utteranceId !== undefined && utteranceId !== this.activeUtteranceId)) {
         this.cleanupResources(tempFile, webObjectUrl);
         return true;
       }
 
-      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart);
+      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart, utteranceId);
     } catch (error: any) {
       this.cleanupResources(tempFile, webObjectUrl);
 
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || (utteranceId !== undefined && utteranceId !== this.activeUtteranceId)) {
         this.isSpeakingState = false;
         return true;
       }
@@ -583,8 +606,13 @@ export class VoiceService {
   private static async playCachedAudio(
     cachedBytes: Uint8Array | Blob,
     onDone?: () => void,
-    onStart?: () => void
+    onStart?: () => void,
+    utteranceId?: number
   ): Promise<boolean> {
+    if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+      return true;
+    }
+
     let audioUri: string | null = null;
     let tempFile: File | null = null;
     let webObjectUrl: string | null = null;
@@ -611,7 +639,12 @@ export class VoiceService {
         audioUri = tempFile.uri;
       }
 
-      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart);
+      if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+        this.cleanupResources(tempFile, webObjectUrl);
+        return true;
+      }
+
+      return await this.playAudioSource(audioUri, tempFile, webObjectUrl, onDone, onStart, utteranceId);
     } catch (error) {
       console.warn('[VoiceService] Error al reproducir audio desde caché:', error);
       this.cleanupResources(tempFile, webObjectUrl);
@@ -627,8 +660,14 @@ export class VoiceService {
     tempFile: File | null,
     webObjectUrl: string | null,
     onDone?: () => void,
-    onStart?: () => void
+    onStart?: () => void,
+    utteranceId?: number
   ): Promise<boolean> {
+    if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+      this.cleanupResources(tempFile, webObjectUrl);
+      return true;
+    }
+
     try {
       // Configurar modo de audio para salida clara en altavoz
       try {
@@ -676,6 +715,10 @@ export class VoiceService {
         }
 
         if (status.playing && !hasStarted) {
+          if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+            handleCleanup();
+            return;
+          }
           hasStarted = true;
           this.isSpeakingState = true;
           if (onStart) onStart();
@@ -734,8 +777,13 @@ export class VoiceService {
   private static async speakWithSpeechFallback(
     text: string,
     onDone?: () => void,
-    onStart?: () => void
+    onStart?: () => void,
+    utteranceId?: number
   ): Promise<void> {
+    if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+      return;
+    }
+
     try {
       // 1. Configurar modo de audio antes de llamar a Speech.speak
       try {
@@ -775,26 +823,40 @@ export class VoiceService {
         rate: this.speed, // 0.88: ritmo pausado para adultos mayores
         pitch: this.pitch, // 0.95: tono ligeramente más grave para reducir fatiga auditiva
         onStart: () => {
+          if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+            Speech.stop().catch(() => {});
+            return;
+          }
           console.log('[VoiceService] Speech.speak onStart');
           this.isSpeakingState = true;
           if (onStart) onStart();
         },
         onDone: () => {
           console.log('[VoiceService] Speech.speak onDone');
-          this.isSpeakingState = false;
+          if (utteranceId === undefined || utteranceId === this.activeUtteranceId) {
+            this.isSpeakingState = false;
+          }
           if (onDone) onDone();
         },
         onStopped: () => {
           console.log('[VoiceService] Speech.speak onStopped');
-          this.isSpeakingState = false;
+          if (utteranceId === undefined || utteranceId === this.activeUtteranceId) {
+            this.isSpeakingState = false;
+          }
           if (onDone) onDone();
         },
         onError: (error) => {
           console.warn('[VoiceService] Speech.speak onError:', error);
-          this.isSpeakingState = false;
+          if (utteranceId === undefined || utteranceId === this.activeUtteranceId) {
+            this.isSpeakingState = false;
+          }
           if (onDone) onDone();
         },
       };
+
+      if (utteranceId !== undefined && utteranceId !== this.activeUtteranceId) {
+        return;
+      }
 
       this.isSpeakingState = true;
       Speech.speak(text, options);

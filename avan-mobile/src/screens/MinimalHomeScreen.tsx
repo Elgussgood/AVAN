@@ -22,7 +22,7 @@ import {
   ConversationContext,
   buildDisambiguationSpokenPrompt,
 } from '../services/conversationService';
-import { StepInstruction, DisambiguationCandidate, GeocodePrecision } from '../services/orsService';
+import { StepInstruction, DisambiguationCandidate, GeocodePrecision, orsService } from '../services/orsService';
 import { routingService } from '../services/routingAdapter';
 import { LocationService } from '../services/locationService';
 import { AliasService } from '../services/aliasService';
@@ -679,6 +679,9 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         }
       }
 
+      // Guardar copia de la confirmación pendiente ANTES de que el proceso del mensaje la limpie
+      const previousPendingConfirmation = contextRef.current.pendingConfirmation;
+
       const response = await ConversationService.processUserMessage(
         textToProcess,
         contextRef.current
@@ -707,6 +710,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
       if (response.functionCall?.name === 'confirmar_viaje') {
         const dest =
           response.functionCall.args.destino ||
+          previousPendingConfirmation?.destination ||
           response.updatedContext.activeRoute?.destination ||
           'Hospital General';
 
@@ -714,16 +718,14 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         setLoadingDestination(dest);
 
         const preparingMsg =
-          response.spokenText ||
           `Calculando la mejor ruta hacia ${dest}, por favor espere un momento.`;
         setSpokenMessage(preparingMsg);
-        setVoiceState('speaking');
+        setVoiceState('idle');
 
-        // Reproducir auditivamente mensaje tranquilizador
-        await VoiceService.speak(preparingMsg, () => {
-          setVoiceState('idle');
-        });
+        // Detener auditivamente cualquier diálogo previo para preparar la transición limpia y sin traslapes al mapa
+        await VoiceService.stop();
 
+        let targetCoords: { latitude: number; longitude: number } | null = null;
         try {
           setSpokenMessage('Localizando su vehículo...');
           const userLocation = await LocationService.getRealLocationOrWait((status) => {
@@ -735,27 +737,38 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           };
           setSpokenMessage(`Calculando la mejor ruta hacia ${dest}...`);
 
-          // 1. Obtener coordenadas destino (aprovechando las ya geocodificadas si están disponibles)
+          // 1. Obtener coordenadas destino con máxima resiliencia
           const args = response.functionCall.args as any;
-          let targetCoords: { latitude: number; longitude: number } | null = null;
           if (args?.latitud && args?.longitud) {
             targetCoords = {
               latitude: Number(args.latitud),
               longitude: Number(args.longitud),
             };
-          } else if (contextRef.current.pendingConfirmation?.coordinates) {
-            targetCoords = contextRef.current.pendingConfirmation.coordinates;
+          } else if (previousPendingConfirmation?.coordinates) {
+            targetCoords = previousPendingConfirmation.coordinates;
+          }
+
+          // Si es un alias o lugar personal, resolverlo de inmediato
+          if (!targetCoords) {
+            const aliasMatch = AliasService.resolveDestinationWithAlias(dest);
+            if (aliasMatch.isAlias && aliasMatch.coordinates) {
+              targetCoords = aliasMatch.coordinates;
+            }
           }
 
           if (!targetCoords) {
             const geocoded = await routingService.geocodeDestination(dest, startCoords);
-            targetCoords = geocoded[0]?.coordinates || {
+            targetCoords = geocoded[0]?.coordinates || null;
+          }
+
+          if (!targetCoords) {
+            targetCoords = {
               latitude: 19.4352,
               longitude: -99.1412,
             };
           }
 
-          // 2. Calcular ruta vehicular con ORS
+          // 2. Calcular ruta vehicular con motor unificado (Google / ORS)
           const routeResult = await routingService.getDirections(startCoords, targetCoords);
           const routeCoordinates = routeResult.coordinates.map((c) => ({
             latitude: c.latitude,
@@ -802,8 +815,21 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           contextRef.current.pendingConfirmation = null;
           await VoiceService.stop();
 
+          // Red de seguridad infalible: generar ruta de emergencia para que la vista de mapa nunca quede vacía
+          const fallbackStart = contextRef.current.currentLocation || { latitude: 19.4326, longitude: -99.1332 };
+          const fallbackDest = targetCoords || { latitude: 19.4352, longitude: -99.1412 };
+          const emergencyRoute = orsService.generateFallbackRoute(fallbackStart, fallbackDest);
+          const emergencyRouteData: RouteData = {
+            routeCoordinates: emergencyRoute.coordinates,
+            destinationCoords: fallbackDest,
+            instruction: emergencyRoute.steps[0]?.instruction || `Continúa hacia ${dest}`,
+            distance: emergencyRoute.distance,
+            duration: emergencyRoute.duration,
+            steps: emergencyRoute.steps,
+          };
+
           if (onStartTrip) {
-            onStartTrip(dest);
+            onStartTrip(dest, emergencyRouteData);
           }
         }
         return;

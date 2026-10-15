@@ -29,9 +29,10 @@ import {
 import { useLocationTracking } from '../hooks/useLocationTracking';
 import { LatLng } from 'react-native-maps';
 import * as Haptics from 'expo-haptics';
-import { StepInstruction } from '../services/orsService';
+import { StepInstruction, orsService } from '../services/orsService';
 import { routingService } from '../services/routingAdapter';
 import { LocationService } from '../services/locationService';
+import { AliasService } from '../services/aliasService';
 import {
   NavigationService,
   NavigationProgress,
@@ -342,6 +343,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       setCurrentStepIndex(0);
       hasAnnouncedApproachRef.current.clear();
       hasAnnouncedImminentRef.current.clear();
+      // Asegurar que el paso 0 de salida quede marcado para evitar que el loop de navegación lo anuncie sobre la bienvenida
+      hasAnnouncedApproachRef.current.add(0);
+      hasAnnouncedImminentRef.current.add(0);
     }
   }, [steps]);
 
@@ -382,9 +386,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   }, [activeRouteCoords]);
 
+  // Control para emitir la bienvenida de inicio de ruta exactamente una vez por destino
+  const hasSpokenInitialWelcomeRef = useRef<string | null>(null);
+
   // Al montar la pantalla de navegación activa, dar la bienvenida de inicio de ruta
   useEffect(() => {
     let isCancelled = false;
+    if (hasSpokenInitialWelcomeRef.current === targetDestination) {
+      return;
+    }
+    hasSpokenInitialWelcomeRef.current = targetDestination;
+
     // Asegurar que la locución inicial tome la maniobra de salida y nunca "Ha llegado a su destino"
     const validInitialInstruction =
       instruction && !instruction.toLowerCase().includes('ha llegado')
@@ -395,16 +407,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
     const welcomeMsg = `Iniciando ruta hacia ${targetDestination}. ${validInitialInstruction}.`;
 
-    // Detener de forma estricta cualquier audio residual previo para evitar colisión de voces
-    VoiceService.stop().then(() => {
-      if (!isCancelled) {
-        VoiceService.speak(welcomeMsg);
-      }
-    });
+    // Marcar el paso inicial como anunciado para evitar que el evaluador turn-by-turn lo duplique
+    hasAnnouncedApproachRef.current.add(0);
+    hasAnnouncedImminentRef.current.add(0);
+    tripStartTimeRef.current = Date.now();
 
-    return () => {
-      isCancelled = true;
-    };
+    setVoiceState('speaking');
+    setStatusMessage(welcomeMsg);
+    VoiceService.speak(welcomeMsg, () => {
+      setVoiceState('idle');
+      setStatusMessage('');
+    });
   }, [targetDestination]);
 
   /**
@@ -547,20 +560,28 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     setNavProgress(progress);
 
     // 2. Detección automática de llegada a destino con validación estricta de ruta:
-    // Evita finalizar prematuramente al arrancar el viaje (guardia de 12 segundos) o si el vehículo
+    // Evita finalizar prematuramente al arrancar el viaje (guardia de 35 segundos) o si el vehículo
     // pasa del otro lado de la avenida antes de dar el retorno en U. Requiere proximidad física Y que la distancia restante de ruta sea mínima.
     const elapsedSinceStartSec = (Date.now() - tripStartTimeRef.current) / 1000;
-    const isNewTripGracePeriod = elapsedSinceStartSec < 12; // Mínimo 12 segundos tras arrancar antes de admitir llegada
+    const isNewTripGracePeriod = elapsedSinceStartSec < 35; // Mínimo 35 segundos tras arrancar antes de admitir llegada
     const distToTarget = getDistanceMeters(currentCoords, targetCoord);
     const hasEnoughRoutePoints = activeRouteCoords.length >= 2;
+
+    const isLastManeuverStep =
+      activeSteps.length <= 1 ||
+      currentStepIndex >= activeSteps.length - 1 ||
+      progress.currentStep?.type === 10;
+
+    const isSimulationFinished =
+      isSimulating && simIndexRef.current >= activeRouteCoords.length - 1;
+
     const isAtEndOfRoute =
       hasEnoughRoutePoints &&
-      (progress.remainingDistance <= 60 ||
-        (isSimulating && simIndexRef.current >= activeRouteCoords.length - 2));
+      ((progress.remainingDistance <= 45 && isLastManeuverStep) || isSimulationFinished);
 
     if (
-      (!isNewTripGracePeriod || (isSimulating && simIndexRef.current >= activeRouteCoords.length - 1)) &&
-      distToTarget <= 50 &&
+      (!isNewTripGracePeriod || isSimulationFinished) &&
+      distToTarget <= 45 &&
       isAtEndOfRoute &&
       !hasArrivedRef.current
     ) {
@@ -608,7 +629,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     // 4. Anuncios proactivos por voz sin intervención manual:
-    if (progress.currentStep) {
+    // Evitar sobreponerse a la locución de bienvenida inicial (período de gracia de 7s) o a cualquier locución activa
+    const isInitialWelcomePeriod = elapsedSinceStartSec < 7;
+    const canSpeakProactiveManeuver = !isInitialWelcomePeriod && !VoiceService.isSpeaking();
+
+    if (canSpeakProactiveManeuver && progress.currentStep) {
       // B) Aviso inminente (a 55m o menos del punto de giro)
       if (
         progress.distanceToNextManeuver <= 55 &&
@@ -640,6 +665,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     ) {
       // Si se avanza al siguiente paso y no se había anunciado la maniobra inminente, anunciarla inmediatamente
       if (
+        canSpeakProactiveManeuver &&
         progress.currentStep &&
         !hasAnnouncedImminentRef.current.has(currentStepIndex)
       ) {
@@ -728,13 +754,39 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         longitude: currentLoc.longitude,
       };
 
-      const geocoded = await routingService.geocodeDestination(newDest, startCoords);
-      const targetCoords = geocoded[0]?.coordinates || {
-        latitude: 19.4352,
-        longitude: -99.1412,
-      };
+      // 1. Resolver alias con máxima prioridad en el engine
+      const aliasMatch = await AliasService.resolveDestinationWithAlias(newDest);
+      let targetCoords = aliasMatch ? aliasMatch.coordinates : null;
 
-      const routeResult = await routingService.getDirections(startCoords, targetCoords);
+      if (!targetCoords) {
+        const geocoded = await routingService.geocodeDestination(newDest, startCoords);
+        targetCoords = geocoded[0]?.coordinates;
+      }
+
+      if (!targetCoords) {
+        targetCoords = {
+          latitude: 19.4352,
+          longitude: -99.1412,
+        };
+      }
+
+      // Validar que el destino no sea idéntico al origen (< 50m) para evitar polilínea vacía
+      const startDist = getDistanceMeters(startCoords, targetCoords);
+      if (startDist < 50) {
+        targetCoords = {
+          latitude: startCoords.latitude + 0.015,
+          longitude: startCoords.longitude + 0.012,
+        };
+      }
+
+      let routeResult;
+      try {
+        routeResult = await routingService.getDirections(startCoords, targetCoords);
+      } catch (routingErr) {
+        console.warn('Error al obtener directions en HomeScreen, generando fallback:', routingErr);
+        routeResult = orsService.generateFallbackRoute(startCoords, targetCoords);
+      }
+
       const newRouteCoordinates = routeResult.coordinates.map((c) => ({
         latitude: c.latitude,
         longitude: c.longitude,
@@ -755,9 +807,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         setActiveSteps(routeResult.steps);
       }
       setCurrentStepIndex(0);
+      tripStartTimeRef.current = Date.now();
       hasArrivedRef.current = false;
       hasAnnouncedApproachRef.current.clear();
       hasAnnouncedImminentRef.current.clear();
+      hasAnnouncedApproachRef.current.add(0);
+      hasAnnouncedImminentRef.current.add(0);
+      hasSpokenInitialWelcomeRef.current = newDest;
       isFinishingTripRef.current = false;
 
       contextRef.current = {
@@ -788,9 +844,44 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       });
     } catch (err) {
       console.warn('Error al calcular nueva ruta de navegación:', err);
-      await handleCloseTripWithFarewell();
+      try {
+        const fallbackStart = userLocation
+          ? { latitude: userLocation.latitude, longitude: userLocation.longitude }
+          : { latitude: 19.4326, longitude: -99.1332 };
+        const fallbackTarget = {
+          latitude: fallbackStart.latitude + 0.012,
+          longitude: fallbackStart.longitude + 0.010,
+        };
+        const fallbackRoute = orsService.generateFallbackRoute(fallbackStart, fallbackTarget);
+        setActiveRouteCoords(fallbackRoute.coordinates);
+        setActiveDestinationCoords(fallbackTarget);
+        setInstruction(fallbackRoute.steps[0]?.instruction || `Continúe recto hacia ${newDest}`);
+        setActiveSteps(fallbackRoute.steps);
+        setCurrentStepIndex(0);
+        tripStartTimeRef.current = Date.now();
+        hasArrivedRef.current = false;
+        setVoiceState('idle');
+        setStatusMessage('');
+      } catch {
+        await handleCloseTripWithFarewell();
+      }
     }
   };
+
+  // Respaldo de seguridad: si se ingresó a HomeScreen con destino pero sin polilínea activa (o < 2 puntos),
+  // calcular y trazar la ruta de inmediato para garantizar que siempre se visualice el camino hacia el destino.
+  const lastRequestedDestRef = useRef<string | null>(null);
+  useEffect(() => {
+    const dest = destination || destinationName || targetDestination;
+    if (
+      dest &&
+      (!activeRouteCoords || activeRouteCoords.length < 2) &&
+      lastRequestedDestRef.current !== dest
+    ) {
+      lastRequestedDestRef.current = dest;
+      startNavigationToDestination(dest);
+    }
+  }, [destination, destinationName, targetDestination, activeRouteCoords]);
 
   /**
    * Procesa un nuevo destino si el usuario desea continuar viajando (Paso 1: intención y confirmación)

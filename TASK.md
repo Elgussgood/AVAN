@@ -653,3 +653,80 @@ Aplicación de navegación simplificada para adultos mayores que conducen su pro
 > - **Circuit breaker** por API (Gemini, Routes, Places, Geocoding): 429 -> 60 s; 400/401/403/404 -> 10 min; 3 fallos de red -> 30 s. Evita latencia extra al conductor.
 > - **Compatibilidad**: las maniobras de Google se mapean a los códigos ORS (0 izq, 1 der, ..., 10 llegada, 11 salida) que consume `navigationService`; el primer paso nunca es de llegada.
 > - **Pruebas**: `test_gemini_nlu.ts` (35), `test_google_maps_routing.ts` (52), `test_failover_resilience.ts` (19), todas deterministas con fetch simulado.
+
+---
+
+### Fase 6: Robustez de Navegación en Marcha, Persistencia Integral de Alias y Eliminación de Falsa Llegada [COMPLETADA]
+
+- [x] **TASK-53**: **Resolución Prioritaria de Alias en el Motor de Ruteo y Geocodificación (`06-mapas-ruteo.md`, `08-backend-infraestructura.md`)**:
+  - **Diagnóstico y Solución**: Cuando el conductor pedía viajar a un alias guardado como "casa de mi hijo", los geocodificadores externos fallaban o devolvían ubicaciones genéricas.
+  - Se integró resolución de máxima prioridad en `routingAdapter.ts` (`geocodeDestination` y `getDisambiguationCandidates`) y en `orsService.ts` consultando `AliasService.resolveDestinationWithAlias` antes de realizar llamadas HTTP a Google o a ORS.
+  - Al detectar un alias guardado, se devuelven de inmediato sus coordenadas exactas almacenadas con precisión `exact` y latencia 0ms.
+  - En `routingService.getDirections`, se implementó fallback resiliente a `orsService.generateFallbackRoute`, garantizando que nunca se propague una excepción y que el conductor siempre reciba una polilínea válida.
+
+- [x] **TASK-54**: **Persistencia Local Segura y Resolución Bidireccional de Alias (`08-backend-infraestructura.md`, `04-nlu-conversacional.md`)**:
+  - **Diagnóstico de Falso Destino a 0 Metros**: Al guardar o confirmar un alias con dirección dictada, si la geocodificación fallaba, el código realizaba un fallback silencioso a `targetCoords = context.currentLocation`, asignando la posición actual del vehículo como destino final. Esto provocaba que origen y destino fueran idénticos (distancia 0 m).
+  - Se eliminó el fallback silencioso a `currentLocation` en `conversationService.ts`: si una dirección dictada no puede geocodificarse, el asistente solicita referencias viales específicas amablemente en lugar de registrar la ubicación del vehículo.
+  - En `aliasService.ts`, se incorporó `ensureInitialized()` con control de promesa (`initPromise`) y se invocó al inicio de la app en `App.tsx` para garantizar que todos los alias de `AsyncStorage` residan en memoria antes de cualquier consulta.
+  - Se flexibilizó `saveAlias` para soportar tanto objeto de opciones (`SaveAliasOptions`) como parámetros posicionales, soportando registro por voz dinámico y persistencia local sin bloqueos.
+
+- [x] **TASK-55**: **Eliminación de Falsa Llegada Prematura y Garantía de Renderizado de Polilínea en `HomeScreen` (`07-mobile-frontend.md`, `02-ux-accesibilidad.md`)**:
+  - **Causa Raíz de "No muestra el camino"**: En `MinimalHomeScreen.tsx`, si `getDirections` fallaba o faltaban coordenadas del destino, el bloque `catch` invocaba `onStartTrip(dest)` sin el objeto `routeData`, enviando coordenadas vacías (`[]`) a `HomeScreen`. En `HomeScreen.tsx`, si montaba sin polilínea, el mapa interactivo MapLibre/Leaflet no trazaba ninguna línea.
+  - **Causa Raíz de "Marca que ya se llegó al destino"**: Al tener coordenadas idénticas o distancia restante 0 m por el bug de `currentLocation`, la distancia al destino era `0 <= 50m` y `remainingDistance <= 60m`. Al expirar el temporizador de 12 segundos, el detector de llegada se disparaba automáticamente.
+  - **Blindaje Estricto de Llegada en `HomeScreen.tsx`**:
+    * Se incrementó el período de gracia temporal de 12s a **35 segundos**.
+    * Se incorporó el requisito de **último paso de maniobra**: el vehículo debe estar en `currentStepIndex >= activeSteps.length - 1` o el paso debe ser de tipo 10 (maniobra de llegada).
+    * Se exige que la distancia al objetivo sea $\le 45$m Y que la distancia restante de ruta sea $\le 45$m. Si el usuario está en el paso 0 arrancando el viaje, es físicamente imposible que se dispare la llegada.
+  - **Garantía de Polilínea en `MinimalHomeScreen.tsx` y `HomeScreen.tsx`**:
+    * En `MinimalHomeScreen.tsx`, se preservan las coordenadas de `pendingConfirmation` antes de limpiar el contexto y, en caso de cualquier error de red, se genera una ruta de contingencia con `generateFallbackRoute` para asegurar que `routeData` nunca sea `undefined`.
+    * En `HomeScreen.tsx`, se agregó un `useEffect` de respaldo: si la pantalla monta con destino activo pero sin polilínea (`activeRouteCoords.length < 2`), ejecuta inmediatamente `startNavigationToDestination(dest)` para calcular y trazar el recorrido.
+
+- [x] **TASK-56**: **Confirmación Afirmativa Determinista en 2 Pasos (`04-nlu-conversacional.md`, `03-voice-ux.md`)**:
+  - **Diagnóstico**: Cuando el usuario respondía "sí", "vamos" o "por favor" en la confirmación de viaje, la función `isNegativeOrCancel` o la evaluación de rectificaciones de destino a veces interpretaban palabras afirmativas como cancelaciones o cambios de ruta.
+  - En `isNegativeOrCancel`: se colocó `if (isAffirmative(normalized)) return false;` en la primera línea, blindando cualquier afirmación contra rechazos accidentales.
+  - En `processUserMessageLocal`: se protegió la detección de rectificación con `!isAffirmative(normalized)`.
+  - Se enriqueció `isAffirmative` con patrones comunes ("sí", "vamos", "por supuesto", "desde luego", "iniciar viaje", "sin duda", "adelante").
+
+- [x] **TASK-57**: **Suite de Pruebas Automatizadas y Certificación TypeScript (`09-qa-accesibilidad.md`, `11-orquestador-pm.md`)**:
+  - Creación de [`test_alias_and_navigation_fix.ts`](file:///D:/Escom/Sexto%20semestre/Interacci%C3%B3n/AVAN/avan-mobile/test_alias_and_navigation_fix.ts) con 44 pruebas unitarias e integrales que validan:
+    * Grupo 1: Resolución de alias predeterminados y dinámicos en `routingAdapter` y `orsService` (100% pass).
+    * Grupo 2: Persistencia local y no-asignación de `currentLocation` como coordenada de destino (100% pass).
+    * Grupo 3: Inmunidad afirmativa de confirmación en 2 pasos frente a cancelaciones (100% pass).
+    * Grupo 4: Generación y trazado de rutas con polilínea de múltiples puntos y distancias no-cero (100% pass).
+    * Grupo 5: Blindaje de llegada a destino con guardia de 35s y validación de última maniobra (100% pass).
+  - Ejecución de `npx tsc --noEmit`: 0 errores de compilación TypeScript en todo el proyecto.
+  - Ejecución de `npm run test:all`: 10 suites de prueba superadas al 100%.
+
+---
+
+### Fase 7: Ruptura de Bucle en Desambiguación y Rectificación de Direcciones en Confirmación [COMPLETADA]
+
+- [x] **TASK-58**: **Ruptura de Bucle en Desambiguación (`pendingDisambiguation`) y Salto Ubicuo de Contexto ante Nuevas Ubicaciones (`04-nlu-conversacional.md`, `03-voice-ux.md`)**:
+  - **Diagnóstico de Causa Raíz**:
+    * Cuando el usuario solicitaba una ubicación ambigua (ej. *"Farmacia San Pablo"*, *"Hospital Ángeles"*) y el sistema entraba en `pendingDisambiguation`, dictar una nueva dirección o lugar (ej. *"No, en Sonora 120"*, *"Sonora 120"*, *"No, mejor a Bellas Artes"*, *"Es en Reforma 222"*) no rompía el estado.
+    * El código concatenaba a ciegas `${disambiguation.originalQuery} ${rawText}` generando cadenas inválidas (ej. *"Farmacia San Pablo Sonora 120"*). Al retornar 0 candidatos de geocodificación, el flujo caía en el mensaje repetitivo *"Por favor dígame cuál opción prefiere..."*, atrapando al adulto mayor en un bucle cerrado.
+  - **Mecanismo de Salto de Contexto y Ruptura**:
+    * **Caso A (Rectificación Explícita)**: Se evalúa de forma prioritaria `extractDestinationFromRectification(rawText, normalized)`. Si el usuario dice *"No, mejor a Bellas Artes"*, *"No, en Sonora 120"* o *"Es en Reforma 222"*, se limpia de inmediato `currentContext.pendingDisambiguation = null` y se delega el procesamiento hacia `processUserMessageLocal(nuevoDestino)`.
+    * **Caso D (Nueva Dirección Directa)**: Si el texto no es una opción ordinal (1, 2, 3), se evalúa con `extractDestination`. Si resuelve candidatos autónomos, se rompe la desambiguación y se inicia navegación al nuevo destino.
+    * **Caso F (Fallback Autónomo)**: Si la consulta combinada no devuelve resultados, se consulta `rawText` de forma aislada para resolver el lugar dictado en vez de repetir el menú de opciones.
+
+- [x] **TASK-59**: **Rectificación Directa de Direcciones Mexicanas en Confirmación (`pendingConfirmation`), Desacoplamiento de Alias y Prompt LLM Dinámico (`04-nlu-conversacional.md`, `02-ux-accesibilidad.md`, `05-voz-stt-tts.md`)**:
+  - **Diagnóstico de Confusión entre Alias y Rectificación**:
+    * En `pendingConfirmation`, cualquier destino que coincidiera parcialmente con un alias del sistema (ej. *"Farmacia San Pablo"* con el alias *"la farmacia"*) activaba la rama de actualización de alias si el usuario dictaba una dirección corta (`<35` caracteres).
+    * `mergeAddressAdjustmentHeuristic` usaba una expresión regular sin anclar (`/(\d+)/`), interpretando el número de la nueva calle (ej. el "120" de *"Sonora 120"*) como un ajuste de número exterior de la farmacia previa, generando el mensaje erróneo *"cambié al número 120: Av. Universidad 120... ¿Desea actualizar la dirección de la farmacia...?"*.
+    * Ante frases con preposición como *"No, en Sonora 120"*, `hasRectificationPattern` no incluía la preposición `en` ni el patrón de calle con número, por lo que `isNegativeOrCancel` detectaba `/^no\b/` y lo trataba como cancelación o caía en *"Para su seguridad, por favor dígame: ¿Desea iniciar el viaje a [Destino]? Puede decir 'Sí' o 'Cancelar'"*.
+  - **Implementación de Soluciones**:
+    * **Enriquecimiento de `hasRectificationPattern` y `extractDestinationFromRectification`**: Soporte para `/^(?:no\s*,?\s+)(?:en|a|al|hacia|para)\s+/i`, `/^(?:no\s*,?\s+)[a-z0-9\s]{2,}\s+\d+/i` (calles y números directos) y `/^(?:no\s*,?\s*)?(?:es\s+en|era\s+en|esta\s+en|en\s+realidad\s+es\s+en)\s+/i`.
+    * **Extensión de Longitud en `extractDestination`**: Detección de indicadores viales mexicanos (`calle`, `avenida`, `av`, `eje`, `calzada`, `colonia`, `número`, `sur`, `norte`, `roma`, `condesa`, etc.) permitiendo hasta **16 palabras** sin truncar direcciones compuestas, mientras se excluyen ordinales (`primera`, `segunda`, `opcion`).
+    * **Desacoplamiento de Alias (`isExplicitPersonalAlias`)**: Solo se desvía a la actualización de alias si el destino pendiente fue explícitamente guardado como alias personal del usuario o si el usuario dice expresamente *"la dirección es..."*, *"está mal la dirección"* o *"no es ahí"*. Frases de rectificación de destino como *"No, en Sonora 120"* se atienden siempre como cambio de ruta.
+    * **Anclaje Estricto en `mergeAddressAdjustmentHeuristic`**: Se exige que el ajuste numérico ocupe toda la cadena (`^...$`), impidiendo que nombres de calle con número sean absorbidos como números de casas anteriores.
+    * **Inyección de `pendingDisambiguation` en `buildDynamicContextPrompt`**: Serialización de candidatos activos en el System Prompt de Gemini y Groq, indicando al modelo que invoque `navegar_a(nuevo_destino)` si el usuario cambia de parecer.
+
+- [x] **TASK-60**: **Suite de Pruebas Automatizadas y Certificación de Calidad Fase 7 (`09-qa-accesibilidad.md`, `11-orquestador-pm.md`)**:
+  - Creación de [`test_disambiguation_breakout.ts`](file:///D:/Escom/Sexto%20semestre/Interacci%C3%B3n/AVAN/avan-mobile/test_disambiguation_breakout.ts) con 45 pruebas unitarias y de integración que certifican:
+    * Grupo 1: Reconocimiento y extracción precisa de rectificaciones y direcciones mexicanas extensas (100% pass).
+    * Grupo 2: Ruptura limpia del bucle de desambiguación con nuevas ubicaciones, manteniendo intactos los comandos de selección ordinal y cancelación (100% pass).
+    * Grupo 3: Rectificación unívoca y ambigua en confirmación sin cancelaciones accidentales ni secuestros de alias (100% pass).
+  - Integración en `package.json` (`npm run test:disambiguation-breakout` y `npm run test:all`).
+  - `npx tsc --noEmit`: 0 errores de compilación TypeScript.
+  - `npm run test:all`: 11 suites de prueba superadas al 100%.
