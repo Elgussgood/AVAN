@@ -19,12 +19,13 @@ import {
   aliasService,
 } from './aliasService';
 import {
-  orsService,
   DisambiguationCandidate,
   GeocodePrecision,
   StructuredAddressQuery,
   parseStructuredAddress,
 } from './orsService';
+import { callGeminiChat, getGeminiApiKey } from './geminiService';
+import { routingService } from './routingAdapter';
 
 // ============================================================================
 // CONFIGURACIÓN DE GROQ LLM
@@ -1903,7 +1904,7 @@ async function callGroqLLM(
   context: ConversationContext
 ): Promise<ConversationResponse | null> {
   const apiKey = process.env.EXPO_PUBLIC_GROQ_API_KEY;
-  if (!apiKey || apiKey.trim() === '') {
+  if ((!apiKey || apiKey.trim() === '') && !getGeminiApiKey()) {
     return null;
   }
 
@@ -1975,42 +1976,67 @@ async function callGroqLLM(
     content: userSpeechText,
   });
 
-  // 3. Ejecución de la llamada HTTP a Groq con AbortController para timeout
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
+  // 3. Cascada de LLM (TASK-48): Gemini 2.5 Flash -> Groq -> (el llamador cae al motor local)
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
   try {
-    const response = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages,
-        tools: AVAN_TOOLS,
-        tool_choice: 'auto',
-        temperature: 0.1,
-        max_tokens: 256,
-      }),
-      signal: controller.signal,
+    let message: { role?: string; content?: string | null; tool_calls?: GroqToolCall[] } | null = null;
+
+    // Nivel 1: Gemini (si hay clave y el circuit breaker está cerrado)
+    const geminiMessage = await callGeminiChat({
+      systemPrompt: dynamicContextPrompt,
+      messages: messages.filter((m) => m.role !== 'system') as Array<{ role: 'user' | 'assistant'; content: string }>,
+      tools: AVAN_TOOLS,
     });
+    if (geminiMessage) {
+      message = {
+        content: geminiMessage.content,
+        tool_calls: geminiMessage.tool_calls as GroqToolCall[] | undefined,
+      };
+    }
 
-    clearTimeout(timeoutId);
+    // Nivel 2: Groq (respaldo)
+    if (!message && apiKey && apiKey.trim() !== '') {
+      const controller = new AbortController();
+      timeoutId = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
 
-    if (!response.ok) {
-      console.warn(`Groq API respondió con estatus: ${response.status}`);
+      const response = await fetch(GROQ_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: GROQ_MODEL,
+          messages,
+          tools: AVAN_TOOLS,
+          tool_choice: 'auto',
+          temperature: 0.1,
+          max_tokens: 256,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        console.warn(`Groq API respondió con estatus: ${response.status}`);
+        return null;
+      }
+
+      const data: GroqChatCompletionResponse = await response.json();
+      const choice = data.choices?.[0];
+      if (!choice || !choice.message) {
+        return null;
+      }
+      message = choice.message;
+    }
+
+    // Nivel 3: sin respuesta de ningún LLM -> el llamador usa el motor local offline
+    if (!message) {
       return null;
     }
 
-    const data: GroqChatCompletionResponse = await response.json();
-    const choice = data.choices?.[0];
-    if (!choice || !choice.message) {
-      return null;
-    }
-
-    const message = choice.message;
     const rawContent = (message.content || '').trim();
     const toolCalls = message.tool_calls;
 
@@ -2050,7 +2076,7 @@ async function callGroqLLM(
         let precision: GeocodePrecision | undefined;
 
         try {
-          const geocoded = await orsService.geocodeDestination(
+          const geocoded = await routingService.geocodeDestination(
             normalizedAddr.structuredQuery || normalizedAddr.formattedSearchQuery,
             context.currentLocation
           );
@@ -2145,7 +2171,7 @@ async function callGroqLLM(
 
       if (!destCoords) {
         try {
-          const disambiguation = await orsService.getDisambiguationCandidates(
+          const disambiguation = await routingService.getDisambiguationCandidates(
             structuredDest.street ? structuredDest : destName,
             context.currentLocation,
             3
@@ -2477,7 +2503,7 @@ async function callGroqLLM(
           let aliasPrecision: GeocodePrecision | undefined;
 
           try {
-            const disambiguation = await orsService.getDisambiguationCandidates(
+            const disambiguation = await routingService.getDisambiguationCandidates(
               normalizedAddr.structuredQuery || normalizedAddr.formattedSearchQuery,
               context.currentLocation,
               3
@@ -2850,7 +2876,7 @@ async function processUserMessageLocal(
 
     // Caso C: El usuario dio una pista o colonia adicional
     const newCombinedQuery = `${disambiguation.originalQuery} ${rawText}`;
-    const newCandidatesResult = await orsService.getDisambiguationCandidates(
+    const newCandidatesResult = await routingService.getDisambiguationCandidates(
       newCombinedQuery,
       currentContext.currentLocation,
       3
@@ -3061,7 +3087,7 @@ async function processUserMessageLocal(
       let aliasPrecision: GeocodePrecision | undefined;
 
       try {
-        const disambiguation = await orsService.getDisambiguationCandidates(
+        const disambiguation = await routingService.getDisambiguationCandidates(
           normalizedAddr.structuredQuery || normalizedAddr.formattedSearchQuery,
           currentContext.currentLocation,
           3
@@ -3218,7 +3244,7 @@ async function processUserMessageLocal(
         let newFormatted = merged.formattedUserLabel;
 
         try {
-          const geocoded = await orsService.geocodeDestination(
+          const geocoded = await routingService.geocodeDestination(
             merged.formattedSearchQuery,
             currentContext.currentLocation
           );
@@ -3506,7 +3532,7 @@ async function processUserMessageLocal(
         let correctionPrecision: GeocodePrecision | undefined;
 
         try {
-          const geocoded = await orsService.geocodeDestination(
+          const geocoded = await routingService.geocodeDestination(
             formattedSearchQuery,
             currentContext.currentLocation
           );
@@ -3624,7 +3650,7 @@ async function processUserMessageLocal(
       let newCoords = aliasResult.coordinates;
       if (!newCoords) {
         try {
-          const disambiguation = await orsService.getDisambiguationCandidates(
+          const disambiguation = await routingService.getDisambiguationCandidates(
             resolvedTarget,
             currentContext.currentLocation,
             3
@@ -3925,7 +3951,7 @@ async function processUserMessageLocal(
 
     if (!destinationCoords) {
       try {
-        const disambiguation = await orsService.getDisambiguationCandidates(
+        const disambiguation = await routingService.getDisambiguationCandidates(
           structuredDest.street ? structuredDest : destinationName,
           currentContext.currentLocation,
           3

@@ -22,7 +22,8 @@ import {
   ConversationContext,
   buildDisambiguationSpokenPrompt,
 } from '../services/conversationService';
-import { orsService, StepInstruction, DisambiguationCandidate, GeocodePrecision } from '../services/orsService';
+import { StepInstruction, DisambiguationCandidate, GeocodePrecision } from '../services/orsService';
+import { routingService } from '../services/routingAdapter';
 import { LocationService } from '../services/locationService';
 import { AliasService } from '../services/aliasService';
 import { InteractiveMap } from '../components/InteractiveMap';
@@ -747,7 +748,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           }
 
           if (!targetCoords) {
-            const geocoded = await orsService.geocodeDestination(dest, startCoords);
+            const geocoded = await routingService.geocodeDestination(dest, startCoords);
             targetCoords = geocoded[0]?.coordinates || {
               latitude: 19.4352,
               longitude: -99.1412,
@@ -755,7 +756,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           }
 
           // 2. Calcular ruta vehicular con ORS
-          const routeResult = await orsService.getDirections(startCoords, targetCoords);
+          const routeResult = await routingService.getDirections(startCoords, targetCoords);
           const routeCoordinates = routeResult.coordinates.map((c) => ({
             latitude: c.latitude,
             longitude: c.longitude,

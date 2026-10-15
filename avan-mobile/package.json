@@ -43,7 +43,10 @@
     "test:precision": "npx tsx test_address_precision.ts",
     "test:disambiguation": "npx tsx test_disambiguation.ts",
     "test:navigation-fixes": "npx tsx test_navigation_fixes.ts",
-    "test:all": "npx tsx test_navigation_api_phase1.ts && npx tsx test_nlu_phase2.ts && npx tsx test_tts_cache.ts && npx tsx test_address_precision.ts && npx tsx test_disambiguation.ts && npx tsx test_navigation_fixes.ts"
+    "test:gemini": "npx tsx test_gemini_nlu.ts",
+    "test:google-maps": "npx tsx test_google_maps_routing.ts",
+    "test:failover": "npx tsx test_failover_resilience.ts",
+    "test:all": "npx tsx test_navigation_api_phase1.ts && npx tsx test_nlu_phase2.ts && npx tsx test_tts_cache.ts && npx tsx test_address_precision.ts && npx tsx test_disambiguation.ts && npx tsx test_navigation_fixes.ts && npx tsx test_gemini_nlu.ts && npx tsx test_google_maps_routing.ts && npx tsx test_failover_resilience.ts"
   },
   "private": true
 }

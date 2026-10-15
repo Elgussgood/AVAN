@@ -29,7 +29,8 @@ import {
 import { useLocationTracking } from '../hooks/useLocationTracking';
 import { LatLng } from 'react-native-maps';
 import * as Haptics from 'expo-haptics';
-import { orsService, StepInstruction } from '../services/orsService';
+import { StepInstruction } from '../services/orsService';
+import { routingService } from '../services/routingAdapter';
 import { LocationService } from '../services/locationService';
 import {
   NavigationService,
@@ -505,7 +506,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       const msg = `Recalculando la mejor ruta hacia ${targetDestination}, por favor continúe con precaución.`;
       VoiceService.speak(msg);
 
-      const routeResult = await orsService.getDirections(currentCoords, targetCoord);
+      const routeResult = await routingService.getDirections(currentCoords, targetCoord);
       const newCoords = routeResult.coordinates.map((c) => ({
         latitude: c.latitude,
         longitude: c.longitude,
@@ -727,13 +728,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         longitude: currentLoc.longitude,
       };
 
-      const geocoded = await orsService.geocodeDestination(newDest, startCoords);
+      const geocoded = await routingService.geocodeDestination(newDest, startCoords);
       const targetCoords = geocoded[0]?.coordinates || {
         latitude: 19.4352,
         longitude: -99.1412,
       };
 
-      const routeResult = await orsService.getDirections(startCoords, targetCoords);
+      const routeResult = await routingService.getDirections(startCoords, targetCoords);
       const newRouteCoordinates = routeResult.coordinates.map((c) => ({
         latitude: c.latitude,
         longitude: c.longitude,
