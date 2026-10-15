@@ -914,16 +914,41 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         onContextChange(response.updatedContext);
       }
 
-      // Si el NLU detectó que se desea registrar una dirección o alias
-      if (
-        response.updatedContext.pendingAliasRegistration ||
-        response.functionCall?.name === 'guardar_ubicacion'
-      ) {
+      // Si el NLU guardó directamente una ubicación o alias
+      if (response.functionCall?.name === 'guardar_ubicacion') {
         isFinishingTripRef.current = false;
-        const exitFn = onStopTrip || onCancelTrip;
-        if (exitFn) {
-          exitFn(response.updatedContext);
-        }
+        setVoiceState('speaking');
+        setStatusMessage(response.spokenText);
+        await VoiceService.speak(response.spokenText, () => {
+          setVoiceState('idle');
+          setStatusMessage(instruction || 'Ruta activa');
+        });
+        return;
+      }
+
+      // Si el NLU requiere dirección para registrar un alias
+      if (response.updatedContext.pendingAliasRegistration) {
+        isFinishingTripRef.current = false;
+        setVoiceState('speaking');
+        setStatusMessage(response.spokenText);
+        await VoiceService.speak(response.spokenText, async () => {
+          try {
+            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          } catch {}
+          setVoiceState('listening');
+          setStatusMessage('Diga la dirección o referencia...');
+          await AudioRecorderService.startRecording({
+            initialSilenceMs: 8000,
+            trailingSilenceMs: 1800,
+            onInitialSilenceTimeout: () => {
+              setVoiceState('idle');
+              setStatusMessage(instruction || 'Ruta activa');
+            },
+            onSpeechEnded: async (trans) => {
+              await handleNewDestination(trans?.text || '');
+            },
+          });
+        });
         return;
       }
 
@@ -1109,15 +1134,39 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       }
 
       // Salto de contexto hacia guardar ubicación
-      if (
-        response.updatedContext.pendingAliasRegistration ||
-        response.functionCall?.name === 'guardar_ubicacion'
-      ) {
+      if (response.functionCall?.name === 'guardar_ubicacion') {
         isFinishingTripRef.current = false;
-        const exitFn = onStopTrip || onCancelTrip;
-        if (exitFn) {
-          exitFn(response.updatedContext);
-        }
+        setVoiceState('speaking');
+        setStatusMessage(response.spokenText);
+        await VoiceService.speak(response.spokenText, () => {
+          setVoiceState('idle');
+          setStatusMessage(instruction || 'Ruta activa');
+        });
+        return;
+      }
+
+      if (response.updatedContext.pendingAliasRegistration) {
+        isFinishingTripRef.current = false;
+        setVoiceState('speaking');
+        setStatusMessage(response.spokenText);
+        await VoiceService.speak(response.spokenText, async () => {
+          try {
+            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          } catch {}
+          setVoiceState('listening');
+          setStatusMessage('Diga la dirección o referencia...');
+          await AudioRecorderService.startRecording({
+            initialSilenceMs: 8000,
+            trailingSilenceMs: 1800,
+            onInitialSilenceTimeout: () => {
+              setVoiceState('idle');
+              setStatusMessage(instruction || 'Ruta activa');
+            },
+            onSpeechEnded: async (trans) => {
+              await handleFinishContinuityResponse(trans?.text || '');
+            },
+          });
+        });
         return;
       }
 
@@ -1495,28 +1544,69 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           await VoiceService.speak(response.spokenText);
           await startNavigationToDestination(confirmedDest);
           return;
-        } else if (
-          response.functionCall.name === 'guardar_ubicacion' ||
-          response.updatedContext.pendingAliasRegistration
-        ) {
-          // Salto de contexto hacia registro de dirección
-          const exitFn = onStopTrip || onCancelTrip;
-          if (exitFn) {
-            exitFn(response.updatedContext);
-          }
+        } else if (response.functionCall.name === 'guardar_ubicacion') {
+          setVoiceState('speaking');
+          setStatusMessage(response.spokenText);
+          await VoiceService.speak(response.spokenText, () => {
+            setVoiceState('idle');
+            setStatusMessage(instruction || 'Ruta activa');
+          });
+          return;
+        } else if (response.updatedContext.pendingAliasRegistration) {
+          setVoiceState('speaking');
+          setStatusMessage(response.spokenText);
+          await VoiceService.speak(response.spokenText, async () => {
+            try {
+              await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+            } catch {}
+            setVoiceState('listening');
+            setStatusMessage('Diga la dirección o referencia...');
+            await AudioRecorderService.startRecording({
+              initialSilenceMs: 8000,
+              trailingSilenceMs: 1800,
+              onInitialSilenceTimeout: () => {
+                setVoiceState('idle');
+                setStatusMessage(instruction || 'Ruta activa');
+              },
+              onSpeechEnded: async (trans) => {
+                await processNavigationSpeech(trans?.text || '');
+              },
+            });
+          });
           return;
         }
       }
 
-      // Si el contexto trae pendingConfirmation o pendingAliasRegistration
-      if (
-        response.updatedContext.pendingConfirmation ||
-        response.updatedContext.pendingAliasRegistration
-      ) {
+      // Si el contexto trae pendingConfirmation de nuevo viaje
+      if (response.updatedContext.pendingConfirmation) {
         const exitFn = onStopTrip || onCancelTrip;
         if (exitFn) {
           exitFn(response.updatedContext);
         }
+        return;
+      }
+
+      if (response.updatedContext.pendingAliasRegistration) {
+        setVoiceState('speaking');
+        setStatusMessage(response.spokenText);
+        await VoiceService.speak(response.spokenText, async () => {
+          try {
+            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          } catch {}
+          setVoiceState('listening');
+          setStatusMessage('Diga la dirección o referencia...');
+          await AudioRecorderService.startRecording({
+            initialSilenceMs: 8000,
+            trailingSilenceMs: 1800,
+            onInitialSilenceTimeout: () => {
+              setVoiceState('idle');
+              setStatusMessage(instruction || 'Ruta activa');
+            },
+            onSpeechEnded: async (trans) => {
+              await processNavigationSpeech(trans?.text || '');
+            },
+          });
+        });
         return;
       }
 

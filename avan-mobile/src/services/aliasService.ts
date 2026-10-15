@@ -167,11 +167,6 @@ export class AliasService {
    */
   private async initializeStorage(): Promise<void> {
     try {
-      if (typeof window === 'undefined' && typeof (globalThis as any).nativeCallSyncHook === 'undefined') {
-        // En entorno Node/CLI de pruebas sin runtime nativo
-        this.isInitialized = true;
-        return;
-      }
       const stored = await AsyncStorage.getItem(STORAGE_KEY);
       if (stored) {
         const parsed: SavedAlias[] = JSON.parse(stored);
@@ -201,9 +196,6 @@ export class AliasService {
    */
   private async persistToLocal(): Promise<void> {
     try {
-      if (typeof window === 'undefined' && typeof (globalThis as any).nativeCallSyncHook === 'undefined') {
-        return;
-      }
       const list = Array.from(this.aliases.values());
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
     } catch (error) {
