@@ -434,14 +434,20 @@ export class AudioRecorderService {
         return null;
       }
 
-      const resolvedGroqKey =
+      const rawGroqKey = (
         apiKey ||
         process.env.EXPO_PUBLIC_GROQ_API_KEY ||
-        process.env.GROQ_API_KEY;
+        process.env.GROQ_API_KEY ||
+        ''
+      ).trim();
+      const resolvedGroqKey = rawGroqKey && !rawGroqKey.includes('TU_API_KEY') ? rawGroqKey : '';
 
-      const resolvedOpenAIKey =
+      const rawOpenAIKey = (
         process.env.EXPO_PUBLIC_OPENAI_API_KEY ||
-        process.env.OPENAI_API_KEY;
+        process.env.OPENAI_API_KEY ||
+        ''
+      ).trim();
+      const resolvedOpenAIKey = rawOpenAIKey && !rawOpenAIKey.includes('TU_API_KEY') ? rawOpenAIKey : '';
 
       // Si no se cuenta con API key de Groq ni OpenAI, no devolver texto simulado falso
       if (!resolvedGroqKey && !resolvedOpenAIKey) {

@@ -1954,8 +1954,9 @@ async function callGroqLLM(
   userSpeechText: string,
   context: ConversationContext
 ): Promise<ConversationResponse | null> {
-  const apiKey = process.env.EXPO_PUBLIC_GROQ_API_KEY;
-  if ((!apiKey || apiKey.trim() === '') && !getGeminiApiKey()) {
+  const rawGroqKey = (process.env.EXPO_PUBLIC_GROQ_API_KEY || '').trim();
+  const apiKey = rawGroqKey && !rawGroqKey.includes('TU_API_KEY') ? rawGroqKey : '';
+  if (!apiKey && !getGeminiApiKey()) {
     return null;
   }
 
@@ -2013,7 +2014,7 @@ async function callGroqLLM(
   }
 
   if (aliasesList) {
-    dynamicContextPrompt += `\n\nALIAS GUARDADOS DEL USUARIO (úsales para resolver destinos):\n${aliasesList}`;
+    dynamicContextPrompt += `\n\nALIAS GUARDADOS DEL USUARIO (si el usuario pide ir a uno de estos lugares o personas con cualquier variación como "con mi...", "a casa de mi...", invoca 'navegar_a' pasando como 'destino' el nombre exacto del alias entre comillas):\n${aliasesList}`;
   }
 
   // 2. Historial de mensajes recientes (sin duplicar el mensaje actual recién añadido)
@@ -2207,7 +2208,10 @@ async function callGroqLLM(
         };
       }
 
-      const aliasRes = AliasService.resolveDestinationWithAlias(rawDest);
+      const primaryAliasRes = AliasService.resolveDestinationWithAlias(rawDest);
+      const aliasRes = primaryAliasRes.isAlias
+        ? primaryAliasRes
+        : AliasService.resolveDestinationWithAlias(userSpeechText);
 
       // VERIFICACIÓN CRÍTICA: ¿Es un lugar personal o alias no registrado?
       const isPersonal =
@@ -4765,6 +4769,9 @@ export async function processUserMessage(
   userSpeechText: string,
   context?: ConversationContext
 ): Promise<ConversationResponse> {
+  // Asegurar que todos los alias guardados en AsyncStorage estén cargados en memoria antes de evaluar
+  await AliasService.ensureInitialized();
+
   const currentContext: ConversationContext = {
     userName: context?.userName || 'Gustavo',
     currentLocation: context?.currentLocation,

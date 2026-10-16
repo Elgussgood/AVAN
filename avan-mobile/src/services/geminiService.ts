@@ -83,7 +83,8 @@ function registerFailure(status?: number): void {
 
 export function getGeminiApiKey(): string | null {
   const key = (process.env.EXPO_PUBLIC_GEMINI_API_KEY || '').trim();
-  return key.length > 0 ? key : null;
+  if (!key || key.includes('TU_API_KEY')) return null;
+  return key;
 }
 
 export function getGeminiModel(): string {

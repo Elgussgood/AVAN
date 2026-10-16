@@ -581,14 +581,16 @@ export class OpenRouteService {
   }
 
   constructor(apiKey?: string) {
-    this.apiKey = apiKey || process.env.EXPO_PUBLIC_ORS_API_KEY || '';
+    const rawKey = (apiKey || process.env.EXPO_PUBLIC_ORS_API_KEY || '').trim();
+    this.apiKey = rawKey.includes('TU_API_KEY') ? '' : rawKey;
   }
 
   /**
    * Permite actualizar la clave de API en tiempo de ejecución.
    */
   public setApiKey(key: string): void {
-    this.apiKey = key.trim();
+    const trimmed = key.trim();
+    this.apiKey = trimmed.includes('TU_API_KEY') ? '' : trimmed;
   }
 
   /**

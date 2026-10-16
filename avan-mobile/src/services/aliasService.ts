@@ -57,9 +57,10 @@ function normalizeForSearch(text: string): string {
 function extractCoreTokens(text: string): string[] {
   const stopWords = new Set([
     'a', 'al', 'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas',
-    'de', 'del', 'con', 'en', 'para', 'por', 'hacia', 'donde',
+    'de', 'del', 'con', 'en', 'para', 'por', 'hacia', 'donde', 'lo',
     'mi', 'mis', 'tu', 'tus', 'su', 'sus', 'nuestro', 'nuestra',
-    'ir', 'vamos', 'llevame', 'llevarme', 'viajar', 'navegar', 'quiero'
+    'ir', 'vamos', 'llevame', 'llevarme', 'viajar', 'navegar', 'quiero', 'quisiera',
+    'casa', 'hogar', 'depa', 'departamento', 'domicilio', 'residencia', 'lugar', 'sitio'
   ]);
   return normalizeForSearch(text)
     .split(/\s+/)
@@ -124,6 +125,7 @@ export class AliasService {
   private isInitialized: boolean = false;
   private isSyncing: boolean = false;
   private initPromise: Promise<void> | null = null;
+  private modifiedBeforeInitIds: Set<string> = new Set();
 
   private constructor() {
     this.preloadDefaults();
@@ -172,8 +174,13 @@ export class AliasService {
         const parsed: SavedAlias[] = JSON.parse(stored);
         if (Array.isArray(parsed) && parsed.length > 0) {
           parsed.forEach((alias) => {
-            this.aliases.set(alias.id, alias);
+            if (!this.modifiedBeforeInitIds.has(alias.id)) {
+              this.aliases.set(alias.id, alias);
+            }
           });
+        }
+        if (this.modifiedBeforeInitIds.size > 0) {
+          await this.persistToLocal();
         }
       } else {
         // Primera ejecución: guardar los valores por defecto en AsyncStorage
@@ -292,10 +299,16 @@ export class AliasService {
 
     const normalizedQuery = normalizeForSearch(aliasQuery);
 
-    // 1. Coincidencia exacta por ID o por alias normalizado
+    // 1. Coincidencia exacta por ID, por alias normalizado, por nombre o por dirección exacta (cuando el LLM resuelve el alias)
     for (const item of this.aliases.values()) {
       const normalizedItemAlias = normalizeForSearch(item.alias);
-      if (normalizedQuery === normalizedItemAlias) {
+      const normalizedItemName = normalizeForSearch(item.name);
+      const normalizedItemAddress = normalizeForSearch(item.address);
+      if (
+        normalizedQuery === normalizedItemAlias ||
+        normalizedQuery === normalizedItemName ||
+        (normalizedItemAddress.length > 5 && normalizedQuery === normalizedItemAddress)
+      ) {
         return item;
       }
     }
@@ -481,12 +494,20 @@ export class AliasService {
     };
 
     // 1. Guardar en memoria
+    if (!this.isInitialized) {
+      this.modifiedBeforeInitIds.add(id);
+    }
     this.aliases.set(id, newAlias);
 
-    // 2. Persistir localmente en AsyncStorage
-    this.persistToLocal().catch((err) => {
-      console.warn('[AliasService] Error al guardar en AsyncStorage:', err);
-    });
+    // 2. Persistir localmente en AsyncStorage asegurando que la lectura inicial haya concluido
+    (async () => {
+      try {
+        await this.ensureInitialized();
+        await this.persistToLocal();
+      } catch (err) {
+        console.warn('[AliasService] Error al guardar en AsyncStorage:', err);
+      }
+    })();
 
     // 3. Sincronizar con Supabase en la nube en segundo plano
     const supabase = SupabaseService.getClient();

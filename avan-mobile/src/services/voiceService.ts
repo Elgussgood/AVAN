@@ -189,18 +189,24 @@ export class VoiceService {
     // Registrar el ID único para esta nueva alocución
     const utteranceId = ++this.activeUtteranceId;
 
+    const rawElevenKey = (
+      typeof process !== 'undefined' && process.env
+        ? process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY || process.env.ELEVENLABS_API_KEY || ''
+        : ''
+    ).trim();
     const elevenLabsExplicitKey =
-      (typeof process !== 'undefined' && process.env
-        ? process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY || process.env.ELEVENLABS_API_KEY
-        : undefined);
+      rawElevenKey && !rawElevenKey.includes('TU_API_KEY') ? rawElevenKey : undefined;
 
-    const resolvedApiKey =
+    const rawCandidateKey = (
       apiKey ||
       this.customApiKey ||
       elevenLabsExplicitKey ||
       (typeof process !== 'undefined' && process.env
-        ? process.env.EXPO_PUBLIC_OPENAI_API_KEY || process.env.OPENAI_API_KEY
-        : undefined);
+        ? process.env.EXPO_PUBLIC_OPENAI_API_KEY || process.env.OPENAI_API_KEY || ''
+        : '')
+    ).trim();
+    const resolvedApiKey =
+      rawCandidateKey && !rawCandidateKey.includes('TU_API_KEY') ? rawCandidateKey : undefined;
 
     this.isSpeakingState = true;
 
