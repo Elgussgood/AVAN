@@ -14,8 +14,9 @@
  */
 
 export const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-export const GEMINI_DEFAULT_MODEL = 'gemini-2.5-flash';
-export const GEMINI_TIMEOUT_MS = 3500;
+export const GEMINI_DEFAULT_MODEL = 'gemini-3.5-flash';
+export const GEMINI_FALLBACK_MODELS = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash'] as const;
+export const GEMINI_TIMEOUT_MS = 9000;
 
 export interface GeminiToolInput {
   type: 'function';
@@ -69,10 +70,10 @@ function registerFailure(status?: number): void {
   consecutiveFailures += 1;
   if (status === 429) {
     tripBreaker(60_000); // cuota: esperar 1 min
-  } else if (status === 400 || status === 401 || status === 403 || status === 404) {
-    tripBreaker(10 * 60_000); // clave/modelo/solicitud inválida: no insistir
+  } else if (status === 401 || status === 403) {
+    tripBreaker(10 * 60_000); // clave inválida: no insistir
   } else if (consecutiveFailures >= 3) {
-    tripBreaker(30_000); // red/servidor inestable
+    tripBreaker(30_000); // red/servidor inestable tras agotar reintentos
   }
 }
 
@@ -179,9 +180,8 @@ export interface GeminiChatParams {
 }
 
 /**
- * Llama a Gemini con Function Calling. Devuelve `null` ante cualquier fallo
- * (sin clave, circuito abierto, timeout, cuota, respuesta vacía) para que el
- * llamador conmute al siguiente nivel de la cascada.
+ * Llama a Gemini con Function Calling e intenta modelos de respaldo (3.5-flash -> 3.5-flash-lite)
+ * si hay saturación temporal (503) o demora. Devuelve `null` solo si todos los intentos fallan.
  */
 export async function callGeminiChat(params: GeminiChatParams): Promise<NormalizedLLMMessage | null> {
   const apiKey = getGeminiApiKey();
@@ -191,51 +191,75 @@ export async function callGeminiChat(params: GeminiChatParams): Promise<Normaliz
   const contents = convertMessagesToGeminiContents(params.messages);
   if (contents.length === 0) return null;
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), params.timeoutMs ?? GEMINI_TIMEOUT_MS);
+  const primaryModel = getGeminiModel();
+  const modelsToTry = [
+    primaryModel,
+    ...GEMINI_FALLBACK_MODELS.filter((m) => m !== primaryModel),
+  ];
 
-  try {
-    const response = await fetch(`${GEMINI_API_BASE}/${getGeminiModel()}:generateContent`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey, // cabecera: la clave no queda en URLs/logs
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: params.systemPrompt }] },
-        contents,
-        tools: convertToolsToGemini(params.tools),
-        toolConfig: { functionCallingConfig: { mode: 'AUTO' } },
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 512,
-          thinkingConfig: { thinkingBudget: 0 }, // sin "pensar": latencia mínima para voz
+  const payloadBody = JSON.stringify({
+    systemInstruction: { parts: [{ text: params.systemPrompt }] },
+    contents,
+    tools: convertToolsToGemini(params.tools),
+    toolConfig: { functionCallingConfig: { mode: 'AUTO' } },
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: 2048,
+    },
+  });
+
+  let lastStatus: number | undefined;
+
+  for (const modelName of modelsToTry) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), params.timeoutMs ?? GEMINI_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(`${GEMINI_API_BASE}/${modelName}:generateContent`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
         },
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
+        body: payloadBody,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
 
-    if (!response.ok) {
-      console.warn(`[geminiService] Gemini respondió con estatus ${response.status}`);
-      registerFailure(response.status);
-      return null;
+      if (!response.ok) {
+        lastStatus = response.status;
+        console.warn(`[geminiService] Gemini (${modelName}) respondió con estatus ${response.status}`);
+        // Si la clave es inválida (401/403), no reintentar otros modelos
+        if (response.status === 401 || response.status === 403) {
+          registerFailure(response.status);
+          return null;
+        }
+        // Si es 503 (alta demanda), 404 o 429, intentar el siguiente modelo ligero de Gemini
+        continue;
+      }
+
+      const data = await response.json();
+      const parsed = parseGeminiResponse(data);
+      if (!parsed) {
+        console.warn(
+          `[geminiService] Respuesta de Gemini (${modelName}) vacía o bloqueada:`,
+          data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason
+        );
+        continue;
+      }
+
+      consecutiveFailures = 0;
+      return parsed;
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+      console.warn(
+        `[geminiService] Fallo o timeout en Gemini (${modelName}):`,
+        error?.name === 'AbortError' ? 'timeout' : error?.message || error
+      );
+      // Intentar el siguiente modelo (ej. gemini-3.5-flash-lite)
     }
-
-    const data = await response.json();
-    const parsed = parseGeminiResponse(data);
-    if (!parsed) {
-      console.warn('[geminiService] Respuesta de Gemini vacía o bloqueada:', data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason);
-      registerFailure();
-      return null;
-    }
-
-    consecutiveFailures = 0;
-    return parsed;
-  } catch (error: any) {
-    clearTimeout(timeoutId);
-    console.warn('[geminiService] Fallo o timeout en Gemini:', error?.name === 'AbortError' ? 'timeout' : error?.message || error);
-    registerFailure();
-    return null;
   }
+
+  registerFailure(lastStatus);
+  return null;
 }

@@ -24,6 +24,7 @@ import { AudioRecorderService } from '../services/audioRecorder';
 import {
   ConversationService,
   ConversationContext,
+  detectZoomDirection,
   detectZoomIntensity,
 } from '../services/conversationService';
 import { useLocationTracking } from '../hooks/useLocationTracking';
@@ -1334,24 +1335,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     const lowerText = cleanText.toLowerCase();
+    const normSpeech = cleanSpeech(cleanText);
 
-    // Manejo directo de comandos de mapa frecuentes en marcha con detección de intensidad
-    const zoomIntensity = detectZoomIntensity(lowerText);
+    // Manejo directo de comandos de mapa frecuentes en marcha con detección de dirección e intensidad
+    const zoomDir = detectZoomDirection(normSpeech);
+    const zoomIntensity = detectZoomIntensity(normSpeech);
 
-    if (
-      lowerText.includes('acercar') ||
-      lowerText.includes('acerca') ||
-      lowerText.includes('cerca') ||
-      lowerText.includes('mas grande') ||
-      lowerText.includes('haz zoom') ||
-      lowerText.includes('ampliar') ||
-      lowerText.includes('amplia') ||
-      (lowerText.includes('zoom') && !lowerText.includes('alejar') && !lowerText.includes('menos zoom'))
-    ) {
+    if (zoomDir === 'acercar') {
       mapRef.current?.zoomIn(zoomIntensity);
       const responseText =
         zoomIntensity === 'mucho'
-          ? 'Acercando ampliamente el mapa.'
+          ? 'Acercando bastante el mapa para ver el máximo detalle.'
           : zoomIntensity === 'poco'
           ? 'Acercando un poco el mapa.'
           : 'Acercando el mapa.';
@@ -1364,16 +1358,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    if (
-      lowerText.includes('alejar') ||
-      lowerText.includes('aleja') ||
-      lowerText.includes('lejos') ||
-      lowerText.includes('mas pequeno') ||
-      lowerText.includes('menos zoom') ||
-      lowerText.includes('reducir') ||
-      lowerText.includes('vista general') ||
-      lowerText.includes('vista amplia')
-    ) {
+    if (zoomDir === 'alejar') {
       mapRef.current?.zoomOut(zoomIntensity);
       const responseText =
         zoomIntensity === 'mucho'
@@ -1390,16 +1375,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       return;
     }
 
-    if (
-      lowerText.includes('centrar') ||
-      lowerText.includes('centra') ||
-      lowerText.includes('dónde estoy') ||
-      lowerText.includes('donde estoy') ||
-      lowerText.includes('ubicar') ||
-      lowerText.includes('ubicame') ||
-      lowerText.includes('mi ubicacion') ||
-      lowerText.includes('mi ubicación')
-    ) {
+    if (zoomDir === 'centrar') {
       handleRecenter();
       const responseText = 'Centrando el mapa en su vehículo con la vista estándar.';
       setVoiceState('speaking');

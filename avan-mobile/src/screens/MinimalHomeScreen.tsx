@@ -712,7 +712,15 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           response.functionCall.args.destino ||
           previousPendingConfirmation?.destination ||
           response.updatedContext.activeRoute?.destination ||
-          'Hospital General';
+          '';
+
+        if (!dest) {
+          const askDestMsg = 'Por favor indíqueme a qué destino desea iniciar el viaje.';
+          setSpokenMessage(askDestMsg);
+          setVoiceState('speaking');
+          await VoiceService.speak(askDestMsg, () => setVoiceState('idle'));
+          return;
+        }
 
         setIsLoadingTrip(true);
         setLoadingDestination(dest);
@@ -737,7 +745,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           };
           setSpokenMessage(`Calculando la mejor ruta hacia ${dest}...`);
 
-          // 1. Obtener coordenadas destino con máxima resiliencia
+          // 1. Obtener coordenadas destino reales (esperando y reintentando en vez de usar coordenadas inventadas)
           const args = response.functionCall.args as any;
           if (args?.latitud && args?.longitud) {
             targetCoords = {
@@ -757,19 +765,49 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
           }
 
           if (!targetCoords) {
+            setSpokenMessage(`Verificando la ubicación exacta de ${dest}, un momento por favor...`);
             const geocoded = await routingService.geocodeDestination(dest, startCoords);
             targetCoords = geocoded[0]?.coordinates || null;
           }
 
+          // Si tras los reintentos de geocodificación no hay coordenadas reales, NO avanzar con coordenadas falsas
           if (!targetCoords) {
-            targetCoords = {
-              latitude: 19.4352,
-              longitude: -99.1412,
-            };
+            setIsLoadingTrip(false);
+            contextRef.current.activeRoute = null;
+            contextRef.current.pendingConfirmation = previousPendingConfirmation;
+            setCurrentContext({ ...contextRef.current });
+            const retryCoordMsg = `No logré confirmar la ubicación exacta de ${dest} por la señal de red. Por favor diga la dirección o intente nuevamente.`;
+            setSpokenMessage(retryCoordMsg);
+            setVoiceState('speaking');
+            await VoiceService.speak(retryCoordMsg, () => setVoiceState('idle'));
+            return;
           }
 
-          // 2. Calcular ruta vehicular con motor unificado (Google / ORS)
-          const routeResult = await routingService.getDirections(startCoords, targetCoords);
+          // 2. Calcular ruta vehicular real con espera y reintento si la red demora
+          let routeResult = await routingService.getDirections(startCoords, targetCoords);
+          if (routeResult.isFallback) {
+            setSpokenMessage(`Esperando respuesta del servidor de rutas hacia ${dest}, un momento por favor...`);
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            routeResult = await routingService.getDirections(startCoords, targetCoords);
+          }
+
+          // Si sigue siendo ruta simulada (sin red real), mantener al usuario en espera segura en vez de abrir ruta ficticia
+          if (routeResult.isFallback) {
+            setIsLoadingTrip(false);
+            contextRef.current.activeRoute = null;
+            contextRef.current.pendingConfirmation = previousPendingConfirmation || {
+              destination: dest,
+              coordinates: targetCoords,
+              timestamp: Date.now(),
+            };
+            setCurrentContext({ ...contextRef.current });
+            const waitNetMsg = `La conexión de red tardó en responder para trazar la ruta hacia ${dest}. Diga "Sí" para volver a intentarlo.`;
+            setSpokenMessage(waitNetMsg);
+            setVoiceState('speaking');
+            await VoiceService.speak(waitNetMsg, () => setVoiceState('idle'));
+            return;
+          }
+
           const routeCoordinates = routeResult.coordinates.map((c) => ({
             latitude: c.latitude,
             longitude: c.longitude,
@@ -807,30 +845,19 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
         } catch (error) {
           console.warn('Error al calcular ruta vehicular:', error);
           setIsLoadingTrip(false);
-          if (addressPromptTimeoutRef.current) {
-            clearTimeout(addressPromptTimeoutRef.current);
-            addressPromptTimeoutRef.current = null;
-          }
-          contextRef.current.pendingAliasRegistration = null;
-          contextRef.current.pendingConfirmation = null;
+          contextRef.current.activeRoute = null;
+          contextRef.current.pendingConfirmation = previousPendingConfirmation || (targetCoords ? {
+            destination: dest,
+            coordinates: targetCoords,
+            timestamp: Date.now(),
+          } : null);
+          setCurrentContext({ ...contextRef.current });
           await VoiceService.stop();
 
-          // Red de seguridad infalible: generar ruta de emergencia para que la vista de mapa nunca quede vacía
-          const fallbackStart = contextRef.current.currentLocation || { latitude: 19.4326, longitude: -99.1332 };
-          const fallbackDest = targetCoords || { latitude: 19.4352, longitude: -99.1412 };
-          const emergencyRoute = orsService.generateFallbackRoute(fallbackStart, fallbackDest);
-          const emergencyRouteData: RouteData = {
-            routeCoordinates: emergencyRoute.coordinates,
-            destinationCoords: fallbackDest,
-            instruction: emergencyRoute.steps[0]?.instruction || `Continúa hacia ${dest}`,
-            distance: emergencyRoute.distance,
-            duration: emergencyRoute.duration,
-            steps: emergencyRoute.steps,
-          };
-
-          if (onStartTrip) {
-            onStartTrip(dest, emergencyRouteData);
-          }
+          const errWaitMsg = `Hubo una demora en la red al calcular la ruta hacia ${dest}. Diga "Sí" cuando desee reintentarlo.`;
+          setSpokenMessage(errWaitMsg);
+          setVoiceState('speaking');
+          await VoiceService.speak(errWaitMsg, () => setVoiceState('idle'));
         }
         return;
       }
@@ -1062,7 +1089,7 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     }
 
     if (currentContext.pendingAliasRegistration?.step === 'confirming_address') {
-      return 'Diga "Sí" para confirmar o "No" para corregir';
+      return 'Diga "Sí" para guardar o dicte otra dirección';
     }
 
     if (currentContext.pendingAliasRegistration?.step === 'awaiting_address') {
@@ -1070,11 +1097,11 @@ export const MinimalHomeScreen: React.FC<MinimalHomeScreenProps> = ({
     }
 
     if (currentContext.pendingConfirmation) {
-      return 'Diga "Sí" para confirmar o "Cancelar" para detener';
+      return 'Diga "Sí" para iniciar o dicte otro destino';
     }
 
     if (currentContext.pendingDisambiguation) {
-      return 'Diga el número, la zona o toque una de las opciones';
+      return 'Elija una opción o dicte otra dirección';
     }
 
     if (currentContext.pendingTripCompletion) {

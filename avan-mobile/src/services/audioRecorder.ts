@@ -443,14 +443,11 @@ export class AudioRecorderService {
         process.env.EXPO_PUBLIC_OPENAI_API_KEY ||
         process.env.OPENAI_API_KEY;
 
-      // Si no se cuenta con API key de Groq ni OpenAI, retornamos transcripción simulada para dev
+      // Si no se cuenta con API key de Groq ni OpenAI, no devolver texto simulado falso
       if (!resolvedGroqKey && !resolvedOpenAIKey) {
-        this.status = 'idle';
-        return {
-          text: 'Quiero ir al hospital general',
-          durationMs,
-          isSimulated: true,
-        };
+        console.warn('[AudioRecorder] No se encontró EXPO_PUBLIC_GROQ_API_KEY ni EXPO_PUBLIC_OPENAI_API_KEY para transcribir.');
+        this.status = 'error';
+        return null;
       }
 
       // Usar Groq Whisper (ultra-rápido) si está configurado, o OpenAI Whisper
@@ -460,53 +457,64 @@ export class AudioRecorderService {
 
       const keyToUse = resolvedGroqKey || resolvedOpenAIKey;
 
-      // Envío con UploadTask de expo-file-system para evitar "Unsupported FormDataPart implementation"
+      // Envío con espera y reintento automático (hasta 2 intentos) para tolerar microcortes de red antes de borrar el archivo
       let uploadResult: { status: number; body: string } | null = null;
 
-      try {
-        const file = new File(uri);
-        const uploadTask = new UploadTask(file, endpoint, {
-          httpMethod: 'POST',
-          uploadType: UploadType.MULTIPART,
-          fieldName: 'file',
-          mimeType: 'audio/m4a',
-          headers: {
-            Authorization: `Bearer ${keyToUse}`,
-          },
-          parameters: {
-            model: resolvedGroqKey ? 'whisper-large-v3-turbo' : 'whisper-1',
-            language: 'es',
-            response_format: 'json',
-            temperature: '0',
-            prompt: 'Comandos breves de navegación vehicular AVAN en español. Si solo hay silencio, ruido de motor o ambiente de auto, responde exactamente vacío.',
-          },
-        });
-
-        uploadResult = await uploadTask.uploadAsync();
-      } catch (uploadErr) {
-        console.warn('[AudioRecorder] UploadTask error, intentando fallback con legacy uploadAsync:', uploadErr);
+      for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          const legacyFS = require('expo-file-system/legacy');
-          if (legacyFS?.uploadAsync) {
-            uploadResult = await legacyFS.uploadAsync(endpoint, uri, {
-              httpMethod: 'POST',
-              uploadType: legacyFS.FileSystemUploadType.MULTIPART,
-              fieldName: 'file',
-              mimeType: 'audio/m4a',
-              headers: {
-                Authorization: `Bearer ${keyToUse}`,
-              },
-              parameters: {
-                model: resolvedGroqKey ? 'whisper-large-v3-turbo' : 'whisper-1',
-                language: 'es',
-                response_format: 'json',
-                temperature: '0',
-                prompt: 'Comandos breves de navegación vehicular AVAN en español. Si solo hay silencio, ruido de motor o ambiente de auto, responde exactamente vacío.',
-              },
-            });
+          const file = new File(uri);
+          const uploadTask = new UploadTask(file, endpoint, {
+            httpMethod: 'POST',
+            uploadType: UploadType.MULTIPART,
+            fieldName: 'file',
+            mimeType: 'audio/m4a',
+            headers: {
+              Authorization: `Bearer ${keyToUse}`,
+            },
+            parameters: {
+              model: resolvedGroqKey ? 'whisper-large-v3-turbo' : 'whisper-1',
+              language: 'es',
+              response_format: 'json',
+              temperature: '0',
+              prompt: 'Comandos breves de navegación vehicular AVAN en español. Si solo hay silencio, ruido de motor o ambiente de auto, responde exactamente vacío.',
+            },
+          });
+
+          uploadResult = await uploadTask.uploadAsync();
+        } catch (uploadErr) {
+          console.warn(`[AudioRecorder] UploadTask error (intento ${attempt}), intentando fallback con legacy uploadAsync:`, uploadErr);
+          try {
+            const legacyFS = require('expo-file-system/legacy');
+            if (legacyFS?.uploadAsync) {
+              uploadResult = await legacyFS.uploadAsync(endpoint, uri, {
+                httpMethod: 'POST',
+                uploadType: legacyFS.FileSystemUploadType.MULTIPART,
+                fieldName: 'file',
+                mimeType: 'audio/m4a',
+                headers: {
+                  Authorization: `Bearer ${keyToUse}`,
+                },
+                parameters: {
+                  model: resolvedGroqKey ? 'whisper-large-v3-turbo' : 'whisper-1',
+                  language: 'es',
+                  response_format: 'json',
+                  temperature: '0',
+                  prompt: 'Comandos breves de navegación vehicular AVAN en español. Si solo hay silencio, ruido de motor o ambiente de auto, responde exactamente vacío.',
+                },
+              });
+            }
+          } catch (legacyErr) {
+            console.warn(`[AudioRecorder] Error en fallback legacy uploadAsync (intento ${attempt}):`, legacyErr);
           }
-        } catch (legacyErr) {
-          console.warn('[AudioRecorder] Error en fallback legacy uploadAsync:', legacyErr);
+        }
+
+        if (uploadResult && uploadResult.status >= 200 && uploadResult.status < 300) {
+          break;
+        }
+
+        if (attempt < 2) {
+          console.log('[AudioRecorder] Esperando 1000ms para reintentar transcripción de audio...');
+          await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       }
 
@@ -529,7 +537,7 @@ export class AudioRecorderService {
         };
       } else {
         console.warn(
-          'Error en respuesta de Whisper:',
+          'Error en respuesta de Whisper tras reintentos:',
           uploadResult?.status,
           uploadResult?.body
         );

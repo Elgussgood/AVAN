@@ -11,6 +11,7 @@ import {
   resolveDisambiguationSelection,
   ConversationContext,
 } from './src/services/conversationService';
+import { AliasService } from './src/services/aliasService';
 
 async function runTests() {
   console.log('====================================================');
@@ -221,6 +222,85 @@ async function runTests() {
   } catch (err: any) {
     console.warn('Error en prueba de geocodificación en vivo:', err.message || err);
   }
+
+  // --------------------------------------------------------------------------
+  // TEST 7: Regresión de Flujo de Registro de Alias y Cambio en 1 Paso
+  // --------------------------------------------------------------------------
+  console.log('\n--- TEST 7: Regresión de Flujo de Registro de Alias y Cambio Directo en 1 Paso ---');
+
+  // 7.1 En lista de desambiguación, dictar nueva dirección con número o colonia NO debe elegir falsamente una opción
+  const noFalseSelect = resolveDisambiguationSelection(
+    'Sonora 120, Cuauhtémoc',
+    'sonora 120 cuauhtemoc',
+    mockCandidates
+  );
+  assert(
+    noFalseSelect === null,
+    'Dictar nueva dirección "Sonora 120, Cuauhtémoc" en lista de desambiguación NO selecciona falsamente por token compartido'
+  );
+
+  const noFalseSelectEje = resolveDisambiguationSelection(
+    'Eje 1 Norte 200',
+    'eje 1 norte 200',
+    mockCandidates
+  );
+  assert(
+    noFalseSelectEje === null,
+    'Dictar "Eje 1 Norte 200" en lista de desambiguación NO selecciona falsamente la opción 1 por el dígito "1"'
+  );
+
+  // 7.2 Flujo completo de registro de alias nuevo -> cambio directo de ubicación en 1 paso -> confirmación y guardado
+  let aliasFlowCtx: ConversationContext = {
+    userName: 'Gustavo',
+    currentLocation: { latitude: 19.4326, longitude: -99.1332 },
+  };
+
+  const step1 = await ConversationService.processUserMessage('llévame a casa de mi sobrino Luis', aliasFlowCtx);
+  aliasFlowCtx = step1.updatedContext;
+  assert(
+    Boolean(aliasFlowCtx.pendingAliasRegistration) &&
+      aliasFlowCtx.pendingAliasRegistration?.step === 'awaiting_address',
+    `Paso 1 (alias no registrado): entra a pendingAliasRegistration (step='awaiting_address') para "${aliasFlowCtx.pendingAliasRegistration?.aliasName}"`
+  );
+
+  const step2 = await ConversationService.processUserMessage('Palacio de Bellas Artes', aliasFlowCtx);
+  aliasFlowCtx = step2.updatedContext;
+  assert(
+    Boolean(aliasFlowCtx.pendingAliasRegistration) &&
+      aliasFlowCtx.pendingAliasRegistration?.step === 'confirming_address' &&
+      !aliasFlowCtx.pendingConfirmation,
+    `Paso 2 (proporciona ubicación): pasa a confirming_address para guardar el alias (NO a confirmación de viaje normal)`
+  );
+
+  // Cambio directo en 1 solo paso durante confirming_address (sin decir "No" primero)
+  const step3 = await ConversationService.processUserMessage('Museo Soumaya', aliasFlowCtx);
+  aliasFlowCtx = step3.updatedContext;
+  assert(
+    Boolean(aliasFlowCtx.pendingAliasRegistration) &&
+      aliasFlowCtx.pendingAliasRegistration?.step === 'confirming_address' &&
+      Boolean(aliasFlowCtx.pendingAliasRegistration?.addressCandidate?.toLowerCase().includes('soumaya')),
+    `Paso 3 (cambio directo en 1 paso durante confirming_address): actualiza a "${aliasFlowCtx.pendingAliasRegistration?.addressCandidate}" conservando el registro del alias`
+  );
+
+  // Confirmar guardado con "Sí"
+  const step4 = await ConversationService.processUserMessage('Sí', aliasFlowCtx);
+  aliasFlowCtx = step4.updatedContext;
+  const savedSobrino = AliasService.getAlias('casa de mi sobrino Luis');
+  assert(
+    Boolean(savedSobrino) &&
+      step4.functionCall?.name === 'guardar_ubicacion' &&
+      Boolean(aliasFlowCtx.pendingConfirmation),
+    `Paso 4 (confirma "Sí"): guarda efectivamente el alias en AliasService ("${savedSobrino?.address}") y pasa a confirmación de viaje`
+  );
+
+  // 7.3 Cambio directo de destino en 1 paso durante confirmación de viaje normal (sin tener que decir "No" primero)
+  const step5 = await ConversationService.processUserMessage('Alameda Central', aliasFlowCtx);
+  aliasFlowCtx = step5.updatedContext;
+  assert(
+    Boolean(aliasFlowCtx.pendingConfirmation) &&
+      Boolean(aliasFlowCtx.pendingConfirmation?.destination.toLowerCase().includes('alameda')),
+    `Paso 5 (cambio directo en 1 paso durante pendingConfirmation): cambia destino directamente a "${aliasFlowCtx.pendingConfirmation?.destination}"`
+  );
 
   // --------------------------------------------------------------------------
   // RESUMEN

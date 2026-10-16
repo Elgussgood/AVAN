@@ -167,6 +167,7 @@ function generateMapLibreHtml(
       var pendingDestination = null;
       var pendingUserLocation = null;
       var currentSmoothedBearing = null;
+      var currentTargetZoom = ${initialZoom};
 
       function getArrowSvg(heading, isDark) {
         var fill = isDark ? 'transparent' : '#2B5B84';
@@ -371,6 +372,11 @@ function generateMapLibreHtml(
               window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'USER_INTERACTION' }));
             }
           });
+          map.on('zoom', function(e) {
+            if (e && e.originalEvent && map) {
+              currentTargetZoom = map.getZoom();
+            }
+          });
 
           map.on('moveend', function() {
             var center = map.getCenter();
@@ -425,9 +431,12 @@ function generateMapLibreHtml(
         // Perspectiva POV 3D del conductor (Google Maps):
         // En MapLibre GL JS, bearing: theta orienta el rumbo theta hacia arriba en pantalla.
         // Inclinación pitch: 45° aporta la perspectiva de carretera del parabrisas.
+        // Se incluye siempre zoom: currentTargetZoom para que el seguimiento GPS nunca cancele
+        // la transición de zoom de RECENTER (17) ni los niveles de intensidad de ZOOM_IN / ZOOM_OUT.
         if (followUser) {
           map.easeTo({
             center: [lng, lat],
+            zoom: currentTargetZoom,
             bearing: currentSmoothedBearing,
             pitch: 45,
             duration: 450,
@@ -513,9 +522,10 @@ function generateMapLibreHtml(
           }
 
           if (!coords || coords.length < 2) {
+            currentTargetZoom = ${initialZoom};
             map.easeTo({
               center: [destination.longitude, destination.latitude],
-              zoom: ${initialZoom},
+              zoom: currentTargetZoom,
               duration: 500
             });
           }
@@ -587,34 +597,47 @@ function generateMapLibreHtml(
             break;
           case 'ZOOM_IN':
             if (!map) return;
-            var inDelta = 1.2;
-            if (data && data.intensity === 'mucho') inDelta = 2.5;
-            else if (data && data.intensity === 'poco') inDelta = 0.6;
-            map.easeTo({ zoom: Math.min(19, map.getZoom() + inDelta), duration: 350 });
+            var baseInZoom = (typeof currentTargetZoom === 'number' && !isNaN(currentTargetZoom)) ? currentTargetZoom : map.getZoom();
+            var inDelta = 1.8;
+            if (data && data.intensity === 'mucho') inDelta = 3.2;
+            else if (data && data.intensity === 'poco') inDelta = 0.8;
+            currentTargetZoom = Math.min(19.5, baseInZoom + inDelta);
+            map.easeTo({ zoom: currentTargetZoom, duration: 400 });
             break;
           case 'ZOOM_OUT':
             if (!map) return;
-            var outDelta = 1.5;
-            if (data && data.intensity === 'mucho') outDelta = 3.5;
-            else if (data && data.intensity === 'poco') outDelta = 0.7;
-            map.easeTo({ zoom: Math.max(10, map.getZoom() - outDelta), duration: 350 });
+            var baseOutZoom = (typeof currentTargetZoom === 'number' && !isNaN(currentTargetZoom)) ? currentTargetZoom : map.getZoom();
+            var outDelta = 1.8;
+            if (data && data.intensity === 'mucho') outDelta = 3.8;
+            else if (data && data.intensity === 'poco') outDelta = 0.8;
+            currentTargetZoom = Math.max(10, baseOutZoom - outDelta);
+            map.easeTo({ zoom: currentTargetZoom, duration: 400 });
             break;
           case 'SET_ZOOM':
             if (map && data && typeof data.zoom === 'number') {
-              map.easeTo({ zoom: Math.max(10, Math.min(19, data.zoom)), duration: 300 });
+              currentTargetZoom = Math.max(10, Math.min(19.5, data.zoom));
+              map.easeTo({ zoom: currentTargetZoom, duration: 350 });
             }
             break;
           case 'RECENTER':
-            var recenterLng = (data && data.lng !== undefined) ? data.lng : (userMarker ? userMarker.getLngLat().lng : null);
-            var recenterLat = (data && data.lat !== undefined) ? data.lat : (userMarker ? userMarker.getLngLat().lat : null);
+            var recenterLng = (data && data.lng !== undefined && data.lng !== null) ? data.lng : (userMarker ? userMarker.getLngLat().lng : null);
+            var recenterLat = (data && data.lat !== undefined && data.lat !== null) ? data.lat : (userMarker ? userMarker.getLngLat().lat : null);
+            var targetZoom = (data && typeof data.zoom === 'number') ? data.zoom : 17;
+            currentTargetZoom = targetZoom;
+            if (data && typeof data.heading === 'number' && !isNaN(data.heading)) {
+              currentSmoothedBearing = data.heading;
+            }
             if (map && recenterLng !== null && recenterLat !== null) {
-              var targetZoom = (data && typeof data.zoom === 'number') ? data.zoom : 17;
-              if (data && typeof data.heading === 'number') {
-                currentSmoothedBearing = data.heading;
-              }
               map.easeTo({
                 center: [recenterLng, recenterLat],
-                zoom: targetZoom,
+                zoom: currentTargetZoom,
+                bearing: currentSmoothedBearing || 0,
+                pitch: 45,
+                duration: 600
+              });
+            } else if (map) {
+              map.easeTo({
+                zoom: currentTargetZoom,
                 bearing: currentSmoothedBearing || 0,
                 pitch: 45,
                 duration: 600

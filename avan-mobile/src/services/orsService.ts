@@ -736,95 +736,88 @@ export class OpenRouteService {
       }
     }
 
-    // 2. Concurrencia de baja latencia: Ejecución en paralelo de ORS (Tier 1) y Photon (Tier 3)
-    const apiTasks: Promise<{ source: string; results: GeocodeResult[] }>[] = [];
-    if (this.apiKey) {
+    // 2. Ciclo de espera y reintento automático (hasta 2 intentos ante microcortes o demora de red)
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const apiTasks: Promise<{ source: string; results: GeocodeResult[] }>[] = [];
+      if (this.apiKey) {
+        apiTasks.push(
+          this.geocodeWithORS(structured, userLocation)
+            .then((results) => ({ source: 'ors', results: results || [] }))
+            .catch((err) => {
+              console.warn(`[orsService] Error en geocodificación ORS (intento ${attempt}):`, err);
+              return { source: 'ors', results: [] };
+            })
+        );
+      }
       apiTasks.push(
-        this.geocodeWithORS(structured, userLocation)
-          .then((results) => ({ source: 'ors', results: results || [] }))
+        this.geocodeWithPhoton(structured, userLocation)
+          .then((results) => ({ source: 'photon', results: results || [] }))
           .catch((err) => {
-            console.warn('[orsService] Error en geocodificación ORS:', err);
-            return { source: 'ors', results: [] };
+            console.warn(`[orsService] Error en geocodificación Photon (intento ${attempt}):`, err);
+            return { source: 'photon', results: [] };
           })
       );
-    }
-    apiTasks.push(
-      this.geocodeWithPhoton(structured, userLocation)
-        .then((results) => ({ source: 'photon', results: results || [] }))
-        .catch((err) => {
-          console.warn('[orsService] Error en geocodificación Photon:', err);
-          return { source: 'photon', results: [] };
-        })
-    );
 
-    const apiResponses = await Promise.all(apiTasks);
-    const orsMatch = apiResponses.find((r) => r.source === 'ors')?.results || [];
-    const photonMatch = apiResponses.find((r) => r.source === 'photon')?.results || [];
+      const apiResponses = await Promise.all(apiTasks);
+      const orsMatch = apiResponses.find((r) => r.source === 'ors')?.results || [];
+      const photonMatch = apiResponses.find((r) => r.source === 'photon')?.results || [];
 
-    // Validar si ORS devolvió resultados conformes a la colonia (o sin colonia restrictiva)
-    if (orsMatch.length > 0) {
-      if (structured.colonia) {
-        const expectedColonia = structured.colonia.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        const labelNorm = orsMatch[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        if (labelNorm.includes(expectedColonia)) {
+      // Validar si ORS devolvió resultados conformes a la colonia (o sin colonia restrictiva)
+      if (orsMatch.length > 0) {
+        if (structured.colonia) {
+          const expectedColonia = structured.colonia.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+          const labelNorm = orsMatch[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+          if (labelNorm.includes(expectedColonia)) {
+            OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, orsMatch);
+            return orsMatch;
+          }
+        } else {
           OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, orsMatch);
           return orsMatch;
         }
-        // Si ORS ignoró la colonia, continuar a Nominatim
-      } else {
-        OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, orsMatch);
-        return orsMatch;
       }
-    }
 
-    // Si Photon encontró resultado de precisión exacta respetando la colonia
-    if (photonMatch.length > 0 && photonMatch[0].precision === 'exact') {
-      if (structured.colonia) {
-        const expectedColonia = structured.colonia.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        const labelNorm = photonMatch[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        if (labelNorm.includes(expectedColonia)) {
+      // Si Photon encontró resultado de precisión exacta respetando la colonia
+      if (photonMatch.length > 0 && photonMatch[0].precision === 'exact') {
+        if (structured.colonia) {
+          const expectedColonia = structured.colonia.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+          const labelNorm = photonMatch[0].label.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+          if (labelNorm.includes(expectedColonia)) {
+            OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, photonMatch);
+            return photonMatch;
+          }
+        } else {
           OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, photonMatch);
           return photonMatch;
         }
-      } else {
+      }
+
+      // 3. TIER 2: OpenStreetMap Nominatim con delimitación por viewbox y relajación progresiva
+      try {
+        const nominatimResults = await this.geocodeWithNominatim(structured, userLocation);
+        if (nominatimResults && nominatimResults.length > 0) {
+          OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, nominatimResults);
+          return nominatimResults;
+        }
+      } catch (err) {
+        console.warn(`[orsService] Error en geocodificación Nominatim (intento ${attempt}):`, err);
+      }
+
+      // 4. Si Nominatim no encontró coincidencias pero Photon devolvió resultados a nivel de calle
+      if (photonMatch.length > 0) {
         OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, photonMatch);
         return photonMatch;
       }
-    }
 
-    // 3. TIER 2: OpenStreetMap Nominatim con delimitación por viewbox y relajación progresiva
-    try {
-      const nominatimResults = await this.geocodeWithNominatim(structured, userLocation);
-      if (nominatimResults && nominatimResults.length > 0) {
-        OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, nominatimResults);
-        return nominatimResults;
+      // Si no hubo resultados en el primer intento, esperar 1200ms antes de reintentar
+      if (attempt < 2) {
+        console.log(`[orsService] Esperando 1200ms para reintentar geocodificación de "${trimmed}"...`);
+        await new Promise((resolve) => setTimeout(resolve, 1200));
       }
-    } catch (err) {
-      console.warn('[orsService] Error en geocodificación Nominatim:', err);
     }
 
-    // 4. Si Nominatim no encontró coincidencias pero Photon devolvió resultados a nivel de calle
-    if (photonMatch.length > 0) {
-      OpenRouteService.setInCache(OpenRouteService.geocodeCache, cacheKey, photonMatch);
-      return photonMatch;
-    }
-
-    // 5. Fallback seguro: Si no hubo red ni coincidencias
-    const baseLat = userLocation?.latitude ?? 19.4326;
-    const baseLng = userLocation?.longitude ?? -99.1332;
-
-    return [
-      {
-        id: `approx-${Date.now()}`,
-        name: trimmed,
-        label: `${trimmed}, Ciudad de México`,
-        coordinates: {
-          latitude: baseLat,
-          longitude: baseLng,
-        },
-        precision: 'approximate',
-      },
-    ];
+    // 5. Sin coincidencias tras esperar y reintentar: devolver arreglo vacío (NUNCA inventar coordenadas falsas)
+    return [];
   }
 
   /**
@@ -863,7 +856,7 @@ export class OpenRouteService {
         });
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3500);
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
 
         const response = await fetch(
           `${this.baseUrl}/geocode/search?${localParams.toString()}`,
@@ -898,7 +891,7 @@ export class OpenRouteService {
       });
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3500);
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
 
       const response = await fetch(
         `${this.baseUrl}/geocode/search?${nationalParams.toString()}`,
@@ -986,7 +979,7 @@ export class OpenRouteService {
     });
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3500);
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
     const response = await fetch(`https://photon.komoot.io/api/?${params.toString()}`, {
       headers: { Accept: 'application/json' },
@@ -1068,7 +1061,7 @@ export class OpenRouteService {
         });
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3500);
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
 
         const response = await fetch(
           `https://nominatim.openstreetmap.org/search?${params.toString()}`,
@@ -1397,100 +1390,107 @@ export class OpenRouteService {
     start: Coordinates,
     destination: Coordinates
   ): Promise<RouteResult> {
-    // Tier 1: OpenRouteService (si hay API key configurada)
-    if (this.apiKey) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3500);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      // Tier 1: OpenRouteService (si hay API key configurada)
+      if (this.apiKey) {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 8000);
 
-        const body = {
-          coordinates: [
-            [start.longitude, start.latitude],
-            [destination.longitude, destination.latitude],
-          ],
-          instructions: true,
-          language: 'es',
-          units: 'm',
-          elevation: false,
-        };
+          const body = {
+            coordinates: [
+              [start.longitude, start.latitude],
+              [destination.longitude, destination.latitude],
+            ],
+            instructions: true,
+            language: 'es',
+            units: 'm',
+            elevation: false,
+          };
 
-        const response = await fetch(
-          `${this.baseUrl}/v2/directions/driving-car/geojson`,
-          {
-            method: 'POST',
-            headers: {
-              Authorization: this.apiKey,
-              'Content-Type': 'application/json',
-              Accept: 'application/json, application/geo+json',
-            },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-          }
-        );
-        clearTimeout(timeout);
+          const response = await fetch(
+            `${this.baseUrl}/v2/directions/driving-car/geojson`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: this.apiKey,
+                'Content-Type': 'application/json',
+                Accept: 'application/json, application/geo+json',
+              },
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            }
+          );
+          clearTimeout(timeout);
 
-        if (response.ok) {
-          const data = await response.json();
-          const feature = data.features?.[0];
+          if (response.ok) {
+            const data = await response.json();
+            const feature = data.features?.[0];
 
-          if (feature && feature.geometry && feature.geometry.coordinates) {
-            const rawCoords: [number, number][] = feature.geometry.coordinates;
-            const coordinates: Coordinates[] = rawCoords.map(([lng, lat]) => ({
-              latitude: lat,
-              longitude: lng,
-            }));
+            if (feature && feature.geometry && feature.geometry.coordinates) {
+              const rawCoords: [number, number][] = feature.geometry.coordinates;
+              const coordinates: Coordinates[] = rawCoords.map(([lng, lat]) => ({
+                latitude: lat,
+                longitude: lng,
+              }));
 
-            const properties = feature.properties || {};
-            const summary = properties.summary || {};
-            const segments = properties.segments || [];
+              const properties = feature.properties || {};
+              const summary = properties.summary || {};
+              const segments = properties.segments || [];
 
-            const steps: StepInstruction[] = [];
-            segments.forEach((seg: any) => {
-              if (Array.isArray(seg.steps)) {
-                seg.steps.forEach((step: any) => {
-                  steps.push({
-                    instruction: step.instruction || 'Continúa recto',
-                    distance: step.distance || 0,
-                    duration: step.duration || 0,
-                    type: step.type ?? 0,
-                    modifier: step.modifier,
-                    name: step.name || '',
-                    wayPoints: step.way_points || [0, 0],
+              const steps: StepInstruction[] = [];
+              segments.forEach((seg: any) => {
+                if (Array.isArray(seg.steps)) {
+                  seg.steps.forEach((step: any) => {
+                    steps.push({
+                      instruction: step.instruction || 'Continúa recto',
+                      distance: step.distance || 0,
+                      duration: step.duration || 0,
+                      type: step.type ?? 0,
+                      modifier: step.modifier,
+                      name: step.name || '',
+                      wayPoints: step.way_points || [0, 0],
+                    });
                   });
-                });
-              }
-            });
+                }
+              });
 
-            console.log(
-              `[orsService] Ruta vehicular calculada con Tier 1 ORS: ${(summary.distance / 1000).toFixed(2)} km, ${coordinates.length} puntos.`
-            );
+              console.log(
+                `[orsService] Ruta vehicular calculada con Tier 1 ORS (intento ${attempt}): ${(summary.distance / 1000).toFixed(2)} km, ${coordinates.length} puntos.`
+              );
 
-            return {
-              coordinates,
-              distance: summary.distance || 0,
-              duration: summary.duration || 0,
-              steps,
-              bbox: feature.bbox,
-              isFallback: false,
-            };
+              return {
+                coordinates,
+                distance: summary.distance || 0,
+                duration: summary.duration || 0,
+                steps,
+                bbox: feature.bbox,
+                isFallback: false,
+              };
+            }
+          } else {
+            console.warn(`[orsService] Tier 1 ORS (intento ${attempt}) devolvió status:`, response.status, response.statusText);
           }
-        } else {
-          console.warn('[orsService] Tier 1 ORS devolvió status:', response.status, response.statusText);
+        } catch (error: any) {
+          console.warn(`[orsService] Tier 1 ORS (intento ${attempt}) falló o excedió timeout de 8s:`, error.message || error);
         }
-      } catch (error: any) {
-        console.warn('[orsService] Tier 1 ORS falló o excedió timeout de 3.5s:', error.message || error);
+      }
+
+      // Tier 2: OSRM (Open Source Routing Machine con calles reales de OSM)
+      console.log(`[orsService] Consultando Tier 2 OSRM con geometría de calles reales (intento ${attempt})...`);
+      const osrmResult = await this.getOsrmDirections(start, destination);
+      if (osrmResult) {
+        return osrmResult;
+      }
+
+      if (attempt < 2) {
+        console.log('[orsService] Esperando 1200ms para reintentar cálculo de ruta real...');
+        await new Promise((resolve) => setTimeout(resolve, 1200));
       }
     }
 
-    // Tier 2: OSRM (Open Source Routing Machine con calles reales de OSM)
-    console.log('[orsService] Consultando Tier 2 (OSRM con geometría de calles reales)...');
-    const osrmResult = await this.getOsrmDirections(start, destination);
-    if (osrmResult) {
-      return osrmResult;
-    }
-
-    // Tier 3: Fallback de emergencia local si no hay conexión a internet
-    console.warn('[orsService] Recurriendo a Tier 3 (Ruta de emergencia local)');
+    // Tier 3: Fallback marcado explícitamente como isFallback: true para que la UI pueda esperar en lugar de abrir ruta ficticia
+    console.warn('[orsService] Sin respuesta de servidores de ruteo tras reintentos.');
     return this.generateFallbackRoute(start, destination);
   }
 
